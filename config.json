@@ -1,0 +1,67 @@
+{
+  "baseUrl": "http://127.0.0.1:8080/api/v2",
+
+  "apiConnectTimeoutSeconds": 3,
+  "apiGetTimeoutSeconds": 10,
+  "apiPostTimeoutSeconds": 30,
+  "apiAttempts": 2,
+  "apiFailureBudget": 3,
+
+  "moviesDir": "PUT-YOUR-PATH-HERE",
+  "seriesDir": "PUT-YOUR-PATH-HERE",
+
+  "moviesCategory": "Movies",
+  "seriesCategory": "Series",
+
+  "deleteDataFiles": true,
+  "metadataTimeoutMinutes": 30,
+  "metadataPriorityRankLimit": 10,
+  "queueDrainEnabled": true,
+  "stallCleanupEnabled": true,
+  "stallConfirmSeconds": 60,
+  "stallMaxWaitSeconds": 75,
+  "stallMaxDeletions": 10,
+  "stallInternetProbeUrl": "https://www.cloudflare.com/cdn-cgi/trace",
+  "stalledDeleteDays": 7,
+  "backupMaxAgeDays": 7,
+  "logRetentionDays": 7,
+
+  "assignCategories": true,
+  "moveCompletedToLibrary": true,
+  "moveVerifySeconds": 30,
+  "moveVerifyPollMs": 500,
+
+  "libraryDedupeEnabled": true,
+  "libraryRedundantEnabled": true,
+  "libraryRedundantTolerancePercent": 10,
+  "phantomCleanupEnabled": true,
+
+  "reapOrphans": true,
+  "reapMinAgeHours": 24,
+  "reapRoots": [
+    "PUT-YOUR-PATH-HERE"
+  ],
+
+  "doviPatterns": [
+    "\\bdovi\\b",
+    "\\bdv\\b",
+    "dolby[\\s._-]*vision",
+    "\\bbdvhdr\\b",
+    "\\bdv[\\s._-]*hevc\\b",
+    "\\bdovi[\\s._-]*profile\\b"
+  ],
+
+  "excludeBluRayDiscRips": true,
+  "bdmvSearchDepth": 2,
+  "discRipPatterns": [
+    "\\bbdmv\\b",
+    "\\bcompletebd\\b",
+    "\\bfullbd\\b",
+    "\\bbd(25|50|60|66|100)\\b",
+    "\\b1f4u\\b",
+    "\\bbd-?iso\\b",
+    "\\bbd-?disc\\b",
+    "\\bdisc-?[0-9]+\\b",
+    "blu-?\\s?ray\\s+(disc|disk)"
+  ]
+}
