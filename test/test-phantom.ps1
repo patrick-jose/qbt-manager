@@ -208,10 +208,14 @@ $runStart = $src.IndexOf("Write-Host 'Phantom check")
 Check 'the phantom pass was found in the run body' ($runStart -gt 0)
 if ($runStart -gt 0) {
     $runBody = $src.Substring($runStart, 2500)
+    # The -Knows flag sits between the target and -Reason, so the pattern names
+    # the arguments rather than the whole call. A full-call pattern stopped
+    # matching the moment -Knows was added, which reads as "the rule changed" when
+    # the only change was a flag on a different concern.
     Check 'the call deletes the entry WITHOUT files' `
-        ($runBody -match 'Remove-Torrent -T \$p\.Torrent -Reason \$p\.Reason -DeleteFiles \$false')
+        ($runBody -match 'Remove-Torrent -T \$p\.Torrent -Knows -Reason \$p\.Reason -DeleteFiles \$false')
     Check 'and never with files' `
-        ($runBody -notmatch 'Remove-Torrent -T \$p\.Torrent -Reason \$p\.Reason -DeleteFiles \$true')
+        ($runBody -notmatch 'Remove-Torrent -T \$p\.Torrent -Knows -Reason \$p\.Reason -DeleteFiles \$true')
     # SINGLE quotes below, and not by habit. In a double-quoted PowerShell string
     # `\$` does not escape the dollar - the backslash is literal, $p then
     # interpolates away, and the pattern silently becomes

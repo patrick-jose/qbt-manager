@@ -36,6 +36,9 @@
   "libraryRedundantTolerancePercent": 10,
   "phantomCleanupEnabled": true,
 
+  "//titleAliases": "One show, several spellings. Key = the title the parser produces, value = the title to file it under. Case-insensitive; chains are followed. Nothing is guessed: a title not listed here is untouched, because folding titles by similarity would trade a duplicate nobody notices for a wrong file deleted. See docs/RULES.md.",
+  "titleAliases": {},
+
   "reapOrphans": true,
   "reapMinAgeHours": 24,
   "reapRoots": [

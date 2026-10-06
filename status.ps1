@@ -419,7 +419,12 @@ function Resolve-SetKey {
 # The manager's rule: the largest finished version in a group is the keeper, and
 # everything smaller goes - finished or not. Bigger unfinished versions survive.
 function Get-DedupVerdicts {
-    param($Clusters, $Gone)
+    # TolerancePercent is the user's 10%: two encodes of one episode closer than
+    # this are the same episode, so one of them is redundant. It defaults to 10 and
+    # is passed from libraryRedundantTolerancePercent, so the preview and the run
+    # cannot disagree about where the line sits. Rule 4d in the manager reads the
+    # same key for the same reason.
+    param($Clusters, $Gone, [double]$TolerancePercent = 10)
 
     $verdicts = @{}
 
@@ -495,27 +500,50 @@ function Get-DedupVerdicts {
                 foreach ($m in $set) {
                     if ($m.hash -eq $keeper.hash) { continue }
                     if ((Get-Prop $m 'size') -le 0) { continue }
-                    if ((Get-Prop $m 'size') -ge (Get-Prop $keeper 'size')) { continue }
-                    # NO errored guard here, and that is deliberate and must stay in
-                    # step with the manager.
+                    if ((Get-Prop $m 'size') -le 0) { continue }
+                    
+                    # Bigger than the keeper: left alone, UNLESS it is an unfinished
+                    # copy that is not MEANINGFULLY bigger - the same tolerance the
+                    # manager applies, read from the same config key.
                     #
-                    # Elsewhere an errored torrent is protected. Here it is not,
-                    # because $k is Resolve-SetKey - the keeper holds the
-                    # IDENTICAL episodes and is FINISHED - so an errored member of
-                    # this group is a spare copy that failed, not lost data.
+                    # A FINISHED copy bigger than the keeper IS the keeper, so the
+                    # tolerance can only ever reach an unfinished one.
                     #
-                    # The guard belongs on the DoVi / disc-rip path (an unconditional
-                    # rule that never established anything better existed) and on the
-                    # pack-vs-single path (which requires BOTH sides complete, so an
-                    # errored single is skipped there anyway). This set-level
-                    # comparison is the one place the manager passes -AllowErrored.
-                    $why = if ((Get-Prop $m 'progress') -ge 1) { 'smaller completed version' }
-                           elseif (Test-Errored $m) { 'errored, and the same episodes are already finished elsewhere' }
-                           else { 'incomplete, and a bigger version is already finished' }
+                    # Mirrored from qbt-manager.ps1 on purpose. Left at a strict
+                    # '>=', this copy previews three downloads of one episode as
+                    # clean while the scheduled run deletes them - the panel lying
+                    # about the run, which is the same failure as the drain printing
+                    # 'witness at position 0' when there was no witness at all.
+                    $gap = ''
+                    if ((Get-Prop $m 'size') -ge (Get-Prop $keeper 'size')) {
+                        if ((Get-Prop $m 'progress') -ge 1) { continue }
+                        $over = ((Get-Prop $m 'size') - (Get-Prop $keeper 'size')) / (Get-Prop $keeper 'size')
+                        if ($over -gt ($TolerancePercent / 100.0)) { continue }
+                        $why = 'incomplete, and not meaningfully bigger than a finished version'
+                        $gap = (" - only {0:N2}% bigger, inside the {1:N0}% tolerance" -f ($over * 100), $TolerancePercent)
+                    }
+                    else {
+                        # NO errored guard here, and that is deliberate and must stay in
+                        # step with the manager.
+                        #
+                        # Elsewhere an errored torrent is protected. Here it is not,
+                        # because $k is Resolve-SetKey - the keeper holds the
+                        # IDENTICAL episodes and is FINISHED - so an errored member of
+                        # this group is a spare copy that failed, not lost data.
+                        #
+                        # The guard belongs on the DoVi / disc-rip path (an unconditional
+                        # rule that never established anything better existed) and on the
+                        # pack-vs-single path (which requires BOTH sides complete, so an
+                        # errored single is skipped there anyway). This set-level
+                        # comparison is the one place the manager passes -AllowErrored.
+                        $why = if ((Get-Prop $m 'progress') -ge 1) { 'smaller completed version' }
+                               elseif (Test-Errored $m) { 'errored, and the same episodes are already finished elsewhere' }
+                               else { 'incomplete, and a bigger version is already finished' }
+                    }
                     $verdicts[$m.hash] = [pscustomobject]@{
                         Verdict = 'DELETE'; Rule = 'dedup'
-                        Reason  = ("{0} of '{1}' ({2}); '{3}' is finished at {4:N2} GB against {5:N2} GB" -f `
-                                   $why, $label, $k, $keeper.name,
+                          Reason  = ("{0}{1} of '{2}' ({3}); '{4}' is finished at {5:N2} GB against {6:N2} GB" -f `
+                                     $why, $gap, $label, $k, $keeper.name,
                                    ((Get-Prop $keeper 'size') / $GB), ((Get-Prop $m 'size') / $GB))
                     }
                 }
@@ -623,7 +651,14 @@ function Get-MetadataWatch {
         $t = $byPriority[$i]
         if ((Get-ExclusionVerdict -T $t)) { continue }
 
-        $noMeta = ((Get-Prop $t 'size' 0) -eq 0) -or ((Get-Prop $t 'state') -eq 'metaDL')
+        # TRYING, not merely WAITING - the same line as the manager, and the same line
+          # the drain uses a hundred lines below in this file.
+          #
+          # 'size 0' on its own admitted a magnet sitting in line that qBittorrent
+          # had never given a slot to: it entered the table, the panel counted up
+          # against it, and 30 minutes later the panel showed it as about to be
+          # deleted for failing to fetch metadata it was never asked to fetch.
+          $noMeta = ((Get-Prop $t 'state') -eq 'metaDL')
         if (-not $noMeta) { continue }
 
         # The queue window. Identical arithmetic to the manager's, deliberately.
@@ -723,8 +758,28 @@ function Get-QueueDrainVerdict {
         $pos = [int]$t.priority
         if ($pos -lt 1) { continue }
         if ($pos -le $QueueLimit) { continue }
-        $noSize = (($t.size -eq 0) -or ($t.state -eq 'metaDL'))
-        if (-not $noSize) { continue }
+
+        # TRYING, not merely WAITING. Same line as the manager's copy.
+        #
+        # This accepted any torrent reporting size 0, which includes one sitting
+        # in line that qBittorrent has never given a slot to. Measured on a live
+        # queue:
+        #
+        #   pos 11-20   size 8.9 GB, 8.7 GB ...   served: working or stalled
+        #   pos 21      size 0, state queuedDL     never had a turn
+        #   pos 22-30   size 0, state queuedDL     never had a turn
+        #
+        # Position 21 became the candidate, its clock started on arrival, and 30
+        # minutes later this panel would have shown it as about to be deleted for
+        # failing to fetch metadata - having never been asked to fetch any.
+        #
+        # metaDL is the state meaning "fetching metadata right now". A magnet
+        # queued behind the window is queuedDL; one whose metadata resolved has a
+        # size. Rule 2 already draws this line for the same reason: "a magnet at
+        # position 150 has never been handed a peer connection, so it has not tried
+        # anything, and deleting it for being unavailable is really deleting it for
+        # not having been started yet."
+        if ($t.state -ne 'metaDL') { continue }
         $candidate = $t
         $candPos = $pos
         break
@@ -776,7 +831,15 @@ function Get-QueueDrainVerdict {
                    [int]$witness.priority)
     }
     elseif ($startedNow) {
-        $reason = ("no availability: first candidate behind the window at position {0}; its 60 minutes start now" -f $candPos)
+        # The tolerance is quoted from the value, never written as 60.
+        #
+        # It was hardcoded here while the row beside it counted down from
+        # metadataTimeoutMinutes - so with that key set to 30 the panel read
+        # "30m to go" directly above "its 60 minutes start now". Two numbers, one
+        # row, and no way for the reader to tell which one the rule would use.
+        # The user's configured tolerance is the only number that belongs here.
+        $reason = ("no availability: first candidate behind the window at position {0}; its {1:N0} minutes start now" -f `
+                    $candPos, $TimeoutMinutes)
     }
     elseif ($timedOut) {
         $reason = ("no availability: {0:N0} min at queue position {1} (tolerance {2:N0}m) - held, nothing further down " +
@@ -924,8 +987,14 @@ function Show-Snapshot {
 
         $gone = @{}
         foreach ($t in $excluded) { $gone[$t.hash] = $true }
+          # The user's 10%, from the same key the manager reads for BOTH this
+          # comparison and rule 4d. Read here instead of left at the default so
+          # that changing it in config.json moves the preview and the run together -
+          # a preview that quietly kept a default the run has moved past would
+          # report an episode as clean an hour before it is deleted.
+          $dedupTol = [double](Get-Prop $cfg 'libraryRedundantTolerancePercent' 10)
         $clusters = Get-Clusters -Torrents $torrents
-        $dedup    = Get-DedupVerdicts -Clusters $clusters -Gone $gone
+        $dedup    = Get-DedupVerdicts -Clusters $clusters -Gone $gone -TolerancePercent $dedupTol
 
         foreach ($t in $excluded) {
             [void]$pending.Add([pscustomobject]@{
@@ -1047,8 +1116,22 @@ function Show-Snapshot {
             }
             else {
                 $left = $drainTimeout - $d.Minutes
-                Write-Host ("  pos {0}  {1,4:N0}m dead  {2,4:N0}m to go  witness at {3}  {4}" -f `
-                    $d.QueuePos, $d.Minutes, $left, $d.WitnessPos, (Fit $d.Name $nmW)) -ForegroundColor DarkGray
+                  # The witness is printed ONLY when there is one.
+                  #
+                  # It used to be printed unconditionally, from $d.WitnessPos, which is 0
+                  # when no witness exists - so the row read
+                  #
+                  #   pos 21  0m dead  30m to go  witness at 0  Euphoria US S03E05 ...
+                  #
+                  # which looks exactly like the thing this rule exists to prevent: a
+                  # dead magnet at 21 about to be deleted because something at 0 is
+                  # downloading. Nothing was wrong with the RULE - the candidate had no
+                  # witness at all, and the panel claimed there was one at position 0.
+                  # A panel that invents evidence is worse than no panel: it makes the
+                  # rule look broken while it is working.
+                  $witnessText = if ($d.HasWitness) { "witness at $($d.WitnessPos)" } else { 'no witness yet' }
+                  Write-Host ("  pos {0}  {1,4:N0}m dead  {2,4:N0}m to go  {3}  {4}" -f `
+                      $d.QueuePos, $d.Minutes, $left, $witnessText, (Fit $d.Name $nmW)) -ForegroundColor DarkGray
                 Write-WrappedLine -Text $d.Reason -Width ($W - 2) -Indent '    ' -Color 'DarkGray'
             }
         }

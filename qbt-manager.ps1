@@ -27,8 +27,11 @@
     4. Dedup    : within a title group, the largest version that is 100%
                    downloaded is the keeper, and every other version smaller
                    than it is deleted - finished or not, and at any distance in
-                   size. Versions bigger than the keeper are left alone, and a
-                   group with no finished member is untouched.
+                   size. An unfinished version is deleted even when it is not
+                   more than 10% bigger than the keeper, because a size
+                   difference too small to see is not a better version. A
+                   FINISHED version bigger than the keeper is the keeper, and is
+                   never deleted. A group with no finished member is untouched.
                     Groups are built in two passes. Series releases of one
                     episode often carry different titles ('ted lasso' versus
                     'ted lasso follow the anger'), so a second pass, for series
@@ -1793,7 +1796,17 @@ function Get-NoAvailabilityVerdict {
         if ($null -eq $t) { continue }
         if ($Skip.ContainsKey($t.hash)) { continue }
 
-        $noMeta = (($t.size -eq 0) -or ($t.state -eq 'metaDL'))
+        # TRYING, not merely WAITING - the same line the drain uses.
+        #
+        # 'size 0' on its own admitted a magnet sitting in line that qBittorrent
+        # had never given a slot to, so it entered the table and its clock started
+        # on arrival. Being at the front of the queue is not the same as having been
+        # served: rule 2's own premise is that a magnet at position 150 has never
+        # been handed a peer connection, and that reasoning holds at position 5 too.
+        #
+        # Dropping a queuedDL entry here also clears any windowSince it carried, so
+        # it cannot carry a clock it was never served into the window's turn.
+        $noMeta = ($t.state -eq 'metaDL')
 
         # A torrent that resolved has no clock to keep. Dropping the entry here
         # is what stops the table growing without bound.
@@ -2153,7 +2166,7 @@ function Get-StallVerdict {
         $pos = [int]$t.priority
         if ($pos -lt 1) { continue }
         if ($QueueLimit -gt 0 -and $pos -gt $QueueLimit) { continue }
-        $noSize = (($t.size -eq 0) -or ($t.state -eq 'metaDL'))
+        $noSize = ($t.state -eq 'metaDL')
         if (-not $noSize) { continue }
         [void]$picked.Add($t)
         if ($picked.Count -ge $MaxDeletions) { break }
@@ -2213,11 +2226,16 @@ function Get-QueueDrainVerdict {
         the window, gives it its own full tolerance, and deletes it - but only
         when something proves the client is still working:
 
-          1. Candidate. The first torrent with no size at a position greater
-             than the window limit, in ascending position order. Exactly one
-             candidate per run, so the rate is bounded by the tolerance no
-             matter how long the queue is. Priority 0 is excluded for the same
-             reason rule 2 excludes it: it means "out of the queue".
+            1. Candidate. The first magnet ACTIVELY FETCHING METADATA at a position
+               greater than the window limit, in ascending position order. Exactly
+               one candidate per run, so the rate is bounded by the tolerance no
+               matter how long the queue is. Priority 0 is excluded for the same
+               reason rule 2 excludes it: it means "out of the queue".
+               
+               "Actively fetching" is the whole condition, and it is what keeps this
+               rule off magnets that have not had their turn. A queuedDL magnet with
+               no size has not been STARTED - qBittorrent has not given it a slot -
+               so counting minutes against it counts the queue, not its failure.
 
           2. Its own clock, starting when it first becomes the candidate. A new
              candidate always starts from zero, so a magnet promoted from
@@ -2281,8 +2299,30 @@ function Get-QueueDrainVerdict {
         $pos = [int]$t.priority
         if ($pos -lt 1) { continue }                 # out of the queue, not the front
         if ($pos -le $QueueLimit) { continue }      # the window's business, not this rule's
-        $noSize = (($t.size -eq 0) -or ($t.state -eq 'metaDL'))
-        if (-not $noSize) { continue }
+        # TRYING, not merely WAITING.
+        #
+        # The candidate test used to accept any torrent reporting size 0, which
+        # includes one sitting in line with qBittorrent having never given it a
+        # slot. Measured on a live queue:
+        #
+        #   pos 11-20   size 8.9 GB, 8.7 GB ...   served: working or stalled
+        #   pos 21      size 0, state queuedDL     never had a turn
+        #   pos 22-30   size 0, state queuedDL     never had a turn
+        #
+        # So the first magnet behind the window was position 21 and its clock started
+        # on arrival. Thirty minutes later it would have been deleted for failing to
+        # fetch metadata - having never been asked to fetch any.
+        #
+        # Rule 2 already draws this line, for the same reason: "a magnet at position
+        # 150 has never been handed a peer connection, so it has not tried anything,
+        # and deleting it for being unavailable is really deleting it for not having
+        # been started yet." The drain inherited the mistake, and this fixes it.
+        #
+        # metaDL is the state meaning "fetching metadata right now". A magnet queued
+        # behind the window is queuedDL, and one whose metadata resolved has a size.
+        # So it is the only state in which "no size" means "trying and failing"
+        # rather than "not started yet".
+        if ($t.state -ne 'metaDL') { continue }
         $candidate = $t
         $candPos = $pos
         break
@@ -2555,8 +2595,8 @@ function ConvertTo-LibraryFolderName {
         Note what this cannot do: the parser drops apostrophes from titles on
         purpose, for matching, so 'It's Always Sunny' reaches this function as
         'its always sunny' and the folder is 'Its Always Sunny In Philadelphia'.
-        Putting the apostrophe back is not derivable from the title - it would
-        need a per-show alias, which is a different feature.
+        Putting the apostrophe back is not derivable from the title - it is what
+        titleAliases is for.
     #>
     param([string]$Title)
 
@@ -2580,6 +2620,70 @@ function ConvertTo-LibraryFolderName {
     return ($out -join '')
 }
 
+# Fold an alias into the title it names, if the user has said they are one show.
+#
+# titleAliases is a flat object of "parsed title" -> "the title to file it under",
+# and it is the only mechanism that can join two spellings nothing else can. Both
+# families this exists for were measured on a live queue:
+#
+#   - 'euphoria' and 'euphoria us' are one show. They share a first word, so
+#     dedup already compares them, but the LIBRARY FOLDER comes from the parsed
+#     title, so the two filed into 'Euphoria' and 'Euphoria Us' and rule 4b could
+#     not see across them - it only ever compares inside one show folder. Two
+#     copies of S03E08 sat in the library, 10.27 GB and 6.89 GB, with no verdict
+#     between them.
+#
+#   - 'widows bay', 'wdowia zatoka widows bay' and 'o segredo de widows bay' are
+#     one show in three languages, and nothing derivable from a title relates
+#     them: 'zatoka' means 'bay', and only a person knows that.
+#
+# Automatic transliteration was considered and rejected. Folding titles by
+# similarity trades a known false-negative - a duplicate nobody notices - for a
+# false positive that deletes a file, which is the worse of the two by a long way.
+#
+# Looked up case-insensitively, since the parser lowercases. A chain is followed
+# so 'a' -> 'b' -> 'c' lands on 'c', but only within a bounded number of hops and
+# only while it keeps changing: a cycle cannot hang the run. An unknown title is
+# returned unchanged, which is what makes the list safe to leave incomplete.
+function Resolve-ShowAlias {
+    param(
+        [string]$Title,
+        [object]$Aliases
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Title)) { return $Title }
+    if ($null -eq $Aliases) { return $Title }
+
+    $pairs = @()
+    if ($Aliases -is [System.Collections.IDictionary]) {
+        foreach ($k in $Aliases.Keys) { $pairs += , @([string]$k, [string]$Aliases[$k]) }
+    }
+    else {
+        foreach ($p in $Aliases.PSObject.Properties) { $pairs += , @($p.Name, [string]$p.Value) }
+    }
+    if ($pairs.Count -eq 0) { return $Title }
+
+    # Built once per call, keyed lowercase. The list is a handful of entries and
+    # this runs once per torrent, so a scan would also do - the map is here so a
+    # long list does not turn into a long list of comparisons.
+    $map = @{}
+    foreach ($p in $pairs) {
+        if ([string]::IsNullOrWhiteSpace($p[0])) { continue }
+        if ([string]::IsNullOrWhiteSpace($p[1])) { continue }
+        $map[$p[0].ToLowerInvariant()] = $p[1]
+    }
+
+    $cur = $Title
+    for ($hop = 0; $hop -lt 8; $hop++) {
+        $k = $cur.ToLowerInvariant()
+        if (-not $map.ContainsKey($k)) { break }
+        $next = $map[$k]
+        if ($next -eq $cur) { break }
+        $cur = $next
+    }
+    return $cur
+}
+
 function Resolve-LibraryShowDir {
     <#
         The show folder on disk for a parsed title, as a FULL path - and it is
@@ -2598,12 +2702,27 @@ function Resolve-LibraryShowDir {
         deliberate act - see the note in ConvertTo-LibraryFolderName - and not
         something a path computation should do on its own.
 
+        The title is folded through titleAliases FIRST, so that two spellings of
+        one show resolve to ONE folder. Without that, dedup compares them (they
+        share a first word) while the library files them apart, and rule 4b - which
+        only ever compares inside a single show folder - can then never see the
+        duplicate that results. Two folders for one show is not a cosmetic split:
+        it is the duplicate problem this project exists to prevent, arriving
+        through the back door.
+
+        The alias target is what the folder is NAMED, but an existing folder
+        matching either spelling is still preferred, so adding an alias does not
+        orphan a folder that is already on disk with files in it. Folding the two
+        existing folders together is a separate, deliberate act - see
+        Merge-LibraryShowFolders.
+
         Cached per run: this is called once per torrent, and the series folder does
         not change mid-run.
     #>
     param(
         [string]$SeriesDir,
-        [string]$Title
+        [string]$Title,
+        [object]$Aliases
     )
 
     if ([string]::IsNullOrWhiteSpace($Title)) { return $null }
@@ -2613,11 +2732,21 @@ function Resolve-LibraryShowDir {
     $ck = $Title.ToLowerInvariant()
     if ($script:showDirCache.ContainsKey($ck)) { return $script:showDirCache[$ck] }
 
-    $want = ConvertTo-LibraryFolderName -Title $Title
+    $alias = Resolve-ShowAlias -Title $Title -Aliases $Aliases
+    $want = ConvertTo-LibraryFolderName -Title $alias
+    # The un-aliased spelling, so a folder that predates the alias is still
+    # found rather than duplicated. Compared second, so the aliased name wins
+    # when both exist.
+    $wantPlain = ConvertTo-LibraryFolderName -Title $Title
     $found = $null
 
     foreach ($d in @(Get-ChildItem -LiteralPath $SeriesDir -Directory -ErrorAction SilentlyContinue)) {
         if ($d.Name.Equals($want, [StringComparison]::OrdinalIgnoreCase)) { $found = $d.FullName; break }
+    }
+    if ($null -eq $found -and $wantPlain -ne $want) {
+        foreach ($d in @(Get-ChildItem -LiteralPath $SeriesDir -Directory -ErrorAction SilentlyContinue)) {
+            if ($d.Name.Equals($wantPlain, [StringComparison]::OrdinalIgnoreCase)) { $found = $d.FullName; break }
+        }
     }
 
     # Nothing there yet: the case-corrected name is what gets created.
@@ -2638,13 +2767,14 @@ function Get-LibraryTargetDir {
     param(
         [object]$T,
         [string]$MoviesDir,
-        [string]$SeriesDir
+        [string]$SeriesDir,
+        [object]$Aliases
     )
 
     if (-not $T -or -not $T.parts) { return $MoviesDir }
     if (-not $T.parts.IsSeries) { return $MoviesDir }
 
-    $base = Resolve-LibraryShowDir -SeriesDir $SeriesDir -Title $T.parts.Title
+    $base = Resolve-LibraryShowDir -SeriesDir $SeriesDir -Title $T.parts.Title -Aliases $Aliases
     if (-not $base) {
         # Unidentified show: fall back to the series root rather than inventing a
         # folder name from an empty title.
@@ -2819,6 +2949,11 @@ function Get-LibraryDuplicateVerdicts {
     $out = New-Object System.Collections.ArrayList
     if (-not $SeriesDir -or -not (Test-Path -LiteralPath $SeriesDir)) { return $out }
 
+    # One file listing per owning entry for the whole pass. Deciding whether an
+    # entry is a pack means asking what episodes it holds, and a season full of
+    # duplicates would otherwise re-read the same listing once per duplicate.
+    $ownerSetKeyCache = @{}
+
     foreach ($showDir in @(Get-ChildItem -LiteralPath $SeriesDir -Directory -ErrorAction SilentlyContinue)) {
         foreach ($seasonDir in @(Get-ChildItem -LiteralPath $showDir.FullName -Directory -ErrorAction SilentlyContinue |
                                 Where-Object { $_.Name -match '^Season\s+(?<n>\d+)$' })) {
@@ -2906,15 +3041,106 @@ function Get-LibraryDuplicateVerdicts {
                     # lost by deleting the entry.
                     $action = 'delete'
                     $packNote = ''
-                    if ($c.Owner -and $c.Owner.parts -and $c.Owner.parts.IsMultiEpisode -and $c.Owner.parts.EpisodeLast) {
-                        $pf = [int]$c.Owner.parts.Episode
-                        $pl = [int]$c.Owner.parts.EpisodeLast
+
+                    # WHICH episodes the owning entry holds. This must never be
+                    # narrower than the truth, because the whole question is
+                    # whether anything would be lost with the entry.
+                    #
+                    # It was, and it cost a season. The guard used to be
+                    # `-and $Owner.parts.IsMultiEpisode -and $Owner.parts.EpisodeLast`,
+                    # which reads an explicit range out of the NAME. A whole-season
+                    # pack states no range - 'Euphoria.S03.COMPLETE' parses to
+                    # Episode 0, IsMultiEpisode false, EpisodeLast null - so the
+                    # guard was false, the branch was skipped, and the verdict fell
+                    # through to a plain `delete` with the pack's hash.
+                    #
+                    #   2026-10-05 22:28:13 [DELETE] "Euphoria.S03.COMPLETE..." [c7fc56a6]
+                    #     - duplicate episode inside Euphoria\Season 3: 5,61 GB beside
+                    #       the larger 8,16 GB copy of the same episode (3-E7)
+                    #
+                    # One file of eight was the duplicate. The entry went anyway, and
+                    # S03E01-E06 and S03E08 - about 31 GB with no other copy anywhere
+                    # - went with it. A 40 GB pack was destroyed on the strength of a
+                    # 5,61 GB file.
+                    #
+                    # Read from the episode numbers FIRST, because that is what a
+                    # single and a named range both state outright. Episode 0 means
+                    # the name claims a whole season without saying how many episodes
+                    # that is, so only then is the file list consulted - the same
+                    # resolver rule 4 uses, and the only way to tell eight episodes
+                    # from ten.
+                    #
+                    # Deliberately NOT gated on parts.IsSeries. That flag describes how
+                    # the name parsed, not what the entry holds, and requiring it
+                    # reclassified every owner that lacked it as 'unknown' - the safe
+                    # direction, and still wrong: it turned ordinary single-episode
+                    # deletions into file-only ones and broke thirteen checks.
+                    $pf = $null
+                    $pl = $null
+                    $ownerParts = $null
+                    if ($c.Owner -and $c.Owner.parts) { $ownerParts = $c.Owner.parts }
+
+                    if ($ownerParts) {
+                        $pe0 = $ownerParts.Episode
+                        $pe1 = $ownerParts.EpisodeLast
+                        if ($null -ne $pe0 -and [int]$pe0 -gt 0) {
+                            if ($null -ne $pe1 -and [int]$pe1 -gt [int]$pe0) {
+                                $pf = [int]$pe0
+                                $pl = [int]$pe1
+                            }
+                            else {
+                                # One episode. A single-episode entry holds nothing
+                                # that deleting it could lose beyond the file already
+                                # removed.
+                                $pf = [int]$pe0
+                                $pl = [int]$pe0
+                            }
+                        }
+                    }
+
+                    # Still nothing: the name claims a season without saying how many
+                    # episodes are in it. Ask the entry's own file list.
+                    if ($null -eq $pf -and $ownerParts) {
+                        $ownerKey = Resolve-TorrentSetKey -T $c.Owner -Cache $ownerSetKeyCache
+                        if ($ownerKey -match '^S\d+-E(\d+)-E(\d+)$') {
+                            $pf = [int]$Matches[1]
+                            $pl = [int]$Matches[2]
+                        }
+                    }
+
+                    # NO OWNER is a different case from an owner of unknown range, and
+                    # conflating them was the second half of this regression.
+                    #
+                    # With no torrent claiming the file there is no entry to protect:
+                    # nothing else can be holding the pack's remaining episodes,
+                    # because there is no pack. The file is simply removed, which is
+                    # what this rule did for unowned duplicates from the start.
+                    #
+                    # Gating on `$null -ne $pf` alone sent those to 'delete-file-only'
+                    # instead, so seven real duplicates stopped being removable and the
+                    # library could only ever be cleaned by hand. An absent owner is
+                    # evidence of nothing at risk; an owner whose range cannot be read
+                    # is evidence of a possible pack.
+                    if ($null -eq $c.Owner) {
+                        $packNote = ' No torrent claims this file, so there is no entry to protect.'
+                    }
+                    elseif ($null -ne $pf) {
                         $orphaned = New-Object System.Collections.ArrayList
+
+                        # The episode being duplicated, taken from the GROUP KEY
+                        # rather than from $ep. $ep is the loop variable of the
+                        # per-episode sweep that built $byEpisode and has long since
+                        # finished, so it holds whatever episode that sweep ended on
+                        # - episode 8 here, not episode 7. Comparing against it made
+                        # the duplicate itself count as "still held by this entry",
+                        # which is the one episode it must never count as.
+                        $dupEpisode = 0
+                        if ($key -match '-E(\d+)$') { $dupEpisode = [int]$Matches[1] }
 
                         for ($pe = $pf; $pe -le $pl; $pe++) {
                             # This very episode is the duplicate being removed, so
                             # it does not count as something the entry still holds.
-                            if ($pe -eq $ep) { continue }
+                            if ($pe -eq $dupEpisode) { continue }
 
                             if (-not $fileEpisodes.ContainsKey($pe)) {
                                 [void]$orphaned.Add("S$season" + "E$pe")
@@ -2942,6 +3168,19 @@ function Get-LibraryDuplicateVerdicts {
                         else {
                             $packNote = (" Every remaining episode of the owning pack is already in the library, so the entry goes with its data.")
                         }
+                    }
+                    else {
+                        # The owning entry's episodes could not be established, so it
+                        # is not known to be a single. Deleting it would be a guess,
+                        # and the guess is 'everything it holds'. So only the
+                        # duplicate FILE goes.
+                        #
+                        # Refusing here is never the wrong direction: an entry left
+                        # behind costs one stale row and disk, while an entry deleted
+                        # on a guess costs the episodes nothing else holds, which is
+                        # not recoverable.
+                        $action = 'delete-file-only'
+                        $packNote = (" Which episodes the owning entry holds could not be established, so it is kept and only this file is removed - deleting it would be a guess, and the guess is everything it holds.")
                     }
 
                     [void]$out.Add([pscustomobject]@{
@@ -3063,7 +3302,11 @@ function Get-PhantomVerdicts {
         [object[]]$Torrents,
         [string]$MoviesDir,
         [string]$SeriesDir,
-        [hashtable]$Gone = @{}
+        [hashtable]$Gone = @{},
+        # titleAliases, forwarded to the folder resolver. Omitting it makes this
+        # rule look for the library in a folder the entry's own episodes were never
+        # filed under - see the note at the resolver call.
+        [object]$Aliases = $null
     )
 
     $out = New-Object System.Collections.ArrayList
@@ -3148,7 +3391,14 @@ function Get-PhantomVerdicts {
         if ([string]::IsNullOrWhiteSpace($show)) { continue }
         # Through the resolver, so this finds the folder that is actually on disk
         # rather than a freshly spelled path that differs only in case.
-        $showDir = Resolve-LibraryShowDir -SeriesDir $SeriesDir -Title $show
+        #
+        # -Aliases, and it is load-bearing here. This rule asks "does the library
+        # hold a replacement for every episode this entry claimed", and it can only
+        # answer by looking in the folder the entry's OWN episodes were filed
+        # under. Without the alias it asks about 'Euphoria Us' while the pack was
+        # moved to 'Euphoria' - so it finds nothing, concludes there is no
+        # replacement, and holds a phantom it should have deleted.
+        $showDir = Resolve-LibraryShowDir -SeriesDir $SeriesDir -Title $show -Aliases $Aliases
         if (-not $showDir) { continue }
         $seasonDir = Join-Path $showDir ("Season {0}" -f $season)
         $have = Get-LibraryEpisodeFiles -SeasonDir $seasonDir -Season $season
@@ -3259,7 +3509,9 @@ function Get-LibraryRedundantVerdicts {
         [string]$MoviesDir,
         [string]$SeriesDir,
         [double]$TolerancePercent = 10,
-        [hashtable]$Gone = @{}
+        [hashtable]$Gone = @{},
+        # titleAliases, forwarded to the folder resolver - see the note there.
+        [object]$Aliases = $null
     )
 
     $out = New-Object System.Collections.ArrayList
@@ -3318,7 +3570,13 @@ function Get-LibraryRedundantVerdicts {
         # packs with packs by exact episode range instead.
         if ($t.parts.IsMultiEpisode) { continue }
 
-        $showDir = Resolve-LibraryShowDir -SeriesDir $SeriesDir -Title $show
+        # -Aliases, and load-bearing here for the same reason as in the phantom
+        # rule: this one asks "does the library already hold this episode", and it
+        # can only answer by looking where the library copy actually is. Without
+        # the alias it looks in 'Euphoria Us' while the copy sits in 'Euphoria',
+        # finds nothing, and the download is judged against a copy that is not
+        # there - or missed, when one is.
+        $showDir = Resolve-LibraryShowDir -SeriesDir $SeriesDir -Title $show -Aliases $Aliases
         if (-not $showDir) { continue }
         $seasonDir = Join-Path $showDir ("Season {0}" -f $season)
         $have = Get-LibraryEpisodeFiles -SeasonDir $seasonDir -Season $season
@@ -3335,12 +3593,53 @@ function Get-LibraryRedundantVerdicts {
 
         $sum = [int64]$best.Length
         $range = "S{0}E{1}" -f $season, $first
+
+        # BIGGER THAN THE COPY IT WOULD REPLACE. Held, not deleted.
+        #
+        # The tolerance decides whether two encodes are the same episode. It does
+        # NOT decide which one to keep - that is rule 4's job, and rule 4 says the
+        # biggest finished copy wins. Deleting a download that would finish BIGGER
+        # than the library copy takes away the very copy the next rule would have
+        # kept, and leaves the smaller one in its place.
+        #
+        # Measured on a live queue, and it did exactly that:
+        #
+        #   2026-10-06 00:13:13 [DELETE] "Euphoria US S03E07 Rain or Shine 2160p"
+        #     [4094aa89] - the library already has S3E7 at 8,16 GB and this download
+        #     will finish at 8,43 GB, within the 10% tolerance
+        #
+        # 8,43 GB against 8,16 GB is 3,4% - inside the tolerance, so this rule
+        # fired. The torrent was at 0%. Had it finished, rule 4 would have kept it
+        # and deleted the 8,16 GB copy, which is the opposite of what happened.
+        #
+        # So the comparison is made in the direction that matters: this download is
+        # redundant only if it is NOT the better copy. Larger than the library copy
+        # means rule 4 would keep it and drop that one instead, so removing it now
+        # is removing the winner.
+        #
+        # The 10% tolerance is untouched. It still governs everything below - a
+        # download equal to or smaller than the library copy is redundant whatever
+        # the gap, and is deleted as before.
+        if ($mine -gt $sum) {
+            [void]$out.Add([pscustomobject]@{
+                Torrent  = $t
+                LibBytes = $sum
+                LibLabel = $best.Name
+                Scope    = "$show $range"
+                Action   = 'hold'
+                Reason   = ("this download will finish at {0:N2} GB against the library's {1:N2} GB of {2}, so it is the BIGGER copy - held. Rule 4 keeps the largest finished version, and that would be this one; the library copy is what would go." -f `
+                            ($mine / 1GB), ($sum / 1GB), $range)
+            })
+            continue
+        }
+
         if ($mine -le ($sum * $limit)) {
             [void]$out.Add([pscustomobject]@{
                 Torrent  = $t
                 LibBytes = $sum
                 LibLabel = $best.Name
                 Scope    = "$show $range"
+                Action   = 'delete'
                 Reason   = ("the library already has {0} at {1:N2} GB and this download will finish at {2:N2} GB, within the {3:N0}% tolerance" -f `
                             $range, ($sum / 1GB), ($mine / 1GB), $TolerancePercent)
             })
@@ -3489,6 +3788,134 @@ function Test-Errored {
     return ([string]$T.state -eq 'error')
 }
 
+# Stop a torrent and CONFIRM it stopped.
+#
+# `torrents/stop` returning HTTP 200 says the request was accepted, not that the
+# torrent has stopped. qBittorrent tears down connections first, so there is a
+# window where the entry still reads 'uploading' or 'downloading'. That window is
+# not academic: a finished torrent was stopped and deleted in the same breath
+# once, and the state read immediately afterwards still said 'queuedUP'.
+#
+# A delete issued inside that window races the running torrent, and a running
+# torrent re-fetches whatever is deleted underneath it - so the duplicate returns
+# on the next run and the delete looks as though it did nothing.
+#
+# Returns $true only when the torrent is stopped, already stopped, or gone.
+# Is a bigger copy of this content still on its way?
+#
+# Returns a sentence naming it, or '' when nothing incoming threatens this entry.
+# This is a different question from -Knows, and neither replaces the other:
+#
+#   -Knows      did a rule SEE a keeper?
+#   this        is something BIGGER still arriving?
+#
+# A rule can pass the first honestly and still be wrong, because the thing that
+# would beat the keeper does not exist yet. Measured on a live queue:
+#
+#   S3E7  unfinished 8,43 GB @  0%   beats  finished 8,16 GB
+#   S4E8  unfinished 9,03 GB @ 63%   beats  finished 7,72 GB
+#
+# Deleting a finished copy because a bigger one is coming is losing data on credit.
+# The credit is never called in: the replacement can fail, stall, be removed by
+# another rule, or turn out to be unseeded. By then the smaller copy is gone and the
+# episode is not on disk.
+#
+# COMPARED ON DECLARED SIZE, and a magnet is never a threat. A magnet has no size,
+# so it could be anything. Treating "unknown" as "bigger" would mean no finished
+# copy could ever be judged redundant by any rule that consults this, which is not
+# a safety property - it is the rule switched off.
+#
+# Only single episodes are matched. A pack's total says nothing about any one
+# episode, and the same rule-4 reasoning applies: comparing totals across kinds is
+# how a pack gets deleted for being smaller than something that covers none of its
+# episodes.
+function Get-IncomingBetterVerdict {
+    param(
+        [object]$T,
+        [object[]]$Torrents
+    )
+
+    if (-not $T -or -not $T.parts -or -not $T.parts.IsSeries) { return '' }
+    if ($null -eq $T.parts.Season -or $null -eq $T.parts.Episode) { return '' }
+    if ($T.parts.Episode -lt 1) { return '' }
+    if ($T.parts.IsMultiEpisode) { return '' }
+
+    $mine = [double]$T.size
+    if ($mine -le 0) { return '' }
+
+    $season = [int]$T.parts.Season
+    $episode = [int]$T.parts.Episode
+    $show = [string]$T.parts.Title
+
+    $best = $null
+    foreach ($o in @($Torrents)) {
+        if ($null -eq $o -or [string]::IsNullOrWhiteSpace([string]$o.hash)) { continue }
+        if ([string]$o.hash -eq [string]$T.hash) { continue }
+        if (-not $o.parts -or -not $o.parts.IsSeries) { continue }
+        if ($o.parts.IsMultiEpisode) { continue }
+        if ($null -eq $o.parts.Season -or $null -eq $o.parts.Episode) { continue }
+        if ([int]$o.parts.Episode -ne $episode) { continue }
+
+        # A different show entirely is a different episode. Compared on the
+        # leading run of the title, the same way the dedup pass groups them, so
+        # 'the office' and 'the bear' can never meet here.
+        if (-not (Test-SameTitle -A $T.parts -B $o.parts)) { continue }
+
+        $size = [double]$o.size
+        if ($size -le 0) { continue }
+        if ($size -le $mine) { continue }
+        # Already finished: that is a keeper a rule can SEE, which is -Knows's
+        # business, not this one's.
+        if ([double]$o.progress -ge 1) { continue }
+
+        if ($null -eq $best -or $size -gt [double]$best.size) { $best = $o }
+    }
+
+    if ($null -eq $best) { return '' }
+
+    $pct = [double]$best.progress * 100
+    return ("'{0}' [{1}] is still downloading S{2}E{3} and will finish at {4:N2} GB against this entry's {5:N2} GB - it is {6:N1}% done" -f `
+            $best.name, $best.hash.Substring(0, 8), $season, $episode, ([double]$best.size / 1GB), ($mine / 1GB), $pct)
+}
+
+function Stop-TorrentAndConfirm {
+    param(
+        [object]$T,
+        [int]$Attempts = 5,
+        [int]$WaitMs = 400
+    )
+
+    if (-not $T -or [string]::IsNullOrWhiteSpace($T.hash)) { return $true }
+
+    $last = [string]$T.state
+    # 'error' joins the settled states. An errored torrent is not running and
+    # cannot start writing, so there is no writer to race - and stopping it would
+    # change its state, which is precisely the record that says why it must not be
+    # deleted. A rule that legitimately deletes an errored torrent would otherwise
+    # alter the evidence on its way past.
+    if ($last -match '^(stopped|paused|error)') { return $true }
+
+    Invoke-ApiPost -Endpoint 'torrents/stop' -Fields @{ hashes = $T.hash } | Out-Null
+
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        Start-Sleep -Milliseconds $WaitMs
+        $now = $null
+        try { $now = Invoke-ApiGet -Endpoint 'torrents/info' } catch { $now = $null }
+        if ($null -eq $now) { continue }
+
+        foreach ($x in @($now)) {
+            if ([string]$x.hash -ne [string]$T.hash) { continue }
+            $last = [string]$x.state
+            if ($last -match '^(stopped|paused|error|moving|missingFiles)') { return $true }
+        }
+        # Not in the listing at all: it is gone, which is what we wanted.
+        return $true
+    }
+
+    Write-Log 'WARN' ("'{0}' did not confirm stopped (last state '{1}') after {2} attempt(s)" -f $T.name, $last, $Attempts)
+    return $false
+}
+
 function Remove-Torrent {
     param(
         [object]$T,
@@ -3504,18 +3931,111 @@ function Remove-Torrent {
         # the same episode against itself - so nothing unique is lost. See the
         # comment at that call site. It exists so that "protected" stays a decision
         # someone makes on purpose rather than a wall.
-        [switch]$AllowErrored
+        [switch]$AllowErrored,
+        # The rule has ESTABLISHED that a better copy of this content exists -
+        # a finished torrent it compared against, or a file in the library - rather
+        # than merely failing to find one. Required to delete a FINISHED entry.
+        #
+        # This is the burden of proof, inverted. Every verdict here is reached from
+        # a partial view: a snapshot of the queue, a library that may be mid-move,
+        # an owning entry that may not be loaded. A rule that did not find another
+        # copy has not established that this is the only one.
+        #
+        # Deleting a 40 GB season pack on the strength of one 5,61 GB duplicate file
+        # is what that costs. The pack was found to be the smaller version of one
+        # episode, and six other episodes went with it.
+        [switch]$Knows,
+        # Escape hatch for the incoming-better-copy guard, for the rules whose
+        # verdict cannot be about a copy at all.
+        #
+        # DoVi and disc rip: their evidence is the release's own NAME or the
+        # on-disk disc structure. There is no comparison between copies to be
+        # pre-empted by a better one - if the best copy of an episode anywhere
+        # carries a DV marker, it still goes, because the rule is about the format
+        # the library does not hold and was specified "in any state".
+        #
+        # Nothing else passes it. A rule that deletes a COPY has to live with the
+        # possibility that a bigger copy of it has not arrived yet.
+        [switch]$AllowIncomingBetter
     )
     if ($script:gone.ContainsKey($T.hash)) { return }
 
-    # The protection. Placed BEFORE $script:gone is marked, so a refused torrent
-    # is not recorded as dealt with and a later rule in the same run can still
-    # report on it.
+    # THE PROTECTION. Placed BEFORE $script:gone is marked, so a refused torrent is
+    # not recorded as dealt with and a later rule in the same run can still report
+    # on it.
     if (-not $AllowErrored -and (Test-Errored $T)) {
         $label = '"{0}" [{1}]' -f $T.name, $T.hash.Substring(0, 8)
         [void]$script:notes.Add("KEPT (errored)  $label - $Reason")
         Write-Log 'WARN' "$label left alone: qBittorrent reports it as errored, and an errored entry is not a deletion candidate"
         return
+    }
+
+    # THE BURDEN OF PROOF. Not knowing is the reason to keep something.
+    #
+    # Every rule here reaches its verdict from a view that is necessarily partial:
+    # the torrent list is a snapshot, the library may be mid-move, a file's owning
+    # entry may not be loaded, a file listing may be unreadable. A rule that cannot
+    # establish what else exists has not established that this is the only copy -
+    # it has established that it did not find another one.
+    #
+    # Those are different, and only the second one is evidence. Deleting on it is
+    # how a 40 GB pack was destroyed: the library held one copy of an episode, the
+    # rule found it was smaller than another, and removing the entry took six other
+    # episodes that existed nowhere else.
+    #
+    # So a rule that deletes a FINISHED torrent must say what it knows, by passing
+    # -Knows. "Finished" is the trigger because a finished entry is a statement
+    # about data that exists: its content is on disk, and removing the entry cannot
+    # be undone by re-downloading. An unfinished entry is deleted with its partial
+    # data, which is small, already unwanted, and what the rule was written for.
+    #
+    # A rule passing -Knows is claiming its comparison is against a keeper it has
+    # actually SEEN - a finished torrent, or a file in the library - not against the
+    # absence of one. DoVi and disc rip pass it because their verdict comes from the
+    # release's own name and on-disk structure, so there is nothing further to know.
+    #
+    # Without -Knows, the entry stays and says why. It costs a row and some disk. The
+    # alternative costs the data.
+    if (-not $Knows -and [double]$T.progress -ge 1) {
+        $label = '"{0}" [{1}]' -f $T.name, $T.hash.Substring(0, 8)
+        [void]$script:notes.Add("KEPT (nothing established it is a copy)  $label - $Reason")
+        Write-Log 'WARN' ("$label left in the list: it is finished, and no rule established that another copy of it exists. Not knowing is the reason to keep it - the queue and the library are both only a partial view.")
+        return
+    }
+
+    # A BETTER COPY THAT HAS NOT ARRIVED YET.
+    #
+    # -Knows asks whether a rule saw a keeper. It cannot ask whether something
+    # bigger is on its way, because that thing does not exist yet: it is at 0%, or
+    # it is a magnet, or it has not been added. Deleting a finished copy on the
+    # promise of a bigger one is losing data on credit, and the credit is never
+    # called in - the replacement may fail, stall, or be removed by another rule,
+    # and by then the smaller copy is gone and the episode is not on disk.
+    #
+    # Measured on a live queue, six pairs where an unfinished download would beat a
+    # finished one, including one at 0%:
+    #
+    #   S3E7  unfinished 8,43 GB @  0%   beats  finished 8,16 GB
+    #   S4E8  unfinished 9,03 GB @ 63%   beats  finished 7,72 GB
+    #   S3E1  unfinished 8,44 GB @ 11%   beats  finished 8,44 GB
+    #
+    # The comparison is on DECLARED size, which a magnet does not have. A magnet is
+    # therefore never treated as a threat - it could be anything, and treating
+    # "unknown" as "bigger" would mean no finished copy could ever be judged
+    # redundant by any rule that consults this.
+    if (-not $AllowIncomingBetter -and [double]$T.progress -ge 1) {
+        $better = Get-IncomingBetterVerdict -T $T -Torrents @($script:liveTorrents)
+        if ($better) {
+            $label = '"{0}" [{1}]' -f $T.name, $T.hash.Substring(0, 8)
+                # The incoming torrent goes in the NOTE as well as the log. The log is
+            # where a human looks afterwards, but the notes are what the run's own
+            # summary prints - and "kept" with no reason given is the kind of line
+            # that gets read as a bug.
+            [void]$script:notes.Add("KEPT (a bigger copy is still downloading)  $label - $Reason - $better")
+            Write-Log 'WARN' ("$label left in the list: $better")
+            return
+
+        }
     }
 
     $label = '"{0}" [{1}] - {2}' -f $T.name, $T.hash.Substring(0, 8), $Reason
@@ -3530,6 +4050,25 @@ function Remove-Torrent {
     $wantFiles = if ($null -ne $DeleteFiles) { [bool]$DeleteFiles } else { [bool]$cfg.deleteDataFiles }
     $deleteFiles = 'false'
     if ($wantFiles) { $deleteFiles = 'true' }
+
+    # Stop first, and do not go on unless the stop is CONFIRMED. There used to be
+    # no stop here at all, which meant a running torrent could be deleted from
+    # under itself - and a running torrent re-fetches whatever is taken away, so
+    # the file came back and the delete read as a no-op.
+    #
+    # A torrent that will not confirm stopped is NOT deleted. Leaving a duplicate
+    # on disk costs space; deleting under a live writer costs the write.
+    #
+    # $script:gone is UNSET here, not just the delete skipped. It is set further up,
+    # before the dry-run branch, so that everything past this point is final. A
+    # refusal that left it set would mark the torrent as dealt with while it is
+    # still in the list - and every later rule would skip it as already handled, so
+    # a torrent kept for being mid-write would silently never be reconsidered.
+    if (-not (Stop-TorrentAndConfirm -T $T)) {
+        $script:gone.Remove($T.hash)
+        [void]$script:notes.Add(('KEPT (still running)  "{0}" [{1}] - {2}' -f $T.name, $T.hash.Substring(0, 8), $Reason))
+        return
+    }
 
     Invoke-ApiPost -Endpoint 'torrents/delete' -Fields @{
         hashes      = $T.hash
@@ -3782,6 +4321,12 @@ foreach ($t in $all) {
 
 $live = New-Object System.Collections.ArrayList
 foreach ($t in $all) { [void]$live.Add($t) }
+
+# Kept for rules that must ask about ownership by path. $live shrinks as rules
+# remove torrents; a path question needs to know what was there when the run
+# started, not what is left after the deletions.
+$script:liveTorrents = @($all)
+
 # -- rule 1: Dolby Vision ---------------------------------------------------
 
 Write-Host ''
@@ -3793,11 +4338,17 @@ foreach ($t in $live) {
     if ($hit) {
         $doviHits++
         # -AllowErrored. This rule was specified as unconditional - "any state" -
-        # and an errored DoVi entry is still a DoVi entry. Protecting it here was
-        # an over-reach: the error protection exists for rules that judge a
-        # torrent on its merit, and this one never does. It reads the NAME and
+        # and an errored DoVi entry is still a DoVi entry. It reads the NAME and
         # acts on the name alone, so there is nothing an error can change.
-        Remove-Torrent -T $t -AllowErrored -Reason "Dolby Vision marker '$hit'"
+        #
+        # -Knows. The verdict comes from the release's own NAME, which is all the
+        # evidence there is to have: the marker is either in the name or it is not,
+        # and there is no further copy to go and find. If the best copy of an
+        # episode happens to carry a DV marker, this rule still removes it - that
+        # is what "in any state" was asked to mean. DoVi is a statement about the
+        # format, not a comparison between copies. So this rule knows what it
+        # knows without consulting anything else.
+        Remove-Torrent -T $t -AllowErrored -Knows -AllowIncomingBetter -Reason "Dolby Vision marker '$hit'"
     }
 }
 if ($doviHits -eq 0) { Write-Host '  none found' }
@@ -3815,10 +4366,9 @@ if ($cfg.excludeBluRayDiscRips) {
         $hit = Get-DiscRipHit -T $t
         if ($hit) {
             $discHits++
-            # -AllowErrored, for the same reason as Dolby Vision above: the rule is
-            # unconditional and is decided by what is on disk, not by how the
-            # torrent happens to be doing.
-            Remove-Torrent -T $t -AllowErrored -Reason "full Blu-ray disc structure - $hit"
+            # -Knows, for the same reason as Dolby Vision above: the verdict is
+            # read off the on-disk structure, which is the whole of the evidence.
+            Remove-Torrent -T $t -AllowErrored -Knows -AllowIncomingBetter -Reason "full Blu-ray disc structure - $hit"
         }
     }
     if ($discHits -eq 0) { Write-Host '  none found' }
@@ -3948,8 +4498,26 @@ else {
         }
         else {
             $left = $timeout - $d.Minutes
-            Write-Host ("  candidate at position {0}: {1,-46} dead for {2:N0} min ({3:N0}m left), witness at position {4}" -f `
-                @($d.QueuePos, $shortD, $d.Minutes, $left, $d.WitnessPos)) -ForegroundColor DarkGray
+              # "no witness yet", not "witness at position 0".
+              #
+              # $d.WitnessPos is 0 when there is no witness, and it was printed
+              # unconditionally - so a candidate with NO witness printed as though one
+              # existed, at position 0, which is in FRONT of it. That is the precise
+              # thing this rule must never do: require the witness to be further down
+              # the queue, then report a witness in front of it.
+              #
+              # The rule was never wrong - it holds the torrent - but the panel made it
+              # look broken, and a reader cannot tell a real position 0 from a
+              # missing one.
+              $witnessText = if ($d.HasWitness) { "witness at position $($d.WitnessPos)" } else { 'no witness yet' }
+              # The argument list is built in a variable, not concatenated at the
+              # call site: -f binds tighter than +, so
+              #   "..." -f @($a,$b,$c,$d) + @($e)
+              # formats with the FIRST array and then appends the rest to the
+              # resulting STRING. It throws FormatException at run time, which is
+              # how a one-line display fix took the whole run down.
+              $drainRow = @($d.QueuePos, $shortD, $d.Minutes, $left, $witnessText)
+              Write-Host ("  candidate at position {0}: {1,-46} dead for {2:N0} min ({3:N0}m left), {4}" -f $drainRow) -ForegroundColor DarkGray
         }
     }
 }
@@ -4120,6 +4688,18 @@ if ($cfg.assignCategories) {
 Write-Host ''
 Write-Host 'Dedup (keep the largest finished version, drop anything smaller)'
 
+# The user's 10%: two encodes of one episode that differ by less than this are the
+# same episode, and one of them is redundant. Rule 4d already applies it against the
+# library; this pass applies the SAME number to the other side of the comparison -
+# an unfinished copy of an episode that is already FINISHED in the queue.
+#
+# One key, one meaning, read from one place. Two separate tolerance settings would
+# be two chances to drift apart, and the failure mode is silent: a keeper 9% larger
+# deleted by one rule and kept by the other, with nothing in the log to say why.
+$dedupTol = 10
+if ($cfg.PSObject.Properties['libraryRedundantTolerancePercent']) { $dedupTol = [double]$cfg.libraryRedundantTolerancePercent }
+$tolerance = $dedupTol
+
 # Rule 4 weighs releases that hold the IDENTICAL set of episodes. It used to look
 # for those inside one cluster, and a cluster is built from the release TITLE, so
 # two packs of one show whose names differ never met. Measured on a live queue:
@@ -4258,14 +4838,53 @@ foreach ($c in $setGroups) {
                         # alone here.
                         if ($m.size -le 0) { continue }
 
-                        if ($m.size -ge $keeper.size) { continue }
+                        if ($m.size -ge $keeper.size) {
+                            # A FINISHED copy that is bigger is the keeper itself -
+                            # rule 4 is "both finished, keep the bigger, delete the
+                            # smaller", and the survivor must never be deleted. So
+                            # the tolerance below is deliberately one-sided: it can
+                            # only ever reach an UNFINISHED copy.
+                            if ([double]$m.progress -ge 1) { continue }
 
-                        # Spelled out for the errored case so the log says WHY an
-                        # errored entry was removed, rather than leaving it to be
-                        # inferred from the fact that it happened at all.
-                        $why = if ($m.progress -ge 1) { 'smaller completed version' }
-                               elseif (Test-Errored $m) { 'errored, and the same episodes are already finished elsewhere' }
-                               else { 'incomplete, and a bigger version is already finished' }
+                            # BIGGER IS NOT ACTUALLY BIGGER.
+                            #
+                            # A download that would finish larger is the better
+                            # version, and throwing it away throws away the better
+                            # version. But 61 KB out of 9 GB is not a better version,
+                            # it is the difference between two releases of the same
+                            # encode: a padded track, a container detail, a slightly
+                            # different tag. Measured on a live queue, one episode:
+                            #
+                            #    9.057.610.150 B    0,6%   +0,00067%   kept
+                            #    9.057.552.150 B   12,8%   +0,00003%   kept
+                            #    9.057.550.486 B    6,1%   +0,00001%   kept
+                            #    9.057.549.336 B  100,0%              finished keeper
+                            #
+                            # Three downloads of one episode, each a rounding error
+                            # larger than the copy ALREADY FINISHED, all kept by a
+                            # strict ">=" and all fetching the same thing. On a size
+                            # ratio they are indistinguishable, and the finished copy
+                            # is the one that is done.
+                            #
+                            # The tolerance is the same 10% rule 4d applies against
+                            # the library, read the same way: "no more than 10%
+                            # bigger" counts as within it, so a download exactly on
+                            # the limit is redundant. Anything past it is a different
+                            # encode and stays - a 2160p next to a finished 1080p is
+                            # a genuine better copy and is not touched.
+                            $over = ([double]$m.size - [double]$keeper.size) / [double]$keeper.size
+                            if ($over -gt ($tolerance / 100.0)) { continue }
+
+                            $why = 'incomplete, and not meaningfully bigger than a finished version'
+                        }
+                        else {
+                            # Spelled out for the errored case so the log says WHY an
+                            # errored entry was removed, rather than leaving it to be
+                            # inferred from the fact that it happened at all.
+                            $why = if ($m.progress -ge 1) { 'smaller completed version' }
+                                   elseif (Test-Errored $m) { 'errored, and the same episodes are already finished elsewhere' }
+                                   else { 'incomplete, and a bigger version is already finished' }
+                        }
 
                         # The ONE place an errored torrent may be deleted.
                         #
@@ -4287,8 +4906,26 @@ foreach ($c in $setGroups) {
                         #
                         # In short: an errored copy of something already held in
                         # full is not lost data, it is a spare copy that failed.
-                        Remove-Torrent -T $m -AllowErrored -Reason ("{0} of '{1}' ({2}); '{3}' is finished at {4:N2} GB against {5:N2} GB" -f `
-                            $why, $label, $k, $keeper.name, ($keeper.size / 1GB), ($m.size / 1GB))
+                        #
+                        # -Knows. This is the one rule that genuinely SEES its
+                        # keeper: $keeper is a real torrent in this snapshot, it is
+                        # progress >= 1, and the set key proves the two hold the
+                        # identical episodes. That is a keeper found, not a keeper
+                        # missing - which is the difference -Knows asks about. The
+                        # snapshot is still only a snapshot, so the claim is scoped
+                        # to what it can be: the content exists, finished, in the
+                        # entry named in this very message.
+                        # The percentage is in the message when it decided anything.
+                        # "Incomplete, and not meaningfully bigger" is a claim about
+                        # a number; a reader checking it later needs the number, not
+                        # an adjective.
+                        $gap = ''
+                        if ($m.size -ge $keeper.size) {
+                            $gap = (" - only {0:N2}% bigger, inside the {1:N0}% tolerance" -f `
+                                (([double]$m.size - [double]$keeper.size) / [double]$keeper.size * 100), $tolerance)
+                        }
+                        Remove-Torrent -T $m -AllowErrored -Knows -Reason ("{0}{1} of '{2}' ({3}); '{4}' is finished at {5:N2} GB against {6:N2} GB" -f `
+                            $why, $gap, $label, $k, $keeper.name, ($keeper.size / 1GB), ($m.size / 1GB))
                     }
                 }
             }
@@ -4405,7 +5042,11 @@ foreach ($c in $setGroups) {
             $reason = ("duplicate of '{0}': both are complete, and the single's own copy of S{1}E{2} is smaller ({3:N2} GB) than the pack's file for that episode ({4:N2} GB); the pack holds other episodes this single cannot replace, so the single goes" `
                 -f $pack.name, $pack.parts.Season, $single.parts.Episode,
                    ($single.size / 1GB), ($epFileBytes / 1GB))
-            Remove-Torrent -T $single -Reason $reason -DeleteFiles $true
+            # -Knows. It SEES its keeper: $pack is a real torrent, both are
+            # complete, and $epFileBytes is that pack's own file for this episode -
+            # measured, not inferred. The single is one episode and the pack holds
+            # it, so nothing unique goes with it.
+            Remove-Torrent -T $single -Knows -Reason $reason -DeleteFiles $true
 
             # The pack stays STOPPED. It was stopped above to release its file
             # handles for the delete, and nothing here starts it again.
@@ -4452,13 +5093,17 @@ else {
             continue
         }
 
-        # A pack whose entry must survive. Shown distinctly, because the file is
-        # being removed and the entry deliberately is not - a panel that showed
-        # both as plain deletions would read as a bug.
+        # A pack whose entry must survive is shown distinctly, because the file is
+        # being removed and the entry deliberately is not.
+        #
+        # It does NOT continue here. It used to, and that meant a real
+        # 'delete-file-only' verdict printed "file" and then fell out of the loop
+        # before the removal below - so the duplicate was announced and never
+        # deleted, every run, silently. The verdict is carried, not consumed: the
+        # branch further down handles both the panel and the removal.
         if ($d.Action -eq 'delete-file-only') {
             Write-Host ("  file    {0,-9} {1}" -f $d.Episode, $short) -ForegroundColor Magenta
             Write-Host ("          {0}" -f $d.Reason) -ForegroundColor DarkGray
-            continue
         }
 
         # Both sides are stopped before anything is removed: the duplicate, and the
@@ -4492,8 +5137,15 @@ else {
 
         # The torrent goes with the file. Deleting only the file would leave the
         # owner re-downloading it, which is the same duplicate on the next run.
+        #
+        # -Knows. The verdict function already established the whole of it, and
+        # established it against something it can name: it walked this very season
+        # folder, found a second file for the same episode, measured both, and
+        # recorded the larger one as the keeper. Every episode the owning entry
+        # still holds was counted against the library before this call was reached.
+        # A keeper found in the folder on disk, not the absence of one.
         if ($d.Owner) {
-            Remove-Torrent -T $d.Owner -Reason $d.Reason
+            Remove-Torrent -T $d.Owner -Knows -Reason $d.Reason
         }
         else {
             # No torrent claims it, so there is nothing to ask qBittorrent to
@@ -4536,13 +5188,27 @@ else {
     Write-Host ''
     Write-Host ("Redundant download check (within {0:N0}% of an episode already in the library)" -f $redundantTol)
     $redundant = @(Get-LibraryRedundantVerdicts -Torrents $all -MoviesDir $cfg.moviesDir `
-                                                -SeriesDir $cfg.seriesDir -TolerancePercent $redundantTol)
+                                                -SeriesDir $cfg.seriesDir -TolerancePercent $redundantTol `
+                                                -Aliases $cfg.titleAliases)
 
     if ($redundant.Count -eq 0) {
         Write-Host ("  no download is within {0:N0}% of an episode already in the library" -f $redundantTol) -ForegroundColor DarkGray
     }
     foreach ($r in $redundant) {
         $shortR = $r.Torrent.name.Substring(0, [Math]::Min(52, $r.Torrent.name.Length))
+        # HELD, and shown distinctly. This download would finish BIGGER than the
+        # library copy, so rule 4 would keep IT and delete that one. Printing it as
+        # REDUNDANT claims the opposite of what the next rule would do, and the two
+        # would have to be read together to see the contradiction.
+        if ([string]$r.Action -eq 'hold') {
+            Write-Host ("  hold    {0,-9} download {1,7:N2} GB   library {2,7:N2} GB   ({3,5:N1}% done)" -f `
+                $r.Scope, ([double]$r.Torrent.size / 1GB), ($r.LibBytes / 1GB), ([double]$r.Torrent.progress * 100)) -ForegroundColor Yellow
+            Write-Host ("            {0}" -f $shortR) -ForegroundColor DarkGray
+            Write-Host ("            {0}" -f $r.Reason) -ForegroundColor DarkGray
+            [void]$script:notes.Add("held: this download would be the bigger copy - $($r.Torrent.name) - $($r.Reason)")
+            continue
+        }
+
         Write-Host ("  REDUNDANT {0,-9} download {1,7:N2} GB   library {2,7:N2} GB   ({3,5:N1}% done)" -f `
             $r.Scope, ([double]$r.Torrent.size / 1GB), ($r.LibBytes / 1GB), ([double]$r.Torrent.progress * 100)) -ForegroundColor Red
         Write-Host ("            {0}" -f $shortR) -ForegroundColor DarkGray
@@ -4553,7 +5219,17 @@ else {
         if (-not $DryRun) {
             Invoke-ApiPost -Endpoint 'torrents/stop' -Fields @{ hashes = $r.Torrent.hash } | Out-Null
         }
-        Remove-Torrent -T $r.Torrent -Reason $r.Reason -DeleteFiles $true
+        # -Knows. It SEES its keeper: Get-LibraryRedundantVerdicts opened this
+        # torrent's own season folder and measured a file that is already there,
+        # within the tolerance. That is the library copy found on disk, named in
+        # the reason, not the absence of one.
+        #
+        # This rule only ever judges a download in progress - a completed torrent
+        # is explicitly not its business - so the -Knows guard would not fire here
+        # anyway. It is passed because the claim is true, not because it is needed,
+        # and a rule that later widens to finished torrents should already be
+        # making the claim.
+        Remove-Torrent -T $r.Torrent -Knows -Reason $r.Reason -DeleteFiles $true
     }
 }
 
@@ -4578,7 +5254,8 @@ if (-not $phantomOn) {
 else {
     Write-Host ''
     Write-Host 'Phantom check (finished, but its data is gone)'
-    $phantoms = @(Get-PhantomVerdicts -Torrents $all -MoviesDir $cfg.moviesDir -SeriesDir $cfg.seriesDir)
+    $phantoms = @(Get-PhantomVerdicts -Torrents $all -MoviesDir $cfg.moviesDir -SeriesDir $cfg.seriesDir `
+                                              -Aliases $cfg.titleAliases)
 
     if ($phantoms.Count -eq 0) {
         Write-Host '  every finished entry has its data where it says it does' -ForegroundColor DarkGray
@@ -4599,7 +5276,15 @@ else {
         }
         Write-Host ("  PHANTOM {0}" -f $shortP) -ForegroundColor Red
         Write-Host ("          {0}" -f $p.Reason) -ForegroundColor DarkGray
-        Remove-Torrent -T $p.Torrent -Reason $p.Reason -DeleteFiles $false
+        # -Knows, and this is the rule that most needs it - a phantom is finished
+        # by definition, so the guard fires on every single one of them.
+        #
+        # It SEES its replacement. Get-PhantomVerdicts requires that EVERY episode
+        # the entry claimed has a file present in the library season folder, and it
+        # refuses the entry outright when one is missing. Those files were opened
+        # and found. The data is already gone; what the entry is asserting is
+        # false, and the replacement is on disk.
+        Remove-Torrent -T $p.Torrent -Knows -Reason $p.Reason -DeleteFiles $false
     }
 }
 
@@ -4624,7 +5309,12 @@ if ($cfg.moveCompletedToLibrary) {
             Write-Log 'WARN' "completed but unidentified, not moving: $($t.name)"
             continue
         }
-        $dir = Get-LibraryTargetDir -T $t -MoviesDir $cfg.moviesDir -SeriesDir $cfg.seriesDir
+        # -Aliases, so a show the parser spells two ways is filed in ONE folder.
+        # Without it the two spellings land in different show folders, and rule
+        # 4b only ever compares inside a single one - so the alias stops the split
+        # that would otherwise hide the duplicates from the rule meant to find
+        # them. See Resolve-LibraryShowDir.
+        $dir = Get-LibraryTargetDir -T $t -MoviesDir $cfg.moviesDir -SeriesDir $cfg.seriesDir -Aliases $cfg.titleAliases
         Move-ToLibrary -T $t -TargetDir $dir -Live $all -Gone $script:gone `
                        -VerifySeconds $verifySeconds -PollMs $verifyPollMs
     }

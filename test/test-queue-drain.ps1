@@ -348,6 +348,103 @@ $c = New-Clock
 Check 'the drain looks past priority 0 to real positions'   ((Row (Judge @(M 'm0' 0; M 'm11' 11) $c)).Hash -eq 'm11')
 
 Write-Host ''
+Write-Host '== a magnet that has not had its turn is not a candidate =='
+# The candidate test used to accept any torrent with size 0, which includes one
+# sitting in line that qBittorrent has never given a slot to. Measured on a live
+# queue:
+#
+#   pos 11-20   size 8.9 GB, 8.7 GB ...   served: working or stalled
+#   pos 21      size 0, state queuedDL     never had a turn
+#   pos 22-30   size 0, state queuedDL     never had a turn
+#
+# Position 21 was the first magnet behind the window, so its clock started on
+# arrival and 30 minutes later it would have been deleted for failing to fetch
+# metadata - having never been asked to fetch any.
+#
+# This is rule 2's own distinction, inherited: "a magnet at position 150 has never
+# been handed a peer connection, so it has not tried anything, and deleting it for
+# being unavailable is really deleting it for not having been started yet."
+#
+# Only metaDL means "fetching metadata right now". A magnet queued behind the
+# window is queuedDL, and one whose metadata resolved has a size.
+
+$c = New-Clock; Age $c 'q21' 600
+$queuedOnly = @(M 'q21' 21 'queuedDL'; D 'w30' 30)
+$none = Row (Judge $queuedOnly $c)
+Check 'a queuedDL magnet behind the window is NOT a candidate' ($null -eq $none)
+
+$c = New-Clock; Age $c 'q21' 600
+$stillNone = Row (Judge @(M 'q21' 21 'queuedDL'; D 'w30' 30) $c)
+Check 'not even after a long wait'                          ($null -eq $stillNone)
+
+$c = New-Clock; Age $c 'q21' 600
+$both = @(M 'q21' 21 'queuedDL'; M 'm22' 22 'metaDL'; D 'w30' 30)
+$past = Row (Judge $both $c)
+Check 'the drain reaches PAST it to one that is trying'     ($null -ne $past -and $past.Hash -eq 'm22')
+
+$c = New-Clock; Age $c 'm11' 600
+$still = Row (Judge @(M 'm11' 11 'metaDL'; D 'w30' 30) $c)
+Check 'a metaDL magnet is still the candidate'              ($null -ne $still -and $still.Hash -eq 'm11')
+
+# Read off the source, so the state cannot be loosened back to "any torrent with
+# no size" without this failing.
+$drainSrc = ''
+$ds = $src.IndexOf('function Get-QueueDrainVerdict')
+$de = $src.IndexOf('function Resolve-ShowAlias')
+if ($ds -ge 0 -and $de -gt $ds) { $drainSrc = $src.Substring($ds, $de - $ds) }
+Check 'the candidate test names metaDL explicitly'         ($drainSrc -cmatch "if \(\`$t\.state -ne 'metaDL'\) \{ continue \}")
+Check 'and does not accept a bare size 0'                 (-not ($drainSrc -cmatch '\$noSize = \(\(\$t\.size -eq 0\)'))
+
+Write-Host ''
+
+Write-Host ''
+Write-Host '== NO copy anywhere may accept a bare size 0 =='
+# This is the second time a duplicated rule has drifted, and the same shape both
+# times: the logic lives in more than one place, one copy is fixed, and the other
+# keeps saying the old thing.
+#
+#   rule 4 tolerance - the manager inline, and Get-DedupVerdicts in status.ps1.
+#                      The manager was fixed; the preview would have gone on
+#                      reporting an episode as clean an hour before the run
+#                      deleted it.
+#   candidate gate   - this rule and rule 2, in BOTH files. Four gates between
+#                      them, and fixing the drain alone left status.ps1 still
+#                      counting down against position 21 - the exact torrent the
+#                      user had already said must not have a timer.
+#
+# Nothing keeps these in step except a check that reads every gate, so this reads
+# both files whole and asserts the permissive form is gone from all of them. A new
+# copy added later with the old logic fails here instead of silently resurrecting a
+# timer against torrents that were never given a turn.
+
+$mgrSrc = [System.IO.File]::ReadAllText((Get-ProjectFile 'qbt-manager.ps1'), [System.Text.Encoding]::UTF8)
+$preSrc = [System.IO.File]::ReadAllText((Get-ProjectFile 'status.ps1'), [System.Text.Encoding]::UTF8)
+
+$gates = @(
+    @{ n = 'manager  rule 2 window';   s = $mgrSrc; p = '\$noMeta = \(\$t\.state -eq ''metaDL''\)' }
+    @{ n = 'manager  rule 2 delete';   s = $mgrSrc; p = '\$noSize = \(\$t\.state -eq ''metaDL''\)' }
+    @{ n = 'manager  rule 2c drain';   s = $mgrSrc; p = "if \(\`$t\.state -ne 'metaDL'\) \{ continue \}" }
+    @{ n = 'preview  rule 2 window';   s = $preSrc; p = "\`$noMeta = \(\(Get-Prop \`$t 'state'\) -eq 'metaDL'\)" }
+    @{ n = 'preview  rule 2c drain';   s = $preSrc; p = "if \(\`$t\.state -ne 'metaDL'\) \{ continue \}" }
+)
+foreach ($g in $gates) {
+    Check ("the '{0}' gate names metaDL" -f $g.n) ($g.s -cmatch $g.p)
+}
+
+# The permissive form, gone from both files outright rather than gate by gate, so
+# a sixth gate added with the old logic fails here too.
+Check 'no gate anywhere still accepts a bare size 0' (
+    (-not ($mgrSrc -cmatch '\(\(\$t\.size -eq 0\) -or \(')) -and
+    (-not ($preSrc -cmatch "\(\(Get-Prop \`$t 'size' 0\) -eq 0\) -or")))
+
+# The count is pinned so that DELETING a gate fails here. Deleting one would
+# silently disable a rule rather than break it, and that is the harder failure to
+# notice: no torrent would ever be judged and nothing would say why.
+$gateCount = ([regex]::Matches($mgrSrc, '(?m)^\s*\$(noMeta|noSize) = .*metaDL')).Count +
+             ([regex]::Matches($mgrSrc, "(?m)^\s*if \(\`$t\.state -ne 'metaDL'\) \{ continue \}")).Count +
+             ([regex]::Matches($preSrc, '(?m)^\s*\$noMeta = .*metaDL')).Count +
+             ([regex]::Matches($preSrc, "(?m)^\s*if \(\`$t\.state -ne 'metaDL'\) \{ continue \}")).Count
+Check 'all five gates are still there' ($gateCount -eq 5)
 if ($script:fails -eq 0) {
     Write-Host "all queue-drain tests passed"
 }

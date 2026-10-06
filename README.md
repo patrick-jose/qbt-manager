@@ -56,25 +56,24 @@ This is not theoretical. An earlier version of the rule read `priority` as a
 none of which had been handed a single peer connection.
 
 **Judging by the title fails across release groups.** One episode of one show is
-routinely published as `Its.Always.Sunny.in.Philadelphia.S18E03...`,
-`It s Always Sunny in Philadelphia...` and `Its Always Sunny In Philadelphia
-s18 WEB-DL...`. Grouping by show name makes those three different shows, and the
-duplicates invisible. The fix that does work is the **library folder**: the
-manager filed them together itself, so the folder is a grouping already proven by
-a different route. Two files in the same season folder claiming the same episode
-are the same episode by construction.
+routinely published as `Some.Show.S18E03...`, `Some s Show S18E03...` and
+`Some Show s18 WEB-DL...`. Grouping by show name makes those three different
+shows, and the duplicates invisible. The fix that does work is the **library
+folder**: the manager filed them together itself, so the folder is a grouping
+already proven by a different route. Two files in the same season folder claiming
+the same episode are the same episode by construction.
 
 That fix found **7 duplicated episodes and 10,5 GB** sitting finished in the
 library.
 
-**A name is a claim, and two of them outlived their truth.** Comparing packs means
-knowing which episodes each one holds, and that was read off the release name. A
-name saying `S03` with no episode keys `S3-ALL` — a value no range can equal, so
-`Euphoria.S03.COMPLETE` (finished, 40,37 GB, actually `S03E01`–`E08`) was invisible
-to the 15,69 GB `Euphoria US S03e01-08` holding those same eight episodes, which
-sat downloading at 96,5% until both were removed. Two causes, both needed fixing:
-the set key was a guess where the release's own **file list** was available, and
-grouping by title kept two packs of one show apart whenever their names differed.
+**A name is a claim, and some outlive their truth.** Comparing packs means knowing
+which episodes each one holds, and that was read off the release name. A name
+saying `S03` with no episode keys `S3-ALL` — a value no range can equal. So a
+finished 40 GB pack that actually held `S03E01`–`E08` was invisible to a 16 GB
+`S03E01-E08` pack of those same eight episodes, which sat downloading at 96% until
+both were removed. Two causes, both needed fixing: the set key was a guess where
+the release's own **file list** was available, and grouping by title kept two
+packs of one show apart whenever their names differed.
 
 `S3-ALL` is now checked against the file list, and the comparison is made across a
 show's title variants. Both changes only ever *narrow* what a name may claim: a

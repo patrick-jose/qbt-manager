@@ -150,7 +150,11 @@ Check '9% bigger is still redundant' (@(@($r)).Count -eq 1)
 
 # 11% bigger - outside
 $r = Judge @((Dl 'b3' 'Its Always Sunny in Philadelphia S18E02 Eleven 1080p x264 [ext.to]' ([int]($base * 1.11))))
-Check '11% bigger is KEPT - it may be the better copy' (@(@($r)).Count -eq 0)
+# "KEPT" is asserted as NOT DELETED, not as silence. A download bigger than the
+# library copy now gets a 'hold' row that says why, and demanding zero rows would
+# fail on the improved behaviour - a rule that explains itself is better than one
+# that says nothing, and "kept" never meant "silent".
+Check '11% bigger is KEPT - it may be the better copy' (@(@($r | Where-Object { [string]$_.Action -eq 'delete' })).Count -eq 0)
 
 # 50% smaller - inside, and must be caught
 $r = Judge @((Dl 'b4' 'Its Always Sunny in Philadelphia S18E02 Half 1080p x264 [ext.to]' ([int]($base * 0.5))))
@@ -158,7 +162,7 @@ Check '50% smaller is redundant' (@(@($r)).Count -eq 1)
 
 # a much bigger download - kept, it is probably 2160p
 $r = Judge @((Dl 'b5' 'Its Always Sunny in Philadelphia S18E02 UHD 2160p x264 [ext.to]' ($base * 4)))
-Check 'a 4x bigger download is kept' (@(@($r)).Count -eq 0)
+Check 'a 4x bigger download is kept' (@(@($r | Where-Object { [string]$_.Action -eq 'delete' })).Count -eq 0)
 
 Write-Host ''
 Write-Host '== the tolerance is configurable =='
@@ -167,7 +171,7 @@ Check 'at 25% the same download is redundant' (@(@($r)).Count -eq 1)
 $r = Judge @((Dl 'c2' 'Its Always Sunny in Philadelphia S18E02 Eq 1080p x264 [ext.to]' $base)) 0
 Check 'at 0% only an equal-or-smaller size is redundant' (@(@($r)).Count -eq 1)
 $r = Judge @((Dl 'c3' 'Its Always Sunny in Philadelphia S18E02 Eq 1080p x264 [ext.to]' ([int]($base * 1.01)))) 0
-Check 'and 1% bigger is not' (@(@($r)).Count -eq 0)
+Check 'and 1% bigger is not' (@(@($r | Where-Object { [string]$_.Action -eq 'delete' })).Count -eq 0)
 
 Write-Host ''
 Write-Host '== packs are NOT judged by this rule =='
@@ -203,6 +207,54 @@ Check 'a whole-season pack is KEPT' (@(@($r)).Count -eq 0)
 # singles, not switched off.
 $r = Judge @((Dl 'p6' 'Its.Always.Sunny.in.Philadelphia S18E07 Single 1080p x264-P6 [ext.to]' 1600 0.0))
 Check 'a single of an episode the library has is still judged' (@(@($r)).Count -eq 1)
+
+Write-Host ''
+Write-Host ''
+Write-Host '== a download BIGGER than the library copy is HELD, not deleted =='
+# The tolerance says two encodes are the same episode. It does NOT say which one
+# to keep - that is rule 4, and rule 4 keeps the largest FINISHED copy. Deleting a
+# download that would finish bigger removes the very copy the next rule would keep.
+#
+# Measured on a live queue, and it did exactly that:
+#   2026-10-06 00:13:13 [DELETE] "Euphoria US S03E07 Rain or Shine 2160p"
+#     - the library already has S3E7 at 8,16 GB and this download will finish at
+#       8,43 GB, within the 10% tolerance
+# 8,43 against 8,16 is 3,4% - inside the tolerance - and the torrent was at 0%.
+# Had it finished, rule 4 would have kept it and deleted the 8,16 GB copy.
+$null = New-Episode -Episode 14 -KB 1600
+$biggerDl = Dl 'g1' 'Its Always Sunny in Philadelphia S18E14 2160p AMZN WEB-DL DDP5 1 H 265-Kitsu [ext.to]' 1640 0.0
+$rBigger = @(Judge @($biggerDl))
+$heldRows = @($rBigger | Where-Object { [string]$_.Action -eq 'hold' })
+Check 'a bigger download is held'                    ($heldRows.Count -eq 1)
+Check 'and it is not a deletion verdict'              (@($rBigger | Where-Object { [string]$_.Action -eq 'delete' }).Count -eq 0)
+Check 'the reason says it is the BIGGER copy'         ($heldRows[0].Reason -cmatch 'BIGGER')
+Check 'and says rule 4 would keep it'                 ($heldRows[0].Reason -cmatch 'Rule 4 keeps the largest')
+
+Write-Host '
+Write-Host '== ...while an equal-or-smaller one is still deleted =='
+# The 10% tolerance is untouched. Everything at or below the library copy stays
+# redundant, exactly as before.
+$null = New-Episode -Episode 15 -KB 1600
+$smallerDl = Dl 'g2' 'Its Always Sunny in Philadelphia S18E15 1080p AMZN WEB-DL DDP5 1 H 264-Kitsu [ext.to]' 1580 0.0
+$rSmaller = @(Judge @($smallerDl))
+$delRows = @($rSmaller | Where-Object { [string]$_.Action -eq 'delete' })
+Check 'a smaller download is still deleted'           ($delRows.Count -eq 1)
+Check 'and the reason still cites the tolerance'      ($delRows[0].Reason -cmatch 'tolerance')
+
+Write-Host '
+Write-Host '== both verdicts state an Action, and the guard comes first =='
+# Read off the source. A row with no Action defaults to nothing, and the caller
+# tests '$r.Action -eq hold', so a missing property sends every row down the
+# delete branch - which is the bug, not a cosmetic one.
+# Sliced by hand rather than through a helper: this suite has no Get-Slice, and the
+# first version called one anyway - which fails on a missing function and reads as
+# a broken assertion rather than a missing helper.
+$vA = $src.IndexOf('function Get-LibraryRedundantVerdicts')
+$vB = $src.IndexOf('function Get-ReapCandidates')
+$vSrc = if ($vA -ge 0 -and $vB -gt $vA) { $src.Substring($vA, $vB - $vA) } else { '' }
+Check 'the hold branch states Action = hold'           ($vSrc -cmatch "Action\s+= 'hold'")
+Check 'and the delete branch states delete'            ($vSrc -cmatch "Action\s+= 'delete'")
+# IndexOf, not -clike. In a wildcard pattern '[string]' is a CHARACTER CLASS # matching one of s/t/r/i/n/g, so the pattern silently matched nothing and the # check failed on correct code. Twice now on this suite: first a double-quoted # regex that ate the $, then this. $holdNeedle = "if ([string]`$r.Action -eq 'hold')" Check 'the caller handles a hold'                    ($src.IndexOf($holdNeedle) -ge 0)
 
 Write-Host ''
 Write-Host '== what it must never touch =='
@@ -269,9 +321,13 @@ Write-Host '== the call site removes the partial data =='
 $runStart = $src.IndexOf('Redundant download check')
 Check 'the redundant pass was found in the run body' ($runStart -gt 0)
 if ($runStart -gt 0) {
-    $runBody = $src.Substring($runStart, 3000)
+    $runBody = $src.Substring($runStart, 5000)
+    # -Knows sits between the target and -Reason, so the pattern names the
+    # arguments rather than the whole call. A full-call pattern stopped matching
+    # when the flag was added, which reads as "the rule changed" when the only
+    # change was a flag on a different concern.
     Check 'the call deletes the torrent AND its data' `
-        ($runBody -match 'Remove-Torrent -T \$r\.Torrent -Reason \$r\.Reason -DeleteFiles \$true')
+        ($runBody -match 'Remove-Torrent -T \$r\.Torrent -Knows -Reason \$r\.Reason -DeleteFiles \$true')
     # SINGLE quotes. In a double-quoted PowerShell string `\$` does not escape the
     # dollar - the backslash is literal and $r interpolates away - so the pattern
     # silently becomes a string that matches nothing, and the check fails while the

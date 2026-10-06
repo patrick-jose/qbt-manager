@@ -360,16 +360,34 @@ by dedup rather than treated as smallest, so rule 2's availability test and its
 
 Three boundaries are deliberate and must not drift:
 
-- **A version bigger than the keeper survives.** Finishing the small copy is not
-  a reason to throw away the large one still downloading. This is what keeps the
-  38 GB Ripley REMUX alive while the 17 GB 1080i is the finished one.
-- **A cluster with no finished member is untouched.** Downloading two
-  qualities of the same episode is not a duplicate problem yet â€” neither copy
-  exists to make the other redundant.
-- **A version whose total size is unknown is skipped.** See above.
+- **A version meaningfully bigger than the keeper survives.** Finishing the small
+  copy is not a reason to throw away the large one still downloading. This is
+  what keeps the 38 GB Ripley REMUX alive while the 17 GB 1080i is the finished
+  one. "Meaningfully" is the 10% tolerance below: 42% bigger is a different
+  encode, 0,0007% bigger is the same one.
 
-**Equal-sized copies are not "smaller"** and are kept, which is the one case
-where the rule declines to act.
+**Bigger has to mean bigger.** A copy that is not more than **10% bigger** than a
+finished keeper is not a better version, and an unfinished one is deleted. The
+tolerance is read as "no more than 10%", so exactly 10% is inside it.
+
+Measured on a live queue, one episode:
+
+| Torrent | total | fetched | vs keeper | verdict |
+|---|---|---|---|---|
+| Some Show S03E01 2160p (finished) | 9,057,549,336 B | 100% | | keeper | kept |
+| Some Show S03E01 2160p | 9,057,610,150 B | 0,6% | | +0,00067% | **deleted** |
+| Some Show S03E01 2160p REPACK | 9,057,552,150 B | 12,8% | | +0,00003% | **deleted** |
+| Some Show S03E01 2160p REPACK | 9,057,550,486 B | 6,1% | | +0,00001% | **deleted** |
+
+Sixty-one kilobytes out of nine gigabytes is not a better encode. It is the
+difference between two releases of the same encode, and under a strict `>=` all
+three downloads kept themselves alive forever against a copy that was already
+finished.
+
+The tolerance reads **`libraryRedundantTolerancePercent`**, the same key rule 4d
+uses against the library, so the two sides of "the same episode" cannot drift apart.
+Past the limit the copy is a genuinely different encode and is kept: a 2160p
+download beside a finished 1080p is 42% bigger and survives.
 
 The keeper must itself still be alive: a version already removed earlier in the
 run by the DoVi or stalled rule cannot go on protecting its group.
@@ -407,11 +425,11 @@ So for a name that keys `S3-ALL`, the set is read off the release's own **file
 list** instead. Measured on a live queue:
 
 ```
-Euphoria.S03.COMPLETE.1080p.AMZN.WEB-DL.H.264-EniaHD        40.37 GB, 100%
+Some.Show.S03.COMPLETE.1080p.WEB-DL.H264-GRP        40.4 GB, 100%
     name says season 3, no episode  ->  keyed S3-ALL
     files say S03E01 .. S03E08     ->  actually eight episodes
 
-Euphoria US S03e01-08 [720p Ita Eng Spa SubS] byMe7alh     15.69 GB, 100%
+Some Show US S03e01-08 720p WEB-DL h264 SubS        15.7 GB, 100%
     name and files both say eight episodes  ->  keyed S3-E1-E8
 ```
 
