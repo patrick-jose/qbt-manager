@@ -1,4 +1,4 @@
-﻿<#
+<#
     qbt-manager.ps1
     Automated download curator for qBittorrent (Web API).
 
@@ -910,6 +910,113 @@ function Get-EpisodeSetKey {
     return "$s-E$($Parts.Episode)"
 }
 
+# The episode set a release REALLY holds, read from its own file list. Returns
+# '' whenever the files cannot say, and '' always means "no opinion" - never a
+# wildcard.
+#
+# This exists because the key above is read off the NAME, and a name is a claim
+# rather than a fact. Measured on a live queue:
+#
+#   Euphoria.S03.COMPLETE.1080p.AMZN.WEB-DL.H.264-EniaHD   40.37 GB, 100%
+#       name says season 3, no episode  ->  keyed S3-ALL
+#       files say S03E01 .. S03E08      ->  actually eight episodes
+#
+#   Euphoria US S03e01-08 [720p Ita Eng Spa SubS] byMe7alh  15.69 GB, 96.5%
+#       name and files both say eight episodes  ->  keyed S3-E1-E8
+#
+# Same eight episodes, the first finished and 2.6x bigger, and the two could
+# never be weighed against each other: S3-ALL is not a range, so it equals no
+# range key, and the set pass had no reason to put them in one group. The 15 GB
+# pack sat there downloading. The label was the defect, not the rule - correcting
+# it makes this the comparison of two packs of the SAME range, which is exactly
+# what the rule permits.
+#
+# Every refusal returns '' and the caller keeps the name it read, which is the
+# safe direction: S<n>-ALL only ever meets S<n>-ALL, which is today's behaviour.
+#
+#   - every file must place itself by an S..E token in its own NAME, and not in
+#     the folders above it, or there is no opinion;
+#   - the run must not span seasons;
+#   - the run must not skip an episode, because a range is the only shape
+#     Get-EpisodeSetKey can compare and 'E01 E02 E04' is not a range;
+#   - a token may itself be a range ('S03E01-08'), which is expanded. A bare
+#     '.720p' is not a range: the tail must be a dash, or a dot with the letter
+#     E, and nothing else.
+function Get-EpisodeSetFromFiles {
+    param($Files)
+
+    if (-not $Files) { return '' }
+    $list = @($Files)
+    if ($list.Count -eq 0) { return '' }
+
+    $season = $null
+    $eps = New-Object System.Collections.Generic.HashSet[int]
+
+    foreach ($f in $list) {
+        $path = [string]$f.name
+        if (-not $path) { return '' }
+
+        # The FILE, not the path. The folder 'Euphoria.S03.1080p...' sits above
+        # every file in the pack, and a folder named 'Show.S03E01-E08' would
+        # stamp episode 1 onto all of them.
+        $leaf = $path
+        $cut = $path.LastIndexOfAny([char[]]@('/', '\'))
+        if ($cut -ge 0) { $leaf = $path.Substring($cut + 1) }
+
+        # The tail carries (?!\d) so it must be the WHOLE number that follows.
+        # Without it .NET backtracks: on 'Show.S03E01-720p.mkv' the two-digit
+        # tail matches '-72', reads it as episode 72, and the file is believed to
+        # hold episodes 1 to 72 - a range wide enough to meet almost any pack of
+        # the same show and let it be deleted as a duplicate of it.
+        $ms = [regex]::Matches($leaf,
+            '(?i)S(\d{1,3})[ ._-]?E(\d{1,3})(?:-(0?\d{1,2})(?!\d)|\.E(0?\d{1,2})(?!\d))?')
+        if ($ms.Count -eq 0) { return '' }
+
+        # A dash and digits that the tail could not take is not an episode range
+        # at all - it is the resolution, as in 'S03E01-720p'. Reading that as a
+        # lone episode 1 would be worse than refusing: S3-E1 is a real key, and a
+        # pack of eight episodes would then match one finished single of episode
+        # 1. A file whose range cannot be understood is no opinion.
+        $dashTail = [regex]::Match($leaf, '(?i)S\d{1,3}[ ._-]?E\d{1,3}-(\d+)')
+        if ($dashTail.Success -and [int]$dashTail.Groups[1].Value -gt 99) { return '' }
+
+        $placed = $false
+        foreach ($m in $ms) {
+            $sn = [int]$m.Groups[1].Value
+            $a = [int]$m.Groups[2].Value
+            $tail = $m.Groups[3].Value
+            if (-not $tail) { $tail = $m.Groups[4].Value }
+            $b = $a
+            if ($tail) { $b = [int]$tail }
+
+            # Nonsense in, no opinion out. 'S03E01-720p' cannot be a range.
+            #
+            # The 99 ceiling is what makes this refuse rather than believe: a
+            # season has never had 720 episodes, and a file named
+            # 'Show.S03E01-720p.mkv' would otherwise be read as holding episodes
+            # 1 to 720 - a range so wide it would meet almost any pack of the
+            # same show and let it be deleted as a duplicate. Written as 100 the
+            # check still passed, because .NET's regex backtracks the tail from
+            # two digits to one and reads '-72' as episode 72.
+            if ($sn -lt 1 -or $a -lt 1 -or $b -lt $a -or $b -gt 99) { continue }
+            if ($null -eq $season) { $season = $sn }
+            elseif ($season -ne $sn) { return '' }   # spans seasons
+            for ($e = $a; $e -le $b; $e++) { [void]$eps.Add($e) }
+            $placed = $true
+        }
+        if (-not $placed) { return '' }
+    }
+
+    if ($null -eq $season -or $eps.Count -eq 0) { return '' }
+    $nums = @($eps | Sort-Object)
+    $first = [int]$nums[0]
+    $last = [int]$nums[$nums.Count - 1]
+    if (($last - $first + 1) -ne $nums.Count) { return '' }   # a gap is not a range
+
+    if ($first -eq $last) { return "S$season-E$first" }
+    return "S$season-E$first-E$last"
+}
+
 function Get-SetTag {
     <#
         A short human tag for the episode set a release carries. DISPLAY ONLY -
@@ -1146,6 +1253,78 @@ function Set-FamilyLabels {
     }
 }
 
+# One show-family key per cluster. '' for a film, an unparsed release, or a
+# cluster whose own members do not agree on a show name.
+#
+# This is the whole of "which show is this", lifted out of
+# Merge-SeriesClustersCore so the set pass can ask the same question instead of
+# guessing again. A second, looser guess is the drift this codebase keeps paying
+# for: Set-FamilyLabels already had to be written to match this logic by hand.
+#
+# The family is the FIRST WORD of the run of leading words a cluster's own
+# members agree on, after the lost-apostrophe repair. First word is what keeps
+# two different shows apart - 'ted lasso' and 'its always sunny in philadelphia'
+# fall in different families, so no rewording of either can produce a merge.
+function Get-ClusterFamilies {
+    param($Clusters)
+
+    $count = @($Clusters).Count
+    $show = @('') * $count
+    if ($count -eq 0) {
+        return [pscustomobject]@{ Show = $show; Family = $show }
+    }
+
+    for ($i = 0; $i -lt $count; $i++) {
+        $parts = $Clusters[$i][0].parts
+        if (-not $parts -or -not $parts.IsSeries) { continue }
+        if ($null -eq $parts.Season -or $null -eq $parts.Episode) { continue }
+
+        # One element per title, each element being that title's whole word
+        # list. Written as an explicit loop rather than a pipeline, because a
+        # pipeline unrolls arrays on the way out and each title's words would
+        # arrive loose - leaving every show name empty and silently disabling
+        # this whole computation.
+        $lists = @()
+        foreach ($m in $Clusters[$i]) { $lists += , @($m.parts.Tokens) }
+        $show[$i] = Get-CommonRun -TokenLists $lists
+    }
+
+    # Some release groups lose the apostrophe before the name ever reaches
+    # qBittorrent: 'It s Always Sunny in Philadelphia S18E03 ... playWEB' carries
+    # no apostrophe at all, just a space. There is nothing for the normalisation
+    # in Get-TitleParts to drop, so the word stays split - and because the family
+    # test keys on the FIRST WORD, 'it' and 'its' became two families and those
+    # releases could never see the other 100-odd members of their own show.
+    #
+    # Rejoining is done only when the rejoined name equals another show name IN
+    # FULL, and when exactly one candidate does. Removing one space from a name
+    # could have been any of a handful of things, but landing exactly on another
+    # show's complete name - every word, in order, nothing left over - is not one
+    # of them by accident. The exact match is the evidence; nothing is merged on
+    # resemblance. A first word of four letters or more is left alone, since that
+    # is longer than any apostrophe-bearing word in a show name needs to be.
+    $names = @{}
+    for ($i = 0; $i -lt $count; $i++) { if ($show[$i]) { $names[$show[$i]] = $true } }
+    for ($i = 0; $i -lt $count; $i++) {
+        if (-not $show[$i]) { continue }
+        $words = @($show[$i] -split ' ')
+        if ($words.Count -lt 2) { continue }
+        if ($words[0].Length -gt 3) { continue }
+        $hits = @()
+        for ($w = 1; $w -lt $words.Count; $w++) {
+            $cand = (@($words[0..($w - 1)]) -join '') + (@($words[$w..($words.Count - 1)]) -join ' ')
+            if ($names.ContainsKey($cand)) { $hits += $cand }
+        }
+        if ($hits.Count -eq 1) { $show[$i] = $hits[0] }
+    }
+
+    $fam = @('') * $count
+    for ($i = 0; $i -lt $count; $i++) {
+        if ($show[$i]) { $fam[$i] = @($show[$i] -split ' ')[0] }
+    }
+    return [pscustomobject]@{ Show = $show; Family = $fam }
+}
+
 function Merge-SeriesClustersCore {
 <#
         Second pass over the dedup groups, for series only.
@@ -1214,67 +1393,32 @@ function Merge-SeriesClustersCore {
 
     # Show name and episode key per cluster. An empty show name means "not a
     # series, or unparsed", and such a cluster is never merged.
-    $show = @('') * $count
-    $key = @('') * $count
-    for ($i = 0; $i -lt $count; $i++) {
-        $parts = $Clusters[$i][0].parts
-        if (-not $parts -or -not $parts.IsSeries) { continue }
-        if ($null -eq $parts.Season -or $null -eq $parts.Episode) { continue }
-        # A pack holds a RANGE of episodes, so it has no single episode
-        # key. Letting it merge would let it bridge two clusters whose
-        # singles are different episodes, quietly folding them together.
-        if ($parts.IsMultiEpisode) { continue }
-
-        # One element per title, each element being that title's whole word
-        # list. Written as an explicit loop rather than a pipeline, because a
-        # pipeline unrolls arrays on the way out and each title's words would
-        # arrive loose - leaving every show name empty and silently disabling
-        # this whole pass.
-        $lists = @()
-        foreach ($m in $Clusters[$i]) { $lists += , @($m.parts.Tokens) }
-        $show[$i] = Get-CommonRun -TokenLists $lists
-        $key[$i] = "$($parts.Year)|S$($parts.Season)E$($parts.Episode)"
-    }
-
-    # Some release groups lose the apostrophe before the name ever reaches
-    # qBittorrent: 'It s Always Sunny in Philadelphia S18E03 ... playWEB' carries
-    # no apostrophe at all, just a space. There is nothing for the normalisation
-    # in Get-TitleParts to drop, so the word stays split - and because the family
-    # test keys on the FIRST WORD, 'it' and 'its' became two families and those
-    # releases could never see the other 100-odd members of their own show.
     #
-    # Rejoining is done only when the rejoined name equals another show name IN
-    # FULL, and when exactly one candidate does. Removing one space from a name
-    # could have been any of a handful of things, but landing exactly on another
-    # show's complete name - every word, in order, nothing left over - is not one
-    # of them by accident. The exact match is the evidence; nothing is merged on
-    # resemblance. A first word of four letters or more is left alone, since that
-    # is longer than any apostrophe-bearing word in a show name needs to be.
-    $names = @{}
-    for ($i = 0; $i -lt $count; $i++) { if ($show[$i]) { $names[$show[$i]] = $true } }
-    for ($i = 0; $i -lt $count; $i++) {
-        if (-not $show[$i]) { continue }
-        $words = @($show[$i] -split ' ')
-        if ($words.Count -lt 2) { continue }
-        if ($words[0].Length -gt 3) { continue }
-        $hits = @()
-        for ($w = 1; $w -lt $words.Count; $w++) {
-            $cand = (@($words[0..($w - 1)]) -join '') + (@($words[$w..($words.Count - 1)]) -join ' ')
-            if ($names.ContainsKey($cand)) { $hits += $cand }
-        }
-        if ($hits.Count -eq 1) { $show[$i] = $hits[0] }
-    }
-
-    # Show family: the first word of the run. Everything downstream is confined
-    # to one family, which is what makes 'different show' unreachable.
+    # The show names come from Get-ClusterFamilies, shared with the set pass so
+    # that 'which show is this' has one answer in this file. That helper also
+    # names packs, because the set pass needs a family for a pack; excluding
+    # packs HERE is this pass's own decision, not a limit of the helper.
+    $famInfo = Get-ClusterFamilies -Clusters $Clusters
+    $show = @($famInfo.Show)
     $family = @{}
     for ($i = 0; $i -lt $count; $i++) {
         if (-not $show[$i]) { continue }
-        $f = @($show[$i] -split ' ')[0]
+        # A pack holds a RANGE of episodes, so it has no single episode
+        # key. Letting it merge would let it bridge two clusters whose
+        # singles are different episodes, quietly folding them together.
+        if ($Clusters[$i][0].parts.IsMultiEpisode) { $show[$i] = ''; continue }
+        $f = @($famInfo.Family[$i] -split ' ')[0]
         if (-not $family.ContainsKey($f)) { $family[$f] = New-Object System.Collections.ArrayList }
         [void]$family[$f].Add($i)
     }
     if ($family.Count -eq 0) { return ,$Clusters }
+
+    $key = @('') * $count
+    for ($i = 0; $i -lt $count; $i++) {
+        if (-not $show[$i]) { continue }
+        $parts = $Clusters[$i][0].parts
+        $key[$i] = "$($parts.Year)|S$($parts.Season)E$($parts.Episode)"
+    }
 
     # One show name per family: the longest run every member agrees on. Each
     # cluster's suffix is then its own run minus that name, so the suffix means
@@ -2310,6 +2454,41 @@ function Test-MoveSettled {
 # $null means "not measured", and every caller skips the comparison on that. A
 # missing file listing, a name that matches nothing, or an unknown size must
 # never turn into a deletion.
+# The episode-set key a torrent is judged under, correcting a name that claims a
+# whole season when its own files say otherwise.
+#
+# Only a name-derived S<n>-ALL is corrected, and that limit is deliberate. It is
+# the one key that makes a claim the name cannot support - a season pack asserts
+# every episode of a season without saying how many there are - and it is the one
+# that silently disables dedup, because no range key can equal it. A name that
+# already states a range ('S03e01-08') is taken at its word, as it is everywhere
+# else; correcting that too would mean listing the files of every series torrent
+# in the queue on every run, for a case that does not arise.
+#
+# $null is never returned: an unknown key is the empty string, which every caller
+# already reads as 'take no part'.
+function Resolve-TorrentSetKey {
+    param(
+        [object]$T,
+        [hashtable]$Cache
+    )
+
+    $nameKey = Get-EpisodeSetKey -Parts $T.parts
+    if ($nameKey -notmatch '^S\d+-ALL$') { return $nameKey }
+    if ([string]::IsNullOrWhiteSpace($T.hash)) { return $nameKey }
+
+    $key = $T.hash.ToLowerInvariant()
+    if ($null -eq $Cache) { $Cache = @{} }
+    if (-not $Cache.ContainsKey($key)) {
+        try { $Cache[$key] = @(Invoke-ApiGet -Endpoint "torrents/files?hash=$($T.hash)") }
+        catch { $Cache[$key] = @() }
+    }
+
+    $fromFiles = Get-EpisodeSetFromFiles -Files @($Cache[$key])
+    if (-not $fromFiles) { return $nameKey }
+    return $fromFiles
+}
+
 function Get-PackEpisodeBytes {
     param(
         [string]$Hash,
@@ -3265,6 +3444,51 @@ function Get-ReapCandidates {
 # actions
 # ---------------------------------------------------------------------------
 
+# Is this torrent in qBittorrent's ERROR state?
+#
+# An errored torrent is NOT a deletion candidate, by instruction. The reason is
+# the partial data: with deleteDataFiles on, removing an errored entry destroys
+# whatever it managed to fetch, and an error is usually a transient or external
+# fault - a disk that filled, a path that moved, a tracker that went away - not a
+# verdict on the torrent. Deleting the entry throws away the only record that it
+# existed and of how far it got.
+#
+# THE EXCEPTIONS, where -AllowErrored is passed and an errored torrent IS deleted:
+#
+#   - DoVi and disc rip. Both are unconditional by specification - "in any state" -
+#     and both decide from the torrent's NAME and on-disk structure, never from
+#     how it is progressing. There is no judgement for an error to have corrupted,
+#     so protecting these was an over-reach.
+#
+#   - Dedup's set-level comparison. An errored torrent is deleted there when a
+#     FINISHED torrent of the IDENTICAL episode set is bigger: pack against pack of
+#     the same range, or one episode against itself, never a pack against a
+#     different pack and never against a single. The keeper is complete and holds
+#     the same episodes, so the errored one is a spare copy that failed rather
+#     than data held only once.
+#
+# WHAT STAYS PROTECTED, and why the distinction matters: pack-vs-single. There the
+# comparison is between a pack's own file for ONE episode and a single's file for
+# that episode - and the pack's other episodes have nothing to say about it. That
+# is the comparison that deleted a 12,54 GB E01-E08 pack over a 46 MB difference
+# in one episode, stranding seven files that existed nowhere else. Deleting an
+# errored single there could strand a pack the same way, so an errored single is
+# left alone. Everything else - no-availability, stalled, redundant download,
+# phantom - also keeps the protection, because each of those judges a torrent on
+# its progress or its availability, which is exactly what an error corrupts.
+#
+# The guard lives at this single chokepoint every rule passes through, rather than
+# being repeated at eleven call sites where it would drift.
+#
+# 'error' is the API spelling; the Web UI shows it as "Error" / "Errored". Only
+# that exact state is protected - 'stalledDL', 'missingFiles' and friends are
+# NOT errors and remain subject to every rule as before.
+function Test-Errored {
+    param([object]$T)
+    if ($null -eq $T) { return $false }
+    return ([string]$T.state -eq 'error')
+}
+
 function Remove-Torrent {
     param(
         [object]$T,
@@ -3273,9 +3497,26 @@ function Remove-Torrent {
         # config". Typed as [object] rather than [Nullable[bool]] because a
         # nullable value type parameter is easy to coerce into $false by
         # accident, and the failure would be silent data left on disk.
-        [object]$DeleteFiles = $null
+        [object]$DeleteFiles = $null,
+        # Escape hatch, used by exactly ONE rule: dedup's set-level comparison.
+        # An errored torrent is deleted there only when a FINISHED torrent of the
+        # IDENTICAL episode set is bigger - pack against pack of the same range, or
+        # the same episode against itself - so nothing unique is lost. See the
+        # comment at that call site. It exists so that "protected" stays a decision
+        # someone makes on purpose rather than a wall.
+        [switch]$AllowErrored
     )
     if ($script:gone.ContainsKey($T.hash)) { return }
+
+    # The protection. Placed BEFORE $script:gone is marked, so a refused torrent
+    # is not recorded as dealt with and a later rule in the same run can still
+    # report on it.
+    if (-not $AllowErrored -and (Test-Errored $T)) {
+        $label = '"{0}" [{1}]' -f $T.name, $T.hash.Substring(0, 8)
+        [void]$script:notes.Add("KEPT (errored)  $label - $Reason")
+        Write-Log 'WARN' "$label left alone: qBittorrent reports it as errored, and an errored entry is not a deletion candidate"
+        return
+    }
 
     $label = '"{0}" [{1}] - {2}' -f $T.name, $T.hash.Substring(0, 8), $Reason
     $script:gone[$T.hash] = $true
@@ -3551,7 +3792,12 @@ foreach ($t in $live) {
     $hit = Get-DoviHit -Name $t.name
     if ($hit) {
         $doviHits++
-        Remove-Torrent -T $t -Reason "Dolby Vision marker '$hit'"
+        # -AllowErrored. This rule was specified as unconditional - "any state" -
+        # and an errored DoVi entry is still a DoVi entry. Protecting it here was
+        # an over-reach: the error protection exists for rules that judge a
+        # torrent on its merit, and this one never does. It reads the NAME and
+        # acts on the name alone, so there is nothing an error can change.
+        Remove-Torrent -T $t -AllowErrored -Reason "Dolby Vision marker '$hit'"
     }
 }
 if ($doviHits -eq 0) { Write-Host '  none found' }
@@ -3569,7 +3815,10 @@ if ($cfg.excludeBluRayDiscRips) {
         $hit = Get-DiscRipHit -T $t
         if ($hit) {
             $discHits++
-            Remove-Torrent -T $t -Reason "full Blu-ray disc structure - $hit"
+            # -AllowErrored, for the same reason as Dolby Vision above: the rule is
+            # unconditional and is decided by what is on disk, not by how the
+            # torrent happens to be doing.
+            Remove-Torrent -T $t -AllowErrored -Reason "full Blu-ray disc structure - $hit"
         }
     }
     if ($discHits -eq 0) { Write-Host '  none found' }
@@ -3871,7 +4120,50 @@ if ($cfg.assignCategories) {
 Write-Host ''
 Write-Host 'Dedup (keep the largest finished version, drop anything smaller)'
 
-foreach ($c in $clusters) {
+# Rule 4 weighs releases that hold the IDENTICAL set of episodes. It used to look
+# for those inside one cluster, and a cluster is built from the release TITLE, so
+# two packs of one show whose names differ never met. Measured on a live queue:
+# 'Euphoria US S03e01-08 [720p Ita Eng Spa SubS] byMe7alh' and
+# 'Euphoria.S03.COMPLETE.1080p.AMZN.WEB-DL.H.264-EniaHD' are the same eight
+# episodes, the second finished at 40.37 GB against the first's 15.69 GB at 96.5%,
+# and they were never compared - the titles put them in different clusters and
+# the packs' different names stopped the merge pass joining those clusters.
+#
+# So clusters are folded by show family before the sets are taken. Folding cannot
+# widen the comparison past a set key: a single episode keys S3-E1 and a pack keys
+# S3-E1-E8, so a pack still never meets a single; a pack of 1 to 8 still never
+# meets a pack of 1 to 10; and one pack's other episodes still have nothing to say
+# about another's. What changes is only that a set key is now found across title
+# variants instead of only within one spelling of the title.
+#
+# Films keep one cluster per group, exactly as before. Test-SameTitle is the only
+# thing that has ever decided whether two films are the same film, and a family
+# key is a series concept.
+$setGroups = @()
+$famInfo = Get-ClusterFamilies -Clusters $clusters
+$fams = @($famInfo.Family)
+$byFamily = @{}
+$familyOrder = New-Object System.Collections.ArrayList
+for ($i = 0; $i -lt $clusters.Count; $i++) {
+    $f = if ($i -lt $fams.Count) { $fams[$i] } else { '' }
+    if (-not $f) { $setGroups += , @($clusters[$i]); continue }
+    if (-not $byFamily.ContainsKey($f)) {
+        $byFamily[$f] = New-Object System.Collections.ArrayList
+        [void]$familyOrder.Add($f)
+    }
+    [void]$byFamily[$f].Add($i)
+}
+foreach ($f in $familyOrder) {
+    $g = New-Object System.Collections.ArrayList
+    foreach ($i in $byFamily[$f]) { foreach ($m in $clusters[$i]) { [void]$g.Add($m) } }
+    $setGroups += , @($g)
+}
+
+# One file listing per torrent for the whole run. The set pass walks every live
+# torrent, so an uncached lookup here would be one HTTP call per torrent per run.
+$script:setKeyCache = @{}
+
+foreach ($c in $setGroups) {
     $members = @($c | Where-Object { -not (Test-AlreadyGone $_) })
     if ($members.Count -lt 2) { continue }
 
@@ -3896,7 +4188,7 @@ foreach ($c in $clusters) {
     # the pack-vs-single pass after the set loop.
     $sets = @{}
     foreach ($m in $members) {
-        $k = Get-EpisodeSetKey -Parts $m.parts
+        $k = Resolve-TorrentSetKey -T $m -Cache $script:setKeyCache
         if (-not $k) {
             [void]$script:notes.Add("cannot tell which episodes '$($m.name)' holds - left out of dedup")
             continue
@@ -3968,9 +4260,34 @@ foreach ($c in $clusters) {
 
                         if ($m.size -ge $keeper.size) { continue }
 
+                        # Spelled out for the errored case so the log says WHY an
+                        # errored entry was removed, rather than leaving it to be
+                        # inferred from the fact that it happened at all.
                         $why = if ($m.progress -ge 1) { 'smaller completed version' }
+                               elseif (Test-Errored $m) { 'errored, and the same episodes are already finished elsewhere' }
                                else { 'incomplete, and a bigger version is already finished' }
-                        Remove-Torrent -T $m -Reason ("{0} of '{1}' ({2}); '{3}' is finished at {4:N2} GB against {5:N2} GB" -f `
+
+                        # The ONE place an errored torrent may be deleted.
+                        #
+                        # Everywhere else an error is protected, because deleting it
+                        # destroys whatever it fetched and throws away the record of
+                        # how far it got. Here that reasoning does not apply, because
+                        # the comparison has already established that this content
+                        # exists, complete, somewhere else:
+                        #
+                        #   - the keeper is progress >= 1, so it is FINISHED. An
+                        #     errored torrent is never the keeper; it can only lose.
+                        #   - $k is Get-EpisodeSetKey, so the two hold the IDENTICAL
+                        #     episodes - pack against pack of the same range, or the
+                        #     same single episode against itself. Nothing in this
+                        #     group is unique, which is what makes removing the
+                        #     entry safe rather than merely convenient.
+                        #   - $m.size > 0 was checked above, so this is not a magnet
+                        #     being judged on an unknown size.
+                        #
+                        # In short: an errored copy of something already held in
+                        # full is not lost data, it is a spare copy that failed.
+                        Remove-Torrent -T $m -AllowErrored -Reason ("{0} of '{1}' ({2}); '{3}' is finished at {4:N2} GB against {5:N2} GB" -f `
                             $why, $label, $k, $keeper.name, ($keeper.size / 1GB), ($m.size / 1GB))
                     }
                 }

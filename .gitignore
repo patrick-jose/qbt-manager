@@ -5,9 +5,4 @@ manager.lock
 backup/
 logs/
 
-# Scratch copies kept while debugging status.ps1. They are older, smaller
-# forks of it and would be published by accident otherwise.
-status-dbg.ps1
-status-dbg2.ps1
-
 # Nothing below this line is machine-specific; everything above it is.

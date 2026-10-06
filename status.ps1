@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Live view of what qbt-manager is doing right now.
 
@@ -291,6 +291,22 @@ function Get-ContentKind {
 # They call the lifted detection functions only. None of them deletes anything.
 
 # Would rule 1 or 1b remove this torrent outright?
+# An errored torrent is not a deletion candidate - the manager's Remove-Torrent
+# refuses it unless the rule passes -AllowErrored. Restated rather than sliced:
+# Test-Errored sits beside Remove-Torrent, in the actions region of the manager,
+# and this script only lifts the detection region.
+#
+# Used in exactly ONE place here - the pack-vs-single pass - because that is the
+# only comparison where an errored torrent must still be spared. The DoVi and
+# disc-rip exclusions are unconditional in the manager, in any state, and decide
+# from the name and the on-disk structure rather than from progress, so they
+# report an errored match exactly as they report any other.
+function Test-Errored {
+    param($T)
+    if ($null -eq $T) { return $false }
+    return ([string](Get-Prop $T 'state') -eq 'error')
+}
+
 function Get-ExclusionVerdict {
     param($T)
     $dovi = Get-DoviHit -Name (Get-Prop $T 'name')
@@ -366,6 +382,38 @@ function Get-FamilyLabel {
     return (Get-ClusterLabel -Members $Members)
 }
 
+# The episode-set key a torrent is judged under, correcting a name that claims a
+# whole season when its own files say otherwise.
+#
+# Mirrors Resolve-TorrentSetKey in qbt-manager.ps1, against this script's own HTTP
+# layer. The shared pure half, Get-EpisodeSetFromFiles, is lifted from the
+# manager's detection region like every other helper here - only the fetch has to
+# be written twice, because the two scripts talk to qBittorrent differently.
+#
+# Only a name-derived S<n>-ALL is corrected. It is the one key that makes a claim
+# the name cannot support and the one that silently disables dedup, because no
+# range key can equal it. A magnet has no file list yet and keeps the name's key.
+function Resolve-SetKey {
+    param($T, $Cache)
+
+    $parts = Get-Prop $T 'parts'
+    $nameKey = Get-EpisodeSetKey -Parts $parts
+    if ($nameKey -notmatch '^S\d+-ALL$') { return $nameKey }
+    $hash = [string](Get-Prop $T 'hash')
+    if (-not $hash) { return $nameKey }
+
+    $key = $hash.ToLowerInvariant()
+    if ($null -eq $Cache) { $Cache = @{} }
+    if (-not $Cache.ContainsKey($key)) {
+        $got = Get-Api -Endpoint ("torrents/files?hash=" + $hash)
+        $Cache[$key] = if ($null -eq $got) { @() } else { @($got) }
+    }
+
+    $fromFiles = Get-EpisodeSetFromFiles -Files @($Cache[$key])
+    if (-not $fromFiles) { return $nameKey }
+    return $fromFiles
+}
+
 # Rule 4, replayed. Returns a hash of hash -> reason for everything the next run
 # would delete inside a cluster. Ordering within the cluster matters and matches
 # The manager's rule: the largest finished version in a group is the keeper, and
@@ -375,7 +423,39 @@ function Get-DedupVerdicts {
 
     $verdicts = @{}
 
-    foreach ($c in $Clusters) {
+    # Clusters are folded by show family first, exactly as the manager now does.
+    # A cluster is built from the release TITLE, so two packs of one show whose
+    # names differ were never compared - which is how a finished 40 GB
+    # 'Euphoria.S03.COMPLETE' sat beside an unfinished 15 GB
+    # 'Euphoria US S03e01-08' of the very same eight episodes with the preview
+    # silent about it. Folding cannot widen the comparison past a set key, so a
+    # pack still never meets a single and two different ranges still never meet.
+    # Films keep one cluster per group, as they always have.
+    $setGroups = @()
+    $famInfo = Get-ClusterFamilies -Clusters $Clusters
+    $fams = @($famInfo.Family)
+    $byFamily = @{}
+    $familyOrder = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $Clusters.Count; $i++) {
+        $f = if ($i -lt $fams.Count) { $fams[$i] } else { '' }
+        if (-not $f) { $setGroups += , @($Clusters[$i]); continue }
+        if (-not $byFamily.ContainsKey($f)) {
+            $byFamily[$f] = New-Object System.Collections.ArrayList
+            [void]$familyOrder.Add($f)
+        }
+        [void]$byFamily[$f].Add($i)
+    }
+    foreach ($f in $familyOrder) {
+        $g = New-Object System.Collections.ArrayList
+        foreach ($i in $byFamily[$f]) { foreach ($m in $Clusters[$i]) { [void]$g.Add($m) } }
+        $setGroups += , @($g)
+    }
+
+    # One file listing per torrent for the whole pass, so a season full of packs
+    # does not re-read the same listing once per group it appears in.
+    $setKeyCache = @{}
+
+    foreach ($c in $setGroups) {
         $members = @($c | Where-Object { -not $Gone.ContainsKey($_.hash) })
         if ($members.Count -lt 2) { continue }
 
@@ -390,7 +470,7 @@ function Get-DedupVerdicts {
         # only when their range matches, which is when they are true rivals.
         $sets = @{}
         foreach ($m in $members) {
-            $k = Get-EpisodeSetKey -Parts $m.parts
+            $k = Resolve-SetKey -T $m -Cache $setKeyCache
             if (-not $k) { continue }
             if (-not $sets.ContainsKey($k)) { $sets[$k] = New-Object System.Collections.ArrayList }
             [void]$sets[$k].Add($m)
@@ -416,7 +496,21 @@ function Get-DedupVerdicts {
                     if ($m.hash -eq $keeper.hash) { continue }
                     if ((Get-Prop $m 'size') -le 0) { continue }
                     if ((Get-Prop $m 'size') -ge (Get-Prop $keeper 'size')) { continue }
+                    # NO errored guard here, and that is deliberate and must stay in
+                    # step with the manager.
+                    #
+                    # Elsewhere an errored torrent is protected. Here it is not,
+                    # because $k is Resolve-SetKey - the keeper holds the
+                    # IDENTICAL episodes and is FINISHED - so an errored member of
+                    # this group is a spare copy that failed, not lost data.
+                    #
+                    # The guard belongs on the DoVi / disc-rip path (an unconditional
+                    # rule that never established anything better existed) and on the
+                    # pack-vs-single path (which requires BOTH sides complete, so an
+                    # errored single is skipped there anyway). This set-level
+                    # comparison is the one place the manager passes -AllowErrored.
                     $why = if ((Get-Prop $m 'progress') -ge 1) { 'smaller completed version' }
+                           elseif (Test-Errored $m) { 'errored, and the same episodes are already finished elsewhere' }
                            else { 'incomplete, and a bigger version is already finished' }
                     $verdicts[$m.hash] = [pscustomobject]@{
                         Verdict = 'DELETE'; Rule = 'dedup'
@@ -461,6 +555,7 @@ function Get-DedupVerdicts {
                                                     -Episode $single.parts.Episode -Cache $fileSizeCache
                 if ($null -eq $epFileBytes) { continue }
                 if ((Get-Prop $single 'size') -le 0) { continue }
+                if (Test-Errored $single) { continue }
 
                 # ONLY THE SINGLE IS EVER DELETED HERE, and the manager's copy of
                 # this pass is narrowed the same way. Both used to pick a winner

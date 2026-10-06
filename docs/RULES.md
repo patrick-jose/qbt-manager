@@ -70,13 +70,17 @@ For every command, see [COMMANDS.md](../COMMANDS.md).
    out rule 2's tolerance. See [The stalled client](#the-stalled-client).
 5. **Categories** â€” every identified torrent is put in `Filmes` or `SÃ©ries`
    (series detection is automatic, by `SxxEyy` / `Season N` markers).
-6. **Dedup** â€” torrents are clustered by title. Within a cluster the largest
-   version that is **100% downloaded** is the keeper, and every other version
-   smaller than it is deleted, whether or not it is itself finished. Versions
-   *bigger* than the keeper are left alone. Nothing is deleted from a cluster
-   with no finished member. Comparison is per SET OF EPISODES, not per group:
-   two packs of the same range are rivals and deduplicate, a pack of a different
-   range is not (see [Episode sets](#episode-sets-packs-compete-only-on-an-identical-range)).
+6. **Dedup** â€” torrents are grouped by title, and groups of one show family are
+   then folded together so a comparison is not lost to a spelling difference.
+   Within a group the largest version that is **100% downloaded** is the keeper,
+   and every other version smaller than it is deleted, whether or not it is itself
+   finished. Versions *bigger* than the keeper are left alone. Nothing is deleted
+   from a group with no finished member. Comparison is per SET OF EPISODES, not per
+   group: two packs of the same range are rivals and deduplicate, a pack of a
+   different range is not (see [Episode sets](#episode-sets-packs-compete-only-on-an-identical-range)).
+   A name claiming a whole season is checked against the release's own file list
+   first, because `S3-ALL` equals no range key and would otherwise opt out of
+   dedup silently.
 7. **Library** â€” survivors that are complete are moved to `moviesDir` or
    `seriesDir`. The move is then **verified**, not assumed, and is refused while
    another torrent holds the folder (see [Moving to the library](#moving-to-the-library)).
@@ -86,6 +90,49 @@ For every command, see [COMMANDS.md](../COMMANDS.md).
    the current run is still writing to.
 
 Finished torrents are never removed merely for being finished.
+
+### Errored torrents, and the three exceptions
+
+A torrent in qBittorrent's `error` state is **not** a deletion candidate. The
+reason is its partial data: with `deleteDataFiles` on, removing an errored entry
+destroys whatever it fetched, and an error is usually a transient or external
+fault â€” a disk that filled, a path that moved, a tracker that went away â€” not
+a verdict on the torrent. Deleting it also throws away the only record that it
+existed and how far it got.
+
+It would otherwise be caught by several rules at once, because an unfinished
+torrent looks like a stalled one, a smaller version of its title, and a redundant
+download simultaneously. So the protection lives at the single chokepoint every
+rule passes through (`Remove-Torrent`), rather than being repeated at eleven call
+sites where it would drift. Only the exact string `error` is protected â€”`stalledDL`,
+`missingFiles` and friends are not errors and remain subject to every rule.
+
+Three rules pass `-AllowErrored` and delete an errored torrent:
+
+| Rule | Why the error changes nothing |
+|---|---|
+| **Dolby Vision** | decided by the torrent's *name*, in any state by specification |
+| **Disc rip** | decided by the on-disk structure, never by progress |
+| **Dedup, set level** | a **finished** torrent of the **identical** episode set is bigger |
+
+The dedup case is the only conditional one. It is safe because the comparison has
+already established that the content exists, complete, somewhere else: the keeper
+is `progress >= 1`, so an errored torrent can never *be* the keeper, only lose;
+and the set key means the two hold the same episodes, so nothing is unique. An
+errored copy of something already held in full is a spare copy that failed.
+
+**What stays protected** is the rest, and the distinction is not cosmetic. Most of
+those rules judge a torrent on its progress or its availability, which is exactly
+what an error corrupts. The one worth naming is **pack-vs-single**: there the
+comparison is between a pack's own file for *one* episode and a single's file for
+that episode, and the pack's other episodes say nothing about it. That is the
+comparison that once deleted a 12,54 GB `E01-E08` pack over a 46 MB difference in
+one episode, stranding seven files that existed nowhere else â€” deleting an errored
+single there could strand a pack the same way.
+
+A DoVi or disc-rip entry that is errored *is* deleted, which is what "in any
+state" means. `status.ps1` mirrors this exactly: it reports an errored DoVi as
+`EXCLUDE` rather than hiding it.
 
 ### The drain
 
@@ -349,6 +396,61 @@ allowed to see:
 Two releases are only ever weighed against each other when that key reads the
 same on both sides.
 
+#### `S3-ALL` is a claim, so it is checked
+
+`S3-ALL` is the one key that asserts something the name cannot support: a season
+pack says *every episode of a season* without saying how many there are. Because
+no range key can equal it, a mislabelled `S3-ALL` silently opts out of dedup
+entirely.
+
+So for a name that keys `S3-ALL`, the set is read off the release's own **file
+list** instead. Measured on a live queue:
+
+```
+Euphoria.S03.COMPLETE.1080p.AMZN.WEB-DL.H.264-EniaHD        40.37 GB, 100%
+    name says season 3, no episode  ->  keyed S3-ALL
+    files say S03E01 .. S03E08     ->  actually eight episodes
+
+Euphoria US S03e01-08 [720p Ita Eng Spa SubS] byMe7alh     15.69 GB, 100%
+    name and files both say eight episodes  ->  keyed S3-E1-E8
+```
+
+Same eight episodes, the first finished and 2.6Ã bigger, and the two were never
+weighed against each other: `S3-ALL` is not a range, so it equalled no range key,
+and the packs' different titles kept them in different groups. Both were removed
+once the label was corrected.
+
+This **narrows the name's claim, never widens it**, and only for `S3-ALL`. A name
+that already states a range (`S03e01-08`) is taken at its word, as everywhere
+else â€” checking those too would mean listing the files of every series torrent on
+every run, for a case that does not arise.
+
+The file list is believed only when it agrees with itself:
+
+| file list | result | why |
+|---|---|---|
+| every file places itself by an `S..E` token, one season, contiguous | `S3-E1-E8` | the ordinary case |
+| a file has no such token | no opinion | an unreadable file cannot be placed |
+| the run skips an episode | no opinion | `E01 E02 E04` is not a range |
+| the run spans two seasons | no opinion | one key cannot hold both |
+| `S03E01-720p` | no opinion | that is a resolution, not a range |
+
+"No opinion" always means the caller keeps the name it read, which is the safe
+direction: `S<n>-ALL` then only ever meets `S<n>-ALL`, exactly as before.
+
+A token may itself be a range and is expanded â€” `S03E01-08` and `S03E01.E08`
+both read as episodes 1 to 8. Only the **file's own name** is read, never the
+folder above it: a pack's folder naming an episode would otherwise stamp that
+episode onto every file in it.
+
+#### A season pack still refuses a partial pack
+
+A `S03 Complete` whose files really are ten episodes keys `S3-E1-E10`, and does
+**not** match an eight-episode pack. The two episodes at the end are not
+redundant, so a finished season pack never deletes a partial one. That boundary
+is unchanged by the correction above and is pinned by tests.
+
+
 A group is keyed on the first episode alone, so `its always sunny in philadelphia`
 really does hold single episodes *and* packs of every range that begins at
 episode 1. Printing those as one block, under a header reading `S18E1-E8`, claims
@@ -524,6 +626,30 @@ never merge with a single episode â€” that is a correctness rule â€” b
 belongs to a family for naming. `Set-FamilyLabels` is **display only**: no
 verdict, no cluster, no comparison and no deletion reads `showLabel`, and
 `test-queue-window.ps1` asserts that the dedup pass never mentions it.
+
+#### The set pass folds groups by show family
+
+Skipping packs in the *merge* is right, but the set pass no longer inherits it.
+The set pass re-splits every group by episode-set key anyway, so **groups are
+folded by show family before the keys are taken**. Measured on a live queue, the
+two `Euphoria S03` packs above sat in different groups because their titles
+differed, and neither was ever compared.
+
+Folding cannot widen the comparison past a set key:
+
+- a single episode keys `S3-E1` and a pack keys `S3-E1-E8`, so a pack still
+  never meets a single;
+- a pack of 1 to 8 still never meets a pack of 1 to 10;
+- one pack's other episodes still have nothing to say about another's.
+
+What changes is only that a set key is found **across title variants** instead of
+only within one spelling of the title. Films keep one group each, because
+`Test-SameTitle` is the only thing that has ever decided whether two films are the
+same film, and a family key is a series concept.
+
+The show family itself is computed once, by `Get-ClusterFamilies`, and shared with
+the merge pass. Two guesses at "which show is this" would drift, and one already
+had to be written by hand (`Set-FamilyLabels`) to match the other.
 
 One case stays ambiguous and is not fixable from titles alone: a show named
 exactly like another show plus extra words, present for a single episode only.
@@ -750,14 +876,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\qbt-manager.ps1 -DryRun
 powershell -NoProfile -ExecutionPolicy Bypass -File .\qbt-manager.ps1 -Only 'some title'
 
 # self-tests
-powershell -NoProfile -ExecutionPolicy Bypass -File .\test\run-all.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\test-all.ps1
 
 # live status panel
 powershell -NoProfile -ExecutionPolicy Bypass -File .\status.ps1
 ```
 
-If qBittorrent is not running the script logs the miss and exits non-zero
-without touching anything.
+See [COMMANDS.md](../COMMANDS.md) for every switch either script takes.
+
+If qBittorrent is not running the script logs the miss and exits **0** without
+touching anything — the exit-code table further down this file says so too, and
+the two used to disagree. A closed app is normal, not a failure, so it is not
+signalled as one; the way to tell the cases apart is the `nothing listening on`
+log line, not the exit code.
 
 ## The schedule
 

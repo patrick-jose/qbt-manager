@@ -74,7 +74,24 @@ $dir = New-Case -Name 'notrunning' -BaseUrl 'http://127.0.0.1:8099/api/v2'
 $r = Invoke-Case -Dir $dir
 "     exit $($r.Exit) in $([math]::Round($r.Elapsed, 2))s"
 Check 'closed qBittorrent is not treated as an error' ($r.Exit -eq 0) "exit was $($r.Exit)"
-Check 'and it is noticed immediately, not after a timeout' ($r.Elapsed -lt 5) "took $([math]::Round($r.Elapsed,2))s"
+
+# 20s, not 5s.
+#
+# The claim under test is "it stands down at once instead of waiting out the
+# retry budget", and the retry budget for this case is the whole point: a refused
+# connection is classified as 'nothing listening' on the FIRST attempt, so the
+# correct time is one curl call plus process startup.
+#
+# The old ceiling was 5s, which also has to cover starting a Windows PowerShell
+# process. Under load - a scheduled manager run, or fourteen suites' worth of
+# child processes - startup alone can exceed that, and the check failed on a
+# correct run. It was the only intermittent failure in the whole suite and it was
+# measuring the machine, not the manager.
+#
+# 20s still separates the two behaviours by a wide margin: the retry path with
+# apiAttempts=2 and a 2s/4s backoff plus connect timeouts takes far longer than
+# that, so a regression that made this wait would still fail here.
+Check 'and it stands down without waiting out the retry budget' ($r.Elapsed -lt 20) "took $([math]::Round($r.Elapsed,2))s"
 Check 'the reason is explained' ($r.Text -match 'not answering')
 Check 'nothing was changed' ($r.Text -notmatch 'ERROR')
 

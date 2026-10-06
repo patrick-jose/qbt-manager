@@ -67,6 +67,27 @@ are the same episode by construction.
 That fix found **7 duplicated episodes and 10,5 GB** sitting finished in the
 library.
 
+**A name is a claim, and two of them outlived their truth.** Comparing packs means
+knowing which episodes each one holds, and that was read off the release name. A
+name saying `S03` with no episode keys `S3-ALL` — a value no range can equal, so
+`Euphoria.S03.COMPLETE` (finished, 40,37 GB, actually `S03E01`–`E08`) was invisible
+to the 15,69 GB `Euphoria US S03e01-08` holding those same eight episodes, which
+sat downloading at 96,5% until both were removed. Two causes, both needed fixing:
+the set key was a guess where the release's own **file list** was available, and
+grouping by title kept two packs of one show apart whenever their names differed.
+
+`S3-ALL` is now checked against the file list, and the comparison is made across a
+show's title variants. Both changes only ever *narrow* what a name may claim: a
+real ten-episode season pack still refuses an eight-episode one, and a pack still
+never meets a single episode.
+
+**An errored torrent is left alone** — with three exceptions, each deliberate.
+Deleting one destroys whatever it fetched, and an error is usually a disk, a path
+or a tracker rather than a verdict on the torrent. DoVi and disc-rip decide from
+the name and the disk, so an error cannot affect them. Dedup deletes an errored
+torrent only when a **finished** copy of the **identical** episodes is bigger —
+at which point it is a spare copy that failed, not data held once.
+
 ## Install
 
 Requires Windows PowerShell 5.1 and qBittorrent with its Web UI enabled
