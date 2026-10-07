@@ -173,7 +173,6 @@ $r = (Judge @(M 'aa' 150) $t)[0]
 Check 'queued at 150 after 435 minutes it is kept'       (-not $r.WillDelete)
 Check 'it has no clock, not a zero clock'               ($null -eq $r.Minutes)
 Check 'the stale clock is dropped, not kept'             (-not (Held $t 'aa'))
-Check 'so its next turn at the front starts from zero'   (-not (Held $t 'aa'))
 
 Write-Host ''
 Write-Host '== the clock runs only while the magnet is in the window =='
@@ -381,7 +380,6 @@ Check 'the run body calls the window rule'          ($runBody -match 'Get-NoAvai
 Check 'the run body also calls the drain'           ($runBody -match 'Get-QueueDrainVerdict')
 Check 'the drain runs after the window, not instead' `
       (($runBody.IndexOf('Get-NoAvailabilityVerdict')) -lt ($runBody.IndexOf('Get-QueueDrainVerdict')))
-Check 'and both are inside the one run body'        ($runBody -match 'Get-QueueDrainVerdict')
 
 # Each rule must reach Remove-Torrent on its own account. One delete call wired
 # to the other rule's rows is exactly how a substitution would look.

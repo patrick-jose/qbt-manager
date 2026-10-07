@@ -3,7 +3,8 @@
     Runs every qbt-manager self-test.
 
 .DESCRIPTION
-    One command to answer "is this working?". Each suite lives in .\test\test-*.ps1,
+    One command to answer "is this working?". Suites are discovered automatically
+    as test-*.ps1 anywhere under .\test\, including nested folders and new suites.
     is standalone, and exits non-zero on failure - so each is run in its own child
     process, exactly as a person would run it, rather than dot-sourced into one
     session where a single thrown error would take the runner down and hide every
@@ -63,8 +64,14 @@ if (-not (Test-Path -LiteralPath $testDir)) {
     exit 2
 }
 
-$all = @(Get-ChildItem -LiteralPath $testDir -Filter 'test-*.ps1' -File -ErrorAction SilentlyContinue |
-         Sort-Object Name)
+try {
+    $all = @(Get-ChildItem -LiteralPath $testDir -Filter 'test-*.ps1' -File -Recurse -ErrorAction Stop |
+             Sort-Object FullName)
+}
+catch {
+    Write-Host "Cannot discover all tests: $($_.Exception.Message)" -ForegroundColor Red
+    exit 2
+}
 
 if ($all.Count -eq 0) {
     Write-Host "No test-*.ps1 files in $testDir" -ForegroundColor Red
@@ -81,7 +88,7 @@ if ($List) {
     # by a Check helper, so counting them in the source finds the one place that
     # formats the string, not the checks themselves. An earlier version of this
     # listing did count them and cheerfully reported "~1 checks" for every suite.
-    foreach ($t in $all) { Write-Host ("  {0}" -f $t.Name) }
+    foreach ($t in $all) { Write-Host ("  {0}" -f $t.FullName.Substring($testDir.Length + 1)) }
     Write-Host ''
     Write-Host 'Run one with:  .\test-all.ps1 -Suite <name>'
     Write-Host ''
@@ -147,6 +154,7 @@ $failed = New-Object System.Collections.ArrayList
 $overall = [System.Diagnostics.Stopwatch]::StartNew()
 
 foreach ($t in $selected) {
+    $suiteName = $t.FullName.Substring($testDir.Length + 1)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
     if ($TimeoutSeconds -gt 0) {
@@ -196,10 +204,11 @@ foreach ($t in $selected) {
     $totalPass += $pass
     $totalFail += $fail
 
-    if ($code -ne 0 -or $fail -gt 0) { [void]$failed.Add($t.Name) }
+    if ($code -ne 0 -or $fail -gt 0) { [void]$failed.Add($suiteName) }
 
     $colour = if ($code -eq 0 -and $fail -eq 0) { 'Green' } else { 'Red' }
-    $label = '{0,-24} {1,4} passed {2,3} failed {3,7:N1}s' -f $t.Name, $pass, $fail, $sw.Elapsed.TotalSeconds
+    $label = '{0,-24} {1,4} passed {2,3} failed {3,7:N1}s' -f $suiteName, $pass, $fail, $sw.Elapsed.TotalSeconds
+    if ($code -ne 0) { $label += " (exit $code)" }
 
     if ($Quiet) {
         Write-Host $label -ForegroundColor $colour
@@ -207,7 +216,7 @@ foreach ($t in $selected) {
     else {
         Write-Host ''
         Write-Host ('-' * 78) -ForegroundColor DarkGray
-        Write-Host "  $($t.Name)" -ForegroundColor Cyan
+        Write-Host "  $suiteName" -ForegroundColor Cyan
         Write-Host ('-' * 78) -ForegroundColor DarkGray
         # Each suite colours its own PASS/FAIL lines; passing the text through
         # untouched is what preserves that.
@@ -228,6 +237,9 @@ foreach ($t in $selected) {
         foreach ($line in ($out -split "`r?`n" | Where-Object { $_ -match '\[FAIL\]' })) {
             Write-Host ("    " + $line.Trim()) -ForegroundColor Red
         }
+    }
+    elseif ($code -ne 0 -and $ShowFailures) {
+        Write-Host $out.TrimEnd() -ForegroundColor DarkGray
     }
 }
 

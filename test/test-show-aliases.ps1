@@ -47,6 +47,21 @@ function Get-Slice {
 $src = [System.IO.File]::ReadAllText((Get-ProjectFile 'qbt-manager.ps1'), [System.Text.Encoding]::UTF8)
 Invoke-Expression (Get-Slice -Text $src -From 'function ConvertTo-LibraryFolderName' -To 'function Get-LibraryTargetDir')
 
+# Resolve-PartsAlias retokenises the canonical title, and that asks the same
+# question Get-TitleParts asks: which words carry no identifying signal. The list
+# lives in the detection region, far above the slice above, so it is not defined
+# here - and an empty list silently makes every word significant, which turned a
+# real check into one that passed for the wrong reason.
+#
+# Read out of the source by regex, not restated. Get-Slice cannot do it: it finds
+# its end marker with IndexOf, and the first ')' in a 4000-line file is nowhere
+# near this list. A restated copy would also be free to drift from the real one,
+# which is the whole failure this is guarding against.
+$igMatch = [regex]::Match($src, '(?s)\$script:ignorable = @\((.*?)\)')
+if (-not $igMatch.Success) { throw 'could not read $script:ignorable out of qbt-manager.ps1' }
+$script:ignorable = @(Invoke-Expression $igMatch.Groups[1].Value)
+Write-Host ("   (loaded " + $script:ignorable.Count + " ignorable words from the source)")
+
 $cfg = [System.IO.File]::ReadAllText((Get-ProjectFile 'config.json'), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
 $shipped = $cfg.titleAliases
 
@@ -170,8 +185,17 @@ Write-Host '== the alias reaches Get-LibraryTargetDir =='
 # If the plumbing stopped here, the folder would be right in a test and wrong in a
 # run. Asserted at the call site rather than by behaviour, because the behaviour
 # needs a torrent object this suite does not build.
-$moveLine = ($src -split "`n" | Where-Object { $_ -match 'Get-LibraryTargetDir -T \$t -' } | Select-Object -First 1)
+# Matched on $cfg.moviesDir, not on 'Get-LibraryTargetDir -T $t' alone. The settle
+# rule added a second call site earlier in the file, and a first-match check simply
+# took whichever came first - so it passed or failed on the wrong call, and the one
+# it meant to guard went unchecked. A check that identifies its subject by position
+# rather than by identity is a check that will eventually be about something else.
+$moveLine = ($src -split "`n" | Where-Object { $_ -match 'Get-LibraryTargetDir -T \$t -MoviesDir \$cfg\.moviesDir' } | Select-Object -First 1)
 Check 'the move passes the alias list'          ($moveLine -match '-Aliases \$cfg\.titleAliases')
+# And the settle rule resolves its destination the same way, or a show the parser
+# spells two ways would be cut into a folder of its own.
+$settleLine = ($src -split "`n" | Where-Object { $_ -match 'Get-LibraryTargetDir -T \$t -MoviesDir \$MoviesDir' } | Select-Object -First 1)
+Check 'and so does the settle rule'             (($null -ne $settleLine) -and ($settleLine -match '-Aliases \$Aliases'))
 $defLine = ($src -split "`n" | Where-Object { $_ -match 'Resolve-LibraryShowDir -SeriesDir \$SeriesDir -Title \$T\.parts\.Title' } | Select-Object -First 1)
 Check 'the target dir forwards it'              ($defLine -match '-Aliases \$Aliases')
 
@@ -195,6 +219,102 @@ Write-Host '== and the test tree is gone =='
 Check 'no alias tree left behind'                (@(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Directory -Filter 'qbtselias-*' -ErrorAction SilentlyContinue).Count -eq 0)
 
 Write-Host ''
+Write-Host ''
+Write-Host '== an alias is about IDENTITY, not just folder naming =='
+# 'Euforie - Euphoria S03E01 (2026)[1080p][CZ,SK,EN Dabing]' parses as
+# 'euforie euphoria'. The Czech title of Euphoria in front of the English one, and
+# a show family is the FIRST WORD of the parsed title - so it came out as the show
+# 'euforie', in a group of its own, next to a season it belonged to.
+#
+# Resolve-ShowAlias was called from exactly one place, Resolve-LibraryShowDir. So
+# an alias filed the show under the right name and still left every rule that
+# GROUPS releases reading the raw spelling: dedup compared the wrong sets, and the
+# two library rules looked for a folder nobody had.
+#
+# Resolve-PartsAlias applies the alias where identity is established, so the
+# grouping key and the folder name are derived from the same title.
+
+function Parts {
+    param([string]$Title, [string[]]$Tokens, [int]$Season = 3, [int]$Episode = 1, [string]$Year = '')
+    return [pscustomobject]@{
+        IsSeries = $true
+        Season   = $Season
+        Episode  = $Episode
+        EpisodeLast    = $Episode
+        IsMultiEpisode = $false
+        Year     = $Year
+        Title    = $Title
+        Tokens   = $Tokens
+        Numbers  = @()
+    }
+}
+
+$euforie = { param([object]$a) Parts 'euforie euphoria' @('euforie', 'euphoria') }
+
+$r = Resolve-PartsAlias -Parts (& $euforie $null) -Aliases @{ 'euforie euphoria' = 'euphoria' }
+Check 'the aliased title is the canonical one'      ($r.Title -eq 'euphoria')
+# This is the part that decides anything. The family is the first word of the run
+# of leading TOKENS, so rewriting Title alone would leave the group key reading
+# 'euforie' and change nothing at all.
+Check 'and the TOKENS are rebuilt, not just the title' (((@($r.Tokens)) -join ' ') -eq 'euphoria')
+Check 'so the family becomes euphoria'              (@($r.Tokens)[0] -eq 'euphoria')
+
+$untouched = Resolve-PartsAlias -Parts (& $euforie $null) -Aliases @{ 'euphoria us' = 'euphoria' }
+Check 'an unlisted title is untouched'              ($untouched.Title -eq 'euforie euphoria')
+Check 'with its tokens intact'                      ((@($untouched.Tokens) -join ' ') -eq 'euforie euphoria')
+Check 'no alias table folds nothing'                ((Resolve-PartsAlias -Parts (& $euforie $null) -Aliases $null).Title -eq 'euforie euphoria')
+Check 'a null parts object is passed through'       ($null -eq (Resolve-PartsAlias -Parts $null -Aliases @{ 'x' = 'y' }))
+
+# Resemblance is not evidence. 'euforia', 'euforie' and 'euphoria' are one show to
+# a person and three strings to a parser - but only the alias the user wrote is
+# applied. Nothing here works out which words are foreign names of one another.
+Check 'a sibling spelling with no alias stays put' `
+    ((Resolve-PartsAlias -Parts (Parts 'euforia euphoria' @('euforia', 'euphoria')) -Aliases @{ 'euforie euphoria' = 'euphoria' }).Title -eq 'euforia euphoria')
+
+# Chains are followed, so an alias may name a title that is itself aliased.
+$chain = Resolve-PartsAlias -Parts (Parts 'show b' @('show', 'b')) -Aliases @{ 'show b' = 'show a'; 'show a' = 'show c' }
+Check 'a chain of aliases lands on the last one'   ($chain.Title -eq 'show c')
+Check 'and its tokens follow'                       ((@($chain.Tokens) -join ' ') -eq 'show c')
+
+# An alias to something that yields no usable token would leave the release with
+# NO grouping key at all, and a group with no key is skipped by every rule - so
+# honouring it would silence dedup for every OTHER release of the same show.
+# Refused instead. 'season' is on the ignorable list, so it tokenises to nothing.
+$bad = Resolve-PartsAlias -Parts (Parts 'the show' @('the', 'show')) -Aliases @{ 'the show' = 'season' }
+Check 'an alias with no usable tokens is refused'   ($bad.Title -eq 'the show')
+Check 'and its tokens are left alone too'          (((@($bad.Tokens)) -join ' ') -eq 'the show')
+
+# A bare number is NOT untokenisable, and must not be treated as one: '1917' and
+# '2001' are real titles, which is why Get-TitleParts carries a numericTitle case
+# at all. An alias pointing at a number is honoured.
+$num = Resolve-PartsAlias -Parts (Parts 'the show' @('the', 'show')) -Aliases @{ 'the show' = '2001' }
+Check 'an alias to a numeric title IS honoured'     ($num.Title -eq '2001')
+
+# The season, episode and year must survive: the alias is about which show, never
+# about which episode.
+$kept = Resolve-PartsAlias -Parts (Parts 'euforie euphoria' @('euforie', 'euphoria') 3 7 '2026') -Aliases @{ 'euforie euphoria' = 'euphoria' }
+Check 'season and episode are untouched by an alias' (($kept.Season -eq 3) -and ($kept.Episode -eq 7))
+Check 'and so is the year'                          ($kept.Year -eq '2026')
+
+Write-Host ''
+Write-Host '== both files must resolve identity, or the preview lies =='
+# Same drift shape as the two already found this session: a rule that exists in two
+# places, one fixed and one not. The preview showing a release as its own show while
+# the run files it under Euphoria is exactly the failure to avoid.
+$mgrSrc = [System.IO.File]::ReadAllText((Join-Path $projectRoot 'qbt-manager.ps1'), [System.Text.Encoding]::UTF8)
+$preSrc = [System.IO.File]::ReadAllText((Join-Path $projectRoot 'status.ps1'), [System.Text.Encoding]::UTF8)
+Check 'the manager resolves the alias where parts are attached' `
+    ($mgrSrc -cmatch '(?s)Get-TitleParts -Name \$t\.name.{0,900}?Resolve-PartsAlias -Parts \$parts')
+Check 'the preview does the same' `
+    ($preSrc -cmatch '(?s)Get-TitleParts -Name \(Get-Prop \$t ''name''\).{0,900}?Resolve-PartsAlias -Parts \$parts')
+# Resolve-ShowAlias had a single call site, inside folder naming, and that is why
+# an alias could not reach the rules that group releases. There are three now: two
+# that resolve a title string, and one that resolves a parsed release - and the
+# third is the one that makes grouping agree with filing.
+$showCalls  = ([regex]::Matches($mgrSrc, 'Resolve-ShowAlias -Title')).Count
+$partsCalls = ([regex]::Matches($mgrSrc, 'Resolve-PartsAlias -Parts')).Count
+Check 'Resolve-PartsAlias exists and is reachable'  ($mgrSrc -cmatch '(?m)^function Resolve-PartsAlias')
+Check 'and folder naming is no longer the only caller' (($showCalls -ge 2) -and ($partsCalls -ge 1))
 if ($fail -eq 0) {
     Write-Host ("all show-alias tests passed (" + $pass + " checks)") -ForegroundColor Green
     exit 0

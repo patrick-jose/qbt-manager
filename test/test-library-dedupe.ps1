@@ -170,7 +170,7 @@ $found = @(@($d | Where-Object { (Split-Path -Leaf $_.File) -like 'e0*' }))
 Check 'and is still matched inside Season 18'        ($found.Count -eq 7)
 
 Write-Host ''
-Write-Host '== a tie is held, not decided by a coin toss =='
+Write-Host '== a tie keeps one deterministic finished copy =='
 $tieLayout = @{
     "$folderA|Its.Always.Sunny.in.Philadelphia.S18E01.1080p.WEB-DL.x264-A.mkv" = 1500
     "$folderB|Its.Always.Sunny.in.Philadelphia.S18E01.1080p.WEB-DL.x264-B.mkv" = 1500
@@ -178,13 +178,35 @@ $tieLayout = @{
 $rootTie = New-Tree -ShowName $showName -Season 18 -Layout $tieLayout
 $rTie = @(Judge $rootTie)
 $holdsTie = @(Holds $rTie)
-Check 'two equal copies delete nothing'               (@(Deletes $rTie).Count -eq 0)
+Check 'two equal copies delete one duplicate'         (@(Deletes $rTie).Count -eq 1)
 # The larger of two equal files is the keeper and is not reported at all; the
 # OTHER one is reported as held. Two rows would be wrong - it would name the
 # keeper as a candidate for deletion of itself.
-Check 'and the equal-sized spare is reported as held' ($holdsTie.Count -eq 1)
-Check 'the hold explains itself'                     ($rTie[0].Reason -match 'same size')
+Check 'the equal-sized spare is not held'             ($holdsTie.Count -eq 0)
+Check 'the duplicate explains itself'                 ($rTie[0].Reason -match 'duplicate episode')
 Check 'a hold never carries an owning torrent'       (@($rTie | Where-Object { $_.OwnerHash -ne '' }).Count -eq 0)
+
+# A file's allocated length is not evidence that its owning torrent finished.
+$tieFiles = @(Get-ChildItem -LiteralPath $rootTie -Recurse -File | Sort-Object FullName)
+$allocated = [IO.File]::OpenWrite($tieFiles[0].FullName)
+try { $allocated.SetLength(1800KB) } finally { $allocated.Dispose() }
+$unfinishedOwner = [pscustomobject]@{ hash = 'unfinished'; content_path = $tieFiles[0].FullName; progress = 0.2 }
+$preallocated = @(Get-LibraryDuplicateVerdicts -SeriesDir $rootTie -Torrents @($unfinishedOwner))
+Check 'unfinished preallocated file cannot displace the finished copy' ($preallocated.Count -eq 0)
+$finishedOwner = [pscustomobject]@{ hash = 'finished'; content_path = $tieFiles[0].FullName; progress = 1 }
+$goneOwner = @(Get-LibraryDuplicateVerdicts -SeriesDir $rootTie -Torrents @($finishedOwner) -Gone @{ finished = $true })
+Check 'entry already removed cannot serve as a library keeper' ($goneOwner.Count -eq 0)
+
+$incomingRoot = New-Tree -ShowName 'Example Show' -Season 1 -Layout @{
+    'small|Example.Show.S01E01.small.mkv' = 100
+    'best|Example.Show.S01E01.best.mkv' = 200
+    'incoming|Example.Show.S01E01.incoming.mkv' = 400
+}
+$incomingFile = @(Get-ChildItem -LiteralPath $incomingRoot -Recurse -File | Where-Object { $_.Name -match 'incoming' })[0]
+$incomingOwner = [pscustomobject]@{ hash = 'incoming'; content_path = $incomingFile.FullName; progress = 0.2 }
+$withIncoming = @(Get-LibraryDuplicateVerdicts -SeriesDir $incomingRoot -Torrents @($incomingOwner))
+Check 'larger downloading file does not block finished duplicate cleanup' ($withIncoming.Count -eq 1)
+Check 'library removes small finished copy and preserves current best' ($withIncoming.Count -eq 1 -and $withIncoming[0].File -match 'small.mkv$')
 
 Write-Host ''
 Write-Host '== three copies of one episode: only the smallest go =='

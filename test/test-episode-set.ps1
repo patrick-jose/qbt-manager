@@ -104,7 +104,6 @@ $lNameKey = Get-EpisodeSetKey -Parts $lParts
 Write-Host ("  by name, the finished pack keys '" + $kNameKey + "' and the other '" + $lNameKey + "'")
 Check 'a season-only name really does key S3-ALL'      ($kNameKey -eq 'S3-ALL')
 Check 'so it cannot equal any range key'               ($kNameKey -ne $lNameKey)
-Check 'which is why the two never met'                ($true)
 
 Write-Host ''
 Write-Host '== the files say what the name did not =='
@@ -135,8 +134,6 @@ Check 'no file list at all: no opinion'                ((Get-EpisodeSetFromFiles
 # over: as E1-E72 it meets nearly any pack of the show, and as a lone E1 it
 # meets a finished single of episode 1. Both are wrong, so it must refuse.
 Check 'a resolution after the episode: no opinion'     ((Get-EpisodeSetFromFiles -Files @(F 'A.S03E01-720p.mkv')) -eq '')
-Check 'and never read as a 72-episode range'           ((Get-EpisodeSetFromFiles -Files @(F 'A.S03E01-720p.mkv')) -ne 'S3-E1-E72')
-Check 'and never read as a lone episode 1 either'      ((Get-EpisodeSetFromFiles -Files @(F 'A.S03E01-720p.mkv')) -ne 'S3-E1')
 Check 'a genuine 2-digit tail still works'             ((Get-EpisodeSetFromFiles -Files @(F 'A.S03E01-72.mkv')) -eq 'S3-E1-E72')
 
 Write-Host ''
@@ -160,7 +157,6 @@ foreach ($n in 1..10) { $tenFiles += F ("Euphoria.S03.1080p/Euphoria.S03E{0:D2}.
 $tenKey = Get-EpisodeSetFromFiles -Files $tenFiles
 Check 'ten files really do read as E1-E10'             ($tenKey -eq 'S3-E1-E10')
 Check 'and a ten-episode season pack does NOT match'   ($tenKey -ne $lFileKey)
-Check 'so the partial pack is not deleted by it'       ($true)
 
 Write-Host ''
 Write-Host '== a pack never meets a single =='

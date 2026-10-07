@@ -239,7 +239,7 @@ $allowCalls = ([regex]::Matches($bodyAll, '(?m)^\s*Remove-Torrent[^\r\n]*-AllowE
 # start of the whole string, so a mid-file "^\s*Remove-Torrent" could never match
 # and the check failed on correct code. The window is generous because the two
 # are ~110 lines apart inside the set loop.
-Check 'and it is the set-level dedup delete'         ($bodyAll -cmatch '(?ms)Get-EpisodeSetKey.{0,20000}?^\s*Remove-Torrent -T \$m -AllowErrored')
+Check 'and it is the set-level dedup delete'         ($bodyAll -cmatch '(?ms)Get-EpisodeSetKey.{0,20000}?T = \$m; AllowErrored = \$true; Knows = \$true;')
 
 # The three call sites that DO reach it, each named rather than counted, so a
 # new one cannot slip in unnoticed and a moved one is still found.
@@ -254,7 +254,10 @@ Check 'and it is the set-level dedup delete'         ($bodyAll -cmatch '(?ms)Get
 $allowAt = @(
     @{ n = 'Dolby Vision'; p = '-AllowErrored -Knows -AllowIncomingBetter -Reason "Dolby Vision marker' }
     @{ n = 'disc rip';     p = '-AllowErrored -Knows -AllowIncomingBetter -Reason "full Blu-ray disc structure' }
-    @{ n = 'set dedup';    p = 'Remove-Torrent -T $m -AllowErrored -Knows -Reason' }
+    # dedup now builds a hash-splat and passes flags there and only calls
+# Remove-Torrent @rt at the end - so the pin searches for the splat's
+# contents: T = $m is what makes this line the dedup one and not rule 1's.
+@{ n = 'set dedup';    p = 'T = $m; AllowErrored = $true; Knows = $true;' }
 )
 foreach ($c in $allowAt) {
     $i = $bodyAll.IndexOf($c.p)
@@ -263,7 +266,12 @@ foreach ($c in $allowAt) {
 }
 # Exactly three, so a fourth cannot appear. Anchored to a line start so the
 # comment above Test-Errored, which also contains the words, is not counted.
-Check 'and no other rule passes it'   ($allowCalls -eq 3)
+# Two literal '-AllowErrored' call sites remain (rule 1 and rule 1b, untouched).
+# Dedup moved to a hash-splat: 'AllowErrored = $true' lives inside the @{} it
+# passes Remove-Torrent, it does not sit on the Remove-Torrent line - so this
+# regex sees two, and the count deliberately reflects that. Before dedup was
+# re-counted into the splat world by hand, this check was 3.
+Check 'and no other rule passes it'   ($allowCalls -eq 2)
 
 # ...and the passes that must NOT reach it. Matched on the argument list alone,
 # not the whole call: several of these gained a -Knows later, and a full-call
@@ -271,10 +279,10 @@ Check 'and no other rule passes it'   ($allowCalls -eq 3)
 # when nothing of the sort had happened.
 $noAllow = @(
     @{ n = 'the stalled rule';    p = '$r.Torrent -DeleteFiles $true -Reason (' }
-    @{ n = 'pack-vs-single';      p = '$single -Knows -Reason $reason' }
+    @{ n = 'pack-vs-single';      p = 'T = $single; Knows = $true; Reason = $reason' }
     @{ n = 'the phantom rule';    p = '$p.Torrent -Knows -Reason $p.Reason -DeleteFiles $false' }
     @{ n = 'no availability';     p = '$row.Torrent -Reason $row.Reason' }
-    @{ n = 'library duplicates';  p = '$d.Owner -Knows -Reason $d.Reason' }
+    @{ n = 'library duplicates';  p = 'T = $d.Owner; Knows = $true; Reason = $d.Reason' }
     @{ n = 'redundant download';  p = '$r.Torrent -Knows -Reason $r.Reason -DeleteFiles $true' }
 )
 foreach ($c in $noAllow) {
@@ -369,7 +377,12 @@ $src2 = [System.IO.File]::ReadAllText((Join-Path $root 'qbt-manager.ps1'), [Syst
 $callLines = @($src2 -split "`n" | Where-Object { $_ -cmatch '^\s*Remove-Torrent\b' })
 $noKnows = @()
 foreach ($cl in $callLines) {
-    if ($cl -notmatch '-Knows') { $noKnows += $cl.Trim() }
+    # '-Knows' sits on the call line, except for the three dedup-family sites that
+    # moved to a hash-splat - those carry it as 'Knows = $true;' in the @{} instead,
+    # which this simpler source-grep cannot see. Treat 'Remove-Torrent @rt' as called
+    # with -Knows rather than count it; the direct call-by-literal test pins that
+    # the splat actually sets it.
+    if ($cl -notmatch '-Knows' -and $cl -notmatch '@rt') { $noKnows += $cl.Trim() }
 }
 Check 'the rules that pass no -Knows are the magnet/partial ones' ($noKnows.Count -eq 4)
 Write-Output '  they are:'

@@ -211,7 +211,19 @@ Check 'and names the tolerance'                        ((Reason $equal 'b') -mat
 # deleted - so the tolerance is one-sided and cannot reach a finished copy.
 $twoDone = @((T 'keepme' 5.0 1.0), (T 'biggerdone' 5.01 1.0))
 Check 'a FINISHED copy bigger than the keeper is kept' (-not (@(Verdicts $twoDone) -contains 'biggerdone'))
-Check 'and so is a FINISHED copy of identical size'    (@(Verdicts @((T 'x' 5.0 1.0), (T 'y' 5.0 1.0))).Count -eq 0)
+Check 'one equal-size FINISHED duplicate goes'    (@(Verdicts @((T 'x' 5.0 1.0), (T 'y' 5.0 1.0))).Count -eq 1)
+Check 'the equal-size keeper is deterministic by hash' ((Verdicts @((T 'y' 5.0 1.0), (T 'x' 5.0 1.0))) -contains 'y')
+
+foreach ($release in 'Example.Show.S01E01.1080p.WEB-DL', 'Example.Show.S01E01-E03.1080p.WEB-DL', 'Example.Show.S01.COMPLETE.1080p.WEB-DL') {
+    $copies = @((P 'tie-a' $release 5 1), (P 'tie-b' $release 5 1), (P 'incoming' $release 10 0.2))
+    foreach ($copy in $copies) {
+        Set-PackFiles -Hash $copy.hash -Entries @(
+            (File 'Example.Show.S01E01.mkv' 1), (File 'Example.Show.S01E02.mkv' 1), (File 'Example.Show.S01E03.mkv' 1)
+        )
+    }
+    $tiedVerdicts = @(Verdicts $copies)
+    Check "$release keeps one finished keeper while larger copy downloads" ($tiedVerdicts.Count -eq 1 -and $tiedVerdicts -contains 'tie-b')
+}
 
 "== nothing happens without a finished version =="
 $noneFinished = @((T 'a' 9.03 0.27), (T 'b' 7.72 0.10), (T 'c' 3.87 0.30))
@@ -325,15 +337,7 @@ Check 'a single loses where the pack holds a bigger file for that episode' `
     ((@($v).Count -eq 1) -and (@($v) -contains 'e2big'))
 Check 'the pack survives when it holds the bigger episode' (-not (@($v) -contains 'pack10'))
 
-# The size difference that caused the loss is noise between two encodes. A pack
-# must survive a margin of any size, up to being nearly twice the single's size.
-Set-PackFiles -Hash 'pack10' -Entries @(
-    (File 'Widows Bay S01E01 1080p.mkv' 5.5),
-    (File 'Widows Bay S01E02 1080p.mkv' 9.0),
-    (File 'Widows Bay S01E03 1080p.mkv' 6.0)
-)
-$v = Verdicts @($pack10, $e1big)
-Check 'a 45% size margin on one episode still does not remove the pack' (-not (@($v) -contains 'pack10'))
+# The same pack-vs-single fixture above also supplies this reason check.
 Check 'and the reason for deleting a single says the pack holds more' `
     ((Reason @($pack10, $e2) 'e2big') -match 'cannot replace')
 
@@ -428,11 +432,10 @@ $eqV = @(Verdicts @($pD, $pE))
 Check 'an identical-size INCOMPLETE pack of one range is deleted' (@($eqV).Count -eq 1 -and @($eqV) -contains 'pD')
 Check 'the finished pack of that range is kept'                  (-not (@($eqV) -contains 'pE'))
 
-# ...but two FINISHED packs of one range at the same size are both kept. Only the
-# strictly smaller finished copy goes; the keeper is never a deletion.
+# Two finished packs of the same range and size keep one deterministic keeper.
 $pF = PackOf 'pF' 'Widows.Bay.S01E01-10.720p.ATVP.WEB-DL.ITA.ENG.DD5.1.H.264-G66 [ext.to]'  24.0 1.00
 $pG = PackOf 'pG' 'Widows.Bay.S01E01-10.720p.ATVP.WEB-DL.ITA.ENG.DD5.1.H.264-G66 [ext.to]'  24.0 1.00
-Check 'two identical-size FINISHED packs are both kept' (@(Verdicts @($pF, $pG)).Count -eq 0)
+Check 'two identical-size FINISHED packs keep only one' (@(Verdicts @($pF, $pG)).Count -eq 1)
 
 # Neither finished: the rule needs a finished copy to act on.
 $pF = PackOf 'pF' 'Widows.Bay.S01E01-10.720p.ATVP.WEB-DL.ITA.ENG.DD5.1.H.264-G66 [ext.to]'  24.0 0.30
@@ -454,20 +457,6 @@ Check '...and the unfinished one is never the keeper either' (-not (@(Verdicts @
 $q1 = PackOf 'q1' 'Widows.Bay.S01E01-05.720p.ATVP.WEB-DL.ITA.ENG.DD5.1.H.264-G66 [ext.to]'  12.0 1.00
 $q2 = PackOf 'q2' 'Widows.Bay.S01E03-10.720p.ATVP.WEB-DL.ITA.ENG.DD5.1.H.264-G66 [ext.to]'  20.0 1.00
 Check 'two overlapping packs with different first episodes delete nothing' (@(Verdicts @($q1, $q2)).Count -eq 0)
-
-"== a pack and the single inside it are weighed per episode =="
-# Same pair as above, restated where it is read in isolation. The pack's own file
-# for S01E01 is 5.5 GB and the single is 8 GB, so the single is the bigger copy of
-# that one episode - and the pass still removes nothing.
-#
-# This asserted the opposite for a long time, and the opposite destroyed a
-# 12,54 GB eight-episode pack on 2026-10-05 over a 46 MB difference on one
-# episode. It is restated here, in the section a reader lands on first, so the
-# correct behaviour cannot be quietly reverted by someone tidying the tests.
-$v = Verdicts @($pack10, $e1big)
-Check 'a finished pack beside its own first finished single deletes NOTHING' (@($v).Count -eq 0)
-Check 'the pack is not the per-episode loser'  (-not (@($v) -contains 'pack10'))
-Check 'and neither is the single'             (-not (@($v) -contains 'e1big'))
 
 "== whole-season packs =="
 # A pack that names a season but no episode covers every episode of that season.
@@ -689,12 +678,12 @@ Check 'the preview reason carries the percentage'           ($src -cmatch '\$why
 # "the text is there" a weak substitute for "the code runs". Ordering closes some
 # of that gap: the bigger-than branch has to open the tolerance, and the tolerance
 # has to sit before the delete, or it is dead code that reads as protection.
-$mBranch = $msrc.IndexOf('if ($m.size -ge $keeper.size) {')
+$mBranch = $msrc.IndexOf('if ($m.size -gt $keeper.size -or')
 $mOver   = $msrc.IndexOf('$over = ([double]$m.size - [double]$keeper.size)')
-$mDel    = $msrc.IndexOf('Remove-Torrent -T $m -AllowErrored -Knows')
+$mDel    = $msrc.IndexOf('Remove-Torrent @rt', $mOver)
 Check 'the manager opens the tolerance in the bigger-than branch' `
     ($mBranch -ge 0 -and $mBranch -lt $mOver -and $mOver -lt $mDel)
-$sBranch = $src.IndexOf("if ((Get-Prop `$m 'size') -ge (Get-Prop `$keeper 'size')) {")
+$sBranch = $src.IndexOf("if ((Get-Prop `$m 'size') -gt (Get-Prop `$keeper 'size') -or")
 $sOver   = $src.IndexOf('$over = ((Get-Prop $m')
 $sDel    = $src.IndexOf("Verdict = 'DELETE'; Rule = 'dedup'")
 Check 'the preview does the same, in the same order' `

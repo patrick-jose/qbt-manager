@@ -334,7 +334,20 @@ function Get-Clusters {
         if ($verdict) { continue }
 
         $parts = $null
+$parts = $null
         try { $parts = Get-TitleParts -Name (Get-Prop $t 'name') } catch { $parts = $null }
+
+        # Identity resolved through titleAliases, exactly as the manager does it.
+        # Resolve-PartsAlias is inside the slice above, so this is the same function
+        # and not a second copy that can drift.
+        #
+        # Without this the preview filed the release under one show and the run
+        # under another - or rather, the preview showed it as its own show and the
+        # run would never have grouped it with anything. 'Euforie - Euphoria
+        # S03E01' parses as 'euforie euphoria', which is Euphoria, and only the
+        # user's alias says so.
+        if ($parts) { $parts = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases }
+
         Add-Member -InputObject $t -NotePropertyName parts -NotePropertyValue $parts -Force
         if (-not $parts) { continue }
 
@@ -485,7 +498,7 @@ function Get-DedupVerdicts {
             $set = @($sets[$k])
             if ($set.Count -lt 2) { continue }
 
-            # The largest finished version is the keeper; everything smaller
+            # The largest finished version is the keeper; other smaller or equal copies
             # goes, finished or not. Bigger unfinished versions are left alone.
             # This mirrors qbt-manager.ps1 exactly - the preview must not become
             # a second, separately-maintained copy of the rule.
@@ -496,7 +509,7 @@ function Get-DedupVerdicts {
             # instead of being reported as a duplicate.
             $complete = @($set | Where-Object { (Get-Prop $_ 'progress') -ge 1 })
             if ($complete.Count -ge 1) {
-                $keeper = @($complete | Sort-Object -Property size -Descending)[0]
+                $keeper = @($complete | Sort-Object -Property @{ Expression = { $_.size }; Descending = $true }, hash)[0]
                 foreach ($m in $set) {
                     if ($m.hash -eq $keeper.hash) { continue }
                     if ((Get-Prop $m 'size') -le 0) { continue }
@@ -515,7 +528,8 @@ function Get-DedupVerdicts {
                     # about the run, which is the same failure as the drain printing
                     # 'witness at position 0' when there was no witness at all.
                     $gap = ''
-                    if ((Get-Prop $m 'size') -ge (Get-Prop $keeper 'size')) {
+                    if ((Get-Prop $m 'size') -gt (Get-Prop $keeper 'size') -or
+                        ((Get-Prop $m 'size') -eq (Get-Prop $keeper 'size') -and (Get-Prop $m 'progress') -lt 1)) {
                         if ((Get-Prop $m 'progress') -ge 1) { continue }
                         $over = ((Get-Prop $m 'size') - (Get-Prop $keeper 'size')) / (Get-Prop $keeper 'size')
                         if ($over -gt ($TolerancePercent / 100.0)) { continue }
@@ -536,7 +550,8 @@ function Get-DedupVerdicts {
                         # pack-vs-single path (which requires BOTH sides complete, so an
                         # errored single is skipped there anyway). This set-level
                         # comparison is the one place the manager passes -AllowErrored.
-                        $why = if ((Get-Prop $m 'progress') -ge 1) { 'smaller completed version' }
+                        $why = if ((Get-Prop $m 'progress') -ge 1 -and (Get-Prop $m 'size') -eq (Get-Prop $keeper 'size')) { 'equal-size completed duplicate' }
+                               elseif ((Get-Prop $m 'progress') -ge 1) { 'smaller completed version' }
                                elseif (Test-Errored $m) { 'errored, and the same episodes are already finished elsewhere' }
                                else { 'incomplete, and a bigger version is already finished' }
                     }

@@ -310,7 +310,8 @@ for ($k = $callAt; $k -lt $callAt + 140; $k++) {
 Check 'the panel branch was located'       ($panelAt -gt 0)
 Check 'the removal was located'            ($removeAt -gt $panelAt)
 $panelBlock = ($runBody[$panelAt..($removeAt - 1)]) -join "`n"
-Check 'and the panel does NOT continue past it' (-not ($panelBlock -cmatch '(?m)^\s*continue\s*$'))
+$panelOnly = ($panelBlock -split '# Both sides are stopped')[0]
+Check 'the panel itself does NOT skip deletion' (-not ($panelOnly -cmatch '(?m)^\s*continue\s*$'))
 Write-Host '  a `continue` between the panel and the removal skips the removal.'
 
 Write-Host ''

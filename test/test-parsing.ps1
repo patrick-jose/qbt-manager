@@ -76,9 +76,8 @@ $series = @(
 )
 foreach ($n in $series) { Dump $n }
 Check 'classified as SERIES'                ((Parts $series[0]).IsSeries)
-Check 'S01E01 releases match each other'    (Same $series[0] $series[1])
+Check 'S01E01 releases match despite US vs non-US noise' (Same $series[0] $series[1])
 Check 'S01E02 kept separate from S01E01'    (-not (Same $series[0] $series[2]))
-Check 'US vs non-US noise is tolerated'     (Same $series[0] $series[1])
 
 Write-Host ''
 Write-Host '=== FALSE-POSITIVE GUARDS: these must never match ==='
