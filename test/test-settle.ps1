@@ -81,7 +81,7 @@ function Film {
     return [pscustomobject][ordered]@{
         hash = $Hash; name = "$Title 2019 1080p WEB-DL"; size = [int64]($Gb * $GB)
         progress = $Progress; state = $(if ($Progress -ge 1) { 'stoppedUP' } else { 'downloading' })
-        priority = 1; content_path = 'C:\lib\Filmes\Some Movie 2019 1080p WEB-DL'; parts = (Get-TitleParts -Name "$Title 2019 1080p WEB-DL")
+        priority = 1; save_path = 'C:\lib\Filmes'; content_path = 'C:\lib\Filmes\Some Movie 2019 1080p WEB-DL'; parts = (Get-TitleParts -Name "$Title 2019 1080p WEB-DL")
     }
 }
 
@@ -90,7 +90,7 @@ function Ep {
     return [pscustomobject][ordered]@{
         hash = $Hash; name = $Name; size = [int64]($Gb * $GB)
         progress = $Progress; state = $(if ($Progress -ge 1) { 'stoppedUP' } else { 'downloading' })
-        priority = 1; content_path = 'C:\lib\Series\Some Show\Season 3'; parts = (Get-TitleParts -Name $Name)
+        priority = 1; save_path = 'C:\lib\Series'; content_path = 'C:\lib\Series\Some Show\Season 3'; parts = (Get-TitleParts -Name $Name)
     }
 }
 
@@ -138,6 +138,11 @@ Check 'and the file goes to the TOP of the season folder' `
     ((Split-Path -Parent $v['a'].Files[0].Target) -eq (Join-Path $SERIES 'Some Show\Season 3'))
 Check 'keeping the release file name' `
     ((Split-Path -Leaf $v['a'].Files[0].Target) -eq 'Show.S03E07.mkv')
+Check 'source file is resolved relative to save_path' ($v['a'].Files[0].Path -eq 'C:\lib\Series\Show.S03E07.mkv')
+$unrelated = Ep 'other-show' 'Another Show S03E07 2160p WEB-DL' 12 0.2
+$v = Get-SettleVerdicts -Torrents @($done, $unrelated) -FileLister (Lister @{ a = @((F 'Show.S03E07.mkv' 9.0)) }) `
+        -MoviesDir $MOVIES -SeriesDir $SERIES -Aliases $ALIASES
+Check 'same episode of a different show does not block settlement' ($v['a'].Verdict -eq 'SETTLE')
 
 Write-Host ''
 Write-Host '== anything unfinished blocks, whatever its size =='
@@ -167,6 +172,10 @@ $stopped.priority = 0
 $v = Get-SettleVerdicts -Torrents @($m, $stopped) -FileLister (Lister @{ a = @((F 'Show.S03E07.mkv' 9.0)) }) `
         -MoviesDir $MOVIES -SeriesDir $SERIES -Aliases $ALIASES
 Check 'a STOPPED unfinished copy blocks'         ($v.ContainsKey('a') -and $v['a'].Verdict -eq 'WAIT')
+$stopped.state = 'queuedDL'
+$v = Get-SettleVerdicts -Torrents @($m, $stopped) -FileLister (Lister @{ a = @((F 'Show.S03E07.mkv' 9.0)) }) `
+        -MoviesDir $MOVIES -SeriesDir $SERIES -Aliases $ALIASES
+Check 'queued unfinished related copy still blocks final flattening' ($v['a'].Verdict -eq 'WAIT')
 
 # A FINISHED copy never blocks: it is not going to arrive, and two finished copies
 # of one episode is rule 4's business, not this rule's.
@@ -280,9 +289,11 @@ Check 'a file is never settled into the series ROOT' ($rootTarget -eq 'WAIT')
 
 Write-Host ''
 Write-Host '== the action must be all-or-nothing and must keep the data =='
-$act = $msrc
+$actionStart = $msrc.IndexOf('function Invoke-SettlePlan')
+$actionEnd = $msrc.IndexOf('# Reap totals', $actionStart)
+$act = $msrc.Substring($actionStart, $actionEnd - $actionStart)
 Check 'finished entry removal passes -Knows and preserves data' ($act -cmatch 'Remove-Torrent -T \$t -Knows -DeleteFiles \$false')
-# The ordering is the safety. Stop, move, verify, and only then remove the entry.
+# Stop and journal, then remove without data, move, verify, and clean residues.
 $stopAt = $act.IndexOf('Stop-TorrentAndConfirm -T $t')
 $rmAt = $act.IndexOf('Remove-Torrent -T $t -Knows -DeleteFiles $false')
 $mvAt = $act.IndexOf('Move-Item -LiteralPath $src -Destination $dst')
@@ -290,11 +301,14 @@ $vfAt = $act.IndexOf('$after.Length -eq [int64]$f.Bytes')
 Check 'it STOPS the torrent before moving'      ($stopAt -gt 0 -and $stopAt -lt $mvAt)
 Check 'it MOVES the file'                       ($mvAt -gt 0)
 Check 'it VERIFIES the size after the move'     ($vfAt -gt $mvAt)
-Check 'and only THEN removes the entry'         ($rmAt -gt $vfAt)
-Check 'a failed verification keeps the entry'   ($act -cmatch '\$failed\.Count -gt 0')
-Check 'an unconfirmed stop keeps the entry'     ($act -cmatch 'if \(-not \$stoppedOk\)')
+Check 'entry is removed BEFORE moving media' ($rmAt -lt $mvAt)
+Check 'durable record is written BEFORE removing the entry' ($act.IndexOf('Save-PendingSettleRecord -Record $Record') -lt $rmAt)
+Check 'a failed verification retains a retryable pending plan' ($act -cmatch 'throw "settle verification failed' -and $act -cmatch 'saved plan retains file locations')
+Check 'an unconfirmed stop prevents any move' ($act -cmatch 'if \(-not \(Stop-TorrentAndConfirm -T \$t\)\) \{ return \$false \}')
 # Refusing to overwrite is rule 4b's call to make, not this rule's.
 Check 'it refuses to overwrite a library file'  ($act -cmatch 'already in the library')
+$statusSource = [IO.File]::ReadAllText((Get-ProjectFile 'status.ps1'))
+Check 'status reads accented library paths from logs as UTF-8' ($statusSource -cmatch 'Get-Content -LiteralPath \$log -Encoding UTF8')
 
 Write-Host ''
 Write-Host ''

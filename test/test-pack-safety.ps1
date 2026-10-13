@@ -59,6 +59,7 @@ $src = [System.IO.File]::ReadAllText((Get-ProjectFile 'qbt-manager.ps1'), [Syste
 # slicing them apart leaves the rule itself undefined.
 Invoke-Expression (Get-Slice $src '$script:boundaryPattern' 'function Get-DoviHit')
 Invoke-Expression (Get-Slice $src 'function Test-Claimed' 'function Get-PhantomVerdicts')
+Invoke-Expression (Get-Slice $src 'function Test-PendingSettlePath' 'function Resolve-TorrentFilePath')
 foreach ($fn in 'Get-LibraryDuplicateVerdicts', 'Get-LibraryEpisodeFiles', 'Test-Claimed', 'Get-TitleParts') {
     if (-not (Get-Command $fn -ErrorAction SilentlyContinue)) { throw "$fn was not loaded by the slices" }
 }

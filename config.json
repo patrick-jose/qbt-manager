@@ -18,7 +18,7 @@
   "metadataPriorityRankLimit": 10,
   "queueDrainEnabled": true,
   "stallCleanupEnabled": true,
-  "stallConfirmSeconds": 60,
+  "stallConfirmSeconds": 15,
   "stallMaxWaitSeconds": 75,
   "stallMaxDeletions": 10,
   "stallInternetProbeUrl": "https://www.cloudflare.com/cdn-cgi/trace",
@@ -26,6 +26,7 @@
   "backupMaxAgeDays": 7,
   "logRetentionDays": 7,
 
+  "//assignCategories": "Only fill an empty torrent category based on parsed movie/series identity. Any existing category is user-owned and will never be changed back by the manager.",
   "assignCategories": true,
   "moveCompletedToLibrary": true,
   "moveVerifySeconds": 30,
@@ -41,6 +42,8 @@
 
   "//titleAliases": "One show, several spellings. Key = the title the parser produces, value = the title to file it under. Case-insensitive; chains are followed. Nothing is guessed: a title not listed here is untouched, because folding titles by similarity would trade a duplicate nobody notices for a wrong file deleted. See docs/RULES.md.",
   "titleAliases": {},
+  "//yearScopedMovieAliases": "Optional explicit movie aliases scoped by year. Key format: YYYY|parsed movie title; value: canonical parsed title. These aliases do not apply to series or other release years.",
+  "yearScopedMovieAliases": {},
 
   "reapOrphans": true,
   "reapMinAgeHours": 24,
@@ -56,6 +59,8 @@
     "\\bdv[\\s._-]*hevc\\b",
     "\\bdovi[\\s._-]*profile\\b"
   ],
+  "//doviPatternOverrides": "Optional machine-local release-name patterns for known DoVi releases whose names omit the usual tags. Keep these in config.local.json, never in a published config.",
+  "doviPatternOverrides": [],
 
   "excludeBluRayDiscRips": true,
   "bdmvSearchDepth": 2,

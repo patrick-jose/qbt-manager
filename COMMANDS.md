@@ -145,6 +145,10 @@ location keys belong in it — `moviesDir`, `seriesDir`, `reapRoots`, and the tw
 category names. Every other setting belongs in `config.json`, so there is exactly
 one place to look for it.
 
+When `assignCategories` is enabled, the manager only assigns a category to a
+torrent whose category is blank. Any existing category is treated as the user's
+choice and is never changed back based on the parsed title.
+
 A `"//"` key is a comment and is skipped, so the file can explain itself.
 
 A missing `config.local.json` is not an error. That is the normal case for
@@ -187,18 +191,29 @@ around it with nothing to notice.
 
 ## The scheduled task
 
-Runs every 15 minutes, and at logon. You rarely need to touch it, but:
+The old scheduled watchdog is disabled. A hidden companion starts with qBittorrent
+through the installed Start menu/user shortcuts and existing Windows startup entry.
+Closing qBittorrent ends the companion after any active manager pass finishes safely.
+While qBittorrent is open, it checks relevant
+queue changes every 5 seconds. Manager passes are serial, never overlapping.
+Existing safety confirmation waits still apply, so a pass can take longer than
+the polling interval. Changes during a pass are read on the next poll.
+
+Time-based rules run every minute; pending settles retry every 30 seconds.
+These timer passes skip broad library/reaper scans. Queue changes and 15-minute
+maintenance passes include those scans. Transfer bytes and speed alone do not
+trigger extra passes. With qBittorrent closed, no companion remains running.
+Reopening through a launcher shortcut starts a fresh evaluation.
 
 ```powershell
 # Is it there, and when does it next run?
 Get-ScheduledTask -TaskName 'qbt-manager' | Get-ScheduledTaskInfo
 
-# Run it now instead of waiting for the next tick.
-Start-ScheduledTask -TaskName 'qbt-manager'
+# Start qBittorrent and its companion manually.
+.\launch-qbittorrent.ps1
 
-# Stop it while you work by hand, so it cannot collide with your own run.
+# Inspect the disabled legacy task. Do not enable it alongside the launcher.
 Disable-ScheduledTask -TaskName 'qbt-manager'
-Enable-ScheduledTask  -TaskName 'qbt-manager'
 
 # What it actually runs.
 (Get-ScheduledTask -TaskName 'qbt-manager').Actions
@@ -210,20 +225,32 @@ The task is **not committed** — it points at absolute paths on your machine.
 Recreate it after cloning:
 
 ```powershell
-$here    = 'C:\path\to\qbt-manager'
-$action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$here\qbt-manager.ps1`""
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-    -RepetitionInterval (New-TimeSpan -Minutes 15)
-$logon   = New-ScheduledTaskTrigger -AtLogOn
-
-Register-ScheduledTask -TaskName 'qbt-manager' -Action $action -Trigger @($trigger, $logon) `
-    -Description 'Automated qBittorrent curator'
+.\install-launcher.ps1
 ```
 
-`-WindowStyle Hidden` matters: without it the task flashes a console window every
-15 minutes. This matches the task as it is actually registered here — one
-15-minute time trigger plus one at-logon trigger.
+The installer backs up the old task and affected shortcuts/startup entry under
+`backup\`, disables the task, creates a per-user Start menu launcher, updates
+existing user/pinned shortcuts, and preserves Windows startup arguments.
+Machine-specific executable settings live in ignored `launcher.local.json`.
+It refuses installation while the old task is running, to avoid interrupting
+file operations. No qBittorrent download settings are changed.
+
+Launching `qbittorrent.exe` directly (including an unmodified file/protocol
+association or a third-party launcher) bypasses the companion. Use an installed
+launcher shortcut, Windows startup, or `launch-qbittorrent.ps1` for paired execution.
+
+For an interactive companion that exits when qBittorrent closes:
+
+```powershell
+.\watch-manager.ps1
+# Read-only trial (manager retains its existing dry-run logging behavior):
+.\watch-manager.ps1 -DryRun
+```
+
+Stop an interactive companion with Ctrl+C **between manager passes**, not during
+file operations. Normally, just close qBittorrent; the companion exits on its own.
+Watcher diagnostics are in `logs\watcher-YYYY-MM-DD.log`; decisions remain in
+the existing manager logs. Watcher logs have the same seven-day retention.
 
 ## Logs
 

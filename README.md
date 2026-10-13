@@ -1,7 +1,7 @@
 # qbt-manager
 
 An automated curator for [qBittorrent](https://www.qbittorrent.org/), driven
-through its Web API. Runs unattended on a schedule, deletes what you have decided
+through its Web API. Watches qBittorrent for changes, deletes what you have decided
 should not be downloaded, files what should be kept, and tells you what it did
 and why.
 
@@ -128,8 +128,12 @@ safe, but nothing will be found, deduplicated or moved.
 
 The scheduled task is **not** committed, because it names absolute paths.
 [COMMANDS.md](COMMANDS.md#the-scheduled-task) has the exact
-`Register-ScheduledTask` that recreates it — a 15-minute trigger plus one at
-logon.
+launcher installer that connects the manager to qBittorrent's lifetime. Launching
+qBittorrent through the installed shortcut or Windows startup entry starts its
+companion; closing qBittorrent ends the companion after any active pass finishes.
+It checks relevant queue changes every 5 seconds, time-based rules every minute,
+and pending settles every 30 seconds. Broad scans run on queue changes and every
+15 minutes. No manager remains waiting while qBittorrent is closed.
 
 ## Configuration
 

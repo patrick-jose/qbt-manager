@@ -34,7 +34,7 @@ The panel is deliberately ACTION-FIRST. With a few hundred torrents the
     switch away - see -Full.
 
 .PARAMETER Watch
-    Keep refreshing every few seconds. Without it, prints one snapshot.
+    Keep refreshing every 60 seconds by default. Without it, prints one snapshot.
 
 .PARAMETER Full
     Print the whole queue and every magnet, unbounded. The default is the
@@ -50,7 +50,7 @@ The panel is deliberately ACTION-FIRST. With a few hundred torrents the
     moves, warnings and errors.
 
 .PARAMETER RefreshSeconds
-    Seconds between refreshes under -Watch. Default 30.
+    Seconds between refreshes under -Watch. Default 60.
 
 .EXAMPLE
     .\status.ps1            # one summary snapshot
@@ -65,7 +65,7 @@ param(
     [switch]$Full,
     [switch]$All,
     [int]$Tail = 8,
-    [int]$RefreshSeconds = 30
+    [int]$RefreshSeconds = 60
 )
 
 $ErrorActionPreference = 'Stop'
@@ -141,6 +141,8 @@ if ($sliceStart -lt 0 -or $sliceEnd -le $sliceStart) {
     throw 'could not locate the detection block in qbt-manager.ps1 - the markers it is sliced by have moved'
 }
 Invoke-Expression $src.Substring($sliceStart, $sliceEnd - $sliceStart)
+$script:settleJournalDir = Join-Path $PSScriptRoot 'pending-settle'
+$script:pendingSettleRecords = @(Get-PendingSettleRecords)
 
 # ---- small helpers ---------------------------------------------------------
 
@@ -309,7 +311,7 @@ function Test-Errored {
 
 function Get-ExclusionVerdict {
     param($T)
-    $dovi = Get-DoviHit -Name (Get-Prop $T 'name')
+    $dovi = Get-TorrentDoviHit -Torrent $T
     if ($dovi) {
         return [pscustomobject]@{ Verdict = 'EXCLUDE'; Rule = 'DoVi'; Reason = "Dolby Vision marker '$dovi'" }
     }
@@ -346,7 +348,11 @@ $parts = $null
         # run would never have grouped it with anything. 'Euforie - Euphoria
         # S03E01' parses as 'euforie euphoria', which is Euphoria, and only the
         # user's alias says so.
-        if ($parts) { $parts = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases }
+        if ($parts) {
+            $parts = Resolve-SpecialMovieAlias -Parts $parts -Name ([string](Get-Prop $t 'name')) -Aliases $cfg.specialMovieAliases
+            $parts = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases
+            $parts = Resolve-YearScopedMovieAlias -Parts $parts -Aliases $cfg.yearScopedMovieAliases
+        }
 
         Add-Member -InputObject $t -NotePropertyName parts -NotePropertyValue $parts -Force
         if (-not $parts) { continue }
@@ -1531,6 +1537,16 @@ function Show-Snapshot {
         Write-Host ("  task '{0}' is not registered" -f $taskName) -ForegroundColor Yellow
     }
 
+    if ($script:pendingSettleRecords.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'PENDING SETTLE (retained media; retried on each manager run)' -ForegroundColor Yellow
+        foreach ($record in $script:pendingSettleRecords) {
+            $state = if ($record.EntryRemoved) { 'entry removed; file move/cleanup pending' } else { 'entry removal awaiting confirmation' }
+            Write-Host ("  [{0}] {1}: {2}" -f $record.Plan.Torrent.hash.Substring(0, 8), $state, $record.Plan.Torrent.name)
+            Write-Host ("           -> {0}" -f $record.Plan.Dir) -ForegroundColor DarkGray
+        }
+    }
+
     # ---- recent activity ---------------------------------------------------
     $log = Join-Path $logDir ("manager-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
     $logTitle = 'ACTIVITY'
@@ -1547,7 +1563,7 @@ function Show-Snapshot {
         # Named logRows, not $all: PowerShell ignores case in variable names, so
         # $all would be the same variable as the -All switch and assigning this
         # array to it would silently switch the filter off.
-        $logRows = @(Get-Content -LiteralPath $log -Tail ([Math]::Max($Tail * 6, 60)) -ErrorAction SilentlyContinue |
+        $logRows = @(Get-Content -LiteralPath $log -Encoding UTF8 -Tail ([Math]::Max($Tail * 6, 60)) -ErrorAction SilentlyContinue |
                      ForEach-Object { Get-LogRow $_ } | Where-Object { $_ })
         $rows = @(Select-InterestingLog -Rows $logRows -IncludeAll:([bool]$All))
         $picked = @($rows | Select-Object -Last $Tail)

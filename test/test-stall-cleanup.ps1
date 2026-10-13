@@ -212,7 +212,7 @@ Write-Host ''
 Write-Host '== the shipped config =='
 $cfg = [System.IO.File]::ReadAllText((Join-Path $root 'config.json'), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
 Check 'stallCleanupEnabled is on'                      ($cfg.stallCleanupEnabled -eq $true)
-Check 'the confirm window is 60s'                      ([double]$cfg.stallConfirmSeconds -eq 60)
+Check 'the confirm window is 15s'                      ([double]$cfg.stallConfirmSeconds -eq 15)
 Check 'the wait ceiling is above the window'           ([double]$cfg.stallMaxWaitSeconds -ge [double]$cfg.stallConfirmSeconds)
 Check 'the cap is 10'                                  ([int]$cfg.stallMaxDeletions -eq 10)
 Check 'a probe url is configured'                      (-not [string]::IsNullOrWhiteSpace([string]$cfg.stallInternetProbeUrl))

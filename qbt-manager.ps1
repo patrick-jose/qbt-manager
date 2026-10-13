@@ -62,7 +62,10 @@ param(
     [string]$ConfigPath,
     # Restricts the dedup pass to titles whose parsed name contains this text.
     # Used to stage a first run against a single title.
-    [string]$Only
+    [string]$Only,
+    # Watcher timer passes still evaluate torrent rules and settle retries, but
+    # defer broad filesystem scans until a queue change or maintenance pass.
+    [switch]$SkipLibraryScan
 )
 
 $ErrorActionPreference = 'Stop'
@@ -178,6 +181,7 @@ if (-not (Test-Path -LiteralPath $logDir)) {
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 }
 $statePath = Join-Path $PSScriptRoot 'state.json'
+$script:settleJournalDir = Join-Path $PSScriptRoot 'pending-settle'
 $logPath   = Join-Path $logDir ('manager-{0}.log' -f (Get-Date -Format 'yyyy-MM-dd'))
 
 $script:actions = New-Object System.Collections.ArrayList
@@ -714,8 +718,19 @@ function Get-TitleParts {
         }
     }
 
+    # A few older releases lead with the year: '(1968) Charly DVD-Rip'.
+    # The normal technical-boundary cut sees that year before the title and
+    # used to leave an empty title. Preserve that leading year, then let the
+    # usual boundary logic parse the remaining title.
+    $leadingYear = $null
+    $leadingYearMatch = [regex]::Match($work, '^\s*\((?<year>(?:19|20)\d{2})\)\s+')
+    if ($leadingYearMatch.Success) {
+        $leadingYear = $leadingYearMatch.Groups['year'].Value
+        $work = $work.Substring($leadingYearMatch.Length)
+    }
+
     # --- year, from anywhere in the name (brackets included) ---------------
-    $year = $null
+    $year = $leadingYear
     $m = [regex]::Match($work, '(?<!\w)(?:19|20)\d{2}(?!\w)')
     if ($m.Success) { $year = $m.Value }
 
@@ -1535,9 +1550,33 @@ function Merge-SeriesClusters {
 
 function Get-DoviHit {
     param([string]$Name)
-    foreach ($p in $cfg.doviPatterns) {
+    foreach ($p in (@($cfg.doviPatterns) + @($cfg.doviPatternOverrides))) {
         $m = [regex]::Match($Name, "(?i)$p")
         if ($m.Success) { return $m.Value }
+    }
+    return $null
+}
+
+function Get-TorrentDoviHit {
+    param([object]$Torrent, [switch]$IncludePayloadFiles)
+    # qBittorrent's display name may omit a format tag that remains on the
+    # payload path/file name. Check the cheap identity fields first.
+    $hit = Get-DoviHit -Name ([string]$Torrent.name + ' ' + [string]$Torrent.content_path)
+    if ($hit -or -not $IncludePayloadFiles -or -not $Torrent.has_metadata -or [string]::IsNullOrWhiteSpace([string]$Torrent.hash)) { return $hit }
+
+    # Some magnet titles are shortened before the codec/DoVi suffix. Once
+    # metadata is available, inspect the actual payload filenames too; this is
+    # the authoritative filename that qBittorrent will write. Cache once per
+    # manager pass so other rules can reuse the same result.
+    if ($null -eq $script:doviPayloadFileCache) { $script:doviPayloadFileCache = @{} }
+    $key = ([string]$Torrent.hash).ToLowerInvariant()
+    if (-not $script:doviPayloadFileCache.ContainsKey($key)) {
+        try { $script:doviPayloadFileCache[$key] = @(Invoke-ApiGet -Endpoint "torrents/files?hash=$($Torrent.hash)") }
+        catch { $script:doviPayloadFileCache[$key] = @() }
+    }
+    foreach ($file in @($script:doviPayloadFileCache[$key])) {
+        $hit = Get-DoviHit -Name ([string]$file.name)
+        if ($hit) { return $hit }
     }
     return $null
 }
@@ -1970,7 +2009,7 @@ function Test-InternetReachable {
 #   2. The internet is up, proven by Test-InternetReachable. This is what stops
 #      the rule from firing when the user's connection is down.
 #
-# $MinSeconds is the "more than 1 minute" requirement. It is enforced by the
+# $MinSeconds is the configured sustained-zero confirmation window. It is enforced by the
 # caller, which samples the rate more than once across the run - see
 # Get-StallVerdict, where the clock lives. A single sample cannot tell a stall
 # from a momentary lull between chunks.
@@ -2031,7 +2070,7 @@ function Get-StallVerdict {
              When the threshold has not yet been reached, this function WAITS OUT
              the remainder and re-samples, bounded by $MaxWaitSeconds, so the
              deletion happens in the run that noticed the stall rather than the
-             one after it. That wait is the whole "more than 1 minute" requirement
+              one after it. That wait is the whole confirmation-window requirement
              and it is paid only when the rate is genuinely zero.
 
           3. The internet is up, by Test-InternetReachable, which does not involve
@@ -2470,10 +2509,11 @@ function Test-MoveSettled {
     $cp = [string]$T.content_path
     if ([string]::IsNullOrWhiteSpace($cp)) { return $false }
 
-    $parent = if (Test-Path -LiteralPath $cp) { Split-Path -Parent $cp } else { [string]$T.save_path }
-    if ([string]::IsNullOrWhiteSpace($parent)) { return $false }
-
-    return ($parent.TrimEnd('\', '/') -ieq $TargetDir.TrimEnd('\', '/'))
+    # A multi-file torrent's media can be several folders below the target.
+    # Only its content path, not its shared save path, proves placement.
+    $target = $TargetDir.TrimEnd('\', '/')
+    return ($cp.TrimEnd('\', '/') -ieq $target -or
+            $cp.StartsWith($target + '\', [StringComparison]::OrdinalIgnoreCase))
 }
 
 # The size of ONE episode inside a finished pack, read from the pack's own file
@@ -2762,6 +2802,45 @@ function Resolve-PartsAlias {
     return [pscustomobject]$out
 }
 
+function Resolve-SpecialMovieAlias {
+    <# Explicitly identifies a movie torrent mislabelled as S00E01. #>
+    param($Parts, [string]$Name, [object]$Aliases)
+    if (-not $Parts -or -not $Parts.IsSeries -or $Parts.Season -ne 0 -or $Parts.Episode -ne 1 -or $null -eq $Aliases) { return $Parts }
+    foreach ($alias in $Aliases.PSObject.Properties) {
+        if ([string]::IsNullOrWhiteSpace($alias.Name) -or [string]::IsNullOrWhiteSpace([string]$alias.Value)) { continue }
+        $words = @($alias.Name -split '\s+' | Where-Object { $_ })
+        if ($words.Count -eq 0) { continue }
+        $pattern = '(?i)(?<![\p{L}\p{Nd}])' + (($words | ForEach-Object { [regex]::Escape($_) }) -join '[^\p{L}\p{Nd}]+') + '(?![\p{L}\p{Nd}])'
+        if ($Name -notmatch $pattern) { continue }
+        $canon = ([string]$alias.Value).ToLowerInvariant().Trim()
+        $tokens = @($canon -split '\s+' | Where-Object { $_ -and $script:ignorable -notcontains $_ })
+        if ($tokens.Count -eq 0) { return $Parts }
+        $out = [ordered]@{}
+        foreach ($p in $Parts.PSObject.Properties) { $out[$p.Name] = $p.Value }
+        $out['Title'] = $canon; $out['Tokens'] = $tokens; $out['Numbers'] = @()
+        $out['IsSeries'] = $false; $out['Season'] = $null; $out['Episode'] = $null
+        $out['EpisodeLast'] = $null; $out['IsMultiEpisode'] = $false
+        return [pscustomobject]$out
+    }
+    return $Parts
+}
+
+function Resolve-YearScopedMovieAlias {
+    # Movie remakes can share a short title; scope this identity correction to
+    # the explicitly named release year so another film is never merged.
+    param($Parts, [object]$Aliases)
+    if (-not $Parts -or $Parts.IsSeries -or [string]::IsNullOrWhiteSpace([string]$Parts.Year) -or $null -eq $Aliases) { return $Parts }
+    $pairs = if ($Aliases -is [System.Collections.IDictionary]) { $Aliases.GetEnumerator() } else { $Aliases.PSObject.Properties }
+    foreach ($pair in $pairs) {
+        $key = if ($Aliases -is [System.Collections.IDictionary]) { [string]$pair.Key } else { [string]$pair.Name }
+        $value = if ($Aliases -is [System.Collections.IDictionary]) { [string]$pair.Value } else { [string]$pair.Value }
+        if ($key -notmatch '^(\d{4})\|(.*)$' -or $Matches[1] -ne [string]$Parts.Year -or $Matches[2] -ine [string]$Parts.Title) { continue }
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        return (Resolve-PartsAlias -Parts $Parts -Aliases (@{ ([string]$Parts.Title) = $value }))
+    }
+    return $Parts
+}
+
 function Resolve-LibraryShowDir {
     <#
         The show folder on disk for a parsed title, as a FULL path - and it is
@@ -2807,10 +2886,10 @@ function Resolve-LibraryShowDir {
     if (-not $SeriesDir -or -not (Test-Path -LiteralPath $SeriesDir)) { return $null }
 
     if (-not $script:showDirCache) { $script:showDirCache = @{} }
-    $ck = $Title.ToLowerInvariant()
+    $alias = Resolve-ShowAlias -Title $Title -Aliases $Aliases
+    $ck = $SeriesDir.TrimEnd('\', '/').ToLowerInvariant() + '|' + $Title.ToLowerInvariant() + '|' + $alias.ToLowerInvariant()
     if ($script:showDirCache.ContainsKey($ck)) { return $script:showDirCache[$ck] }
 
-    $alias = Resolve-ShowAlias -Title $Title -Aliases $Aliases
     $want = ConvertTo-LibraryFolderName -Title $alias
     # The un-aliased spelling, so a folder that predates the alias is still
     # found rather than duplicated. Compared second, so the aliased name wins
@@ -3074,6 +3153,7 @@ function Get-LibraryDuplicateVerdicts {
                 # Check every claimant, not merely the first matching torrent.
                 $eligible = @($group | Where-Object {
                     $file = $_.File
+                    if (Test-PendingSettlePath -Path $file.FullName) { return $false }
                     $claims = @($Torrents | Where-Object { Test-Claimed -Path $file.FullName -Torrents @($_) })
                     @($claims | Where-Object { $_.progress -lt 1 -or $Gone.ContainsKey($_.hash) }).Count -eq 0
                 })
@@ -3906,6 +3986,103 @@ function Test-SpanOverlap {
     return ($A.First -le $B.Last -and $B.First -le $A.Last)
 }
 
+function Get-PendingSettleRecords {
+    if (-not $script:settleJournalDir -or -not (Test-Path -LiteralPath $script:settleJournalDir)) { return @() }
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:settleJournalDir -Filter '*.json' -File)) {
+        $record = [IO.File]::ReadAllText($file.FullName, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        if (-not $record.Plan -or $record.Plan.Torrent.hash -notmatch '^[a-fA-F0-9]{40}$') { throw "invalid pending-settle record: $($file.FullName)" }
+        $record
+    }
+}
+
+function Save-PendingSettleRecord {
+    param($Record)
+    if (-not $script:settleJournalDir) { throw 'pending-settle journal location is unavailable' }
+    $hash = [string]$Record.Plan.Torrent.hash
+    if ($hash -notmatch '^[a-fA-F0-9]{40}$') { throw 'invalid pending-settle hash' }
+    New-Item -ItemType Directory -Path $script:settleJournalDir -Force | Out-Null
+    $path = Join-Path $script:settleJournalDir ($hash + '.json')
+    $temp = $path + '.tmp'
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($Record | ConvertTo-Json -Depth 15))
+        $stream = [IO.File]::Open($temp, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        if (Test-Path -LiteralPath $path) {
+            $backup = $path + '.previous'
+            [IO.File]::Replace($temp, $path, $backup)
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        }
+        else { [IO.File]::Move($temp, $path) }
+    }
+    finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force } }
+    $script:pendingSettleRecords = @(Get-PendingSettleRecords)
+}
+
+function Test-PendingSettlePath {
+    param([string]$Path)
+    foreach ($record in @($script:pendingSettleRecords)) {
+        if (-not $record) { continue }
+        foreach ($file in @($record.Plan.Files)) {
+            foreach ($protected in @($file.Path, $file.Target)) {
+                if ([string]::IsNullOrWhiteSpace([string]$protected)) { continue }
+                if ($Path -ieq $protected -or $protected.StartsWith($Path.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
+function Get-EmptyLibraryReleaseFolders {
+    param([string]$SeriesDir, [object[]]$Torrents = @(), $Aliases = $null)
+    if (-not $SeriesDir -or -not (Test-Path -LiteralPath $SeriesDir -PathType Container)) { return @() }
+    foreach ($show in @(Get-ChildItem -LiteralPath $SeriesDir -Directory -Force)) {
+        if ($show.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        foreach ($season in @(Get-ChildItem -LiteralPath $show.FullName -Directory -Force | Where-Object { $_.Name -match '^Season \d+$' })) {
+            if ($season.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            foreach ($release in @(Get-ChildItem -LiteralPath $season.FullName -Directory -Force)) {
+                if ($release.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                $parts = Get-TitleParts -Name $release.Name
+                if (-not $parts -or -not $parts.IsSeries) { continue }
+                $parts = Resolve-PartsAlias -Parts $parts -Aliases $Aliases
+                $target = Get-LibraryTargetDir -T ([pscustomobject]@{ parts = $parts }) -MoviesDir '' -SeriesDir $SeriesDir -Aliases $Aliases
+                # Only a recognised release belonging to THIS show/season is ours.
+                # Preserve library structure, unrelated/user folders, and live claims.
+                if ($target -ine $season.FullName) { continue }
+                if ((Test-Claimed -Path $release.FullName -Torrents $Torrents) -or
+                    (Test-PendingSettlePath -Path $release.FullName)) { continue }
+                try {
+                    $children = @(Get-ChildItem -LiteralPath $release.FullName -Recurse -Force -ErrorAction Stop)
+                    if (@($children | Where-Object { -not $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }).Count -gt 0) { continue }
+                    [pscustomobject]@{
+                        Root = $release.FullName
+                        Dirs = @($children | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { $_.FullName }) + @($release.FullName)
+                    }
+                }
+                catch { continue } # Unreadable is not evidence of an empty tree.
+            }
+        }
+    }
+}
+
+function Resolve-TorrentFilePath {
+    param($T, [string]$Name)
+    # API file names are relative to save_path and already include the payload
+    # folder. Appending them to content_path duplicates that folder.
+    if ([string]::IsNullOrWhiteSpace([string]$T.save_path)) { throw 'save_path is unavailable' }
+    $relative = $Name.Replace('/', '\')
+    if ([IO.Path]::IsPathRooted($relative)) { throw 'torrent file name is absolute' }
+    $root = [IO.Path]::GetFullPath([string]$T.save_path).TrimEnd('\')
+    $path = [IO.Path]::GetFullPath((Join-Path $root $relative))
+    if (-not $path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'torrent file name escapes save_path' }
+    return $path
+}
+
+function Test-SettleMedia {
+    param([string]$Name)
+    return ($Name -match '(?i)\.(mkv|mp4|avi|m4v)$' -and
+            $Name -notmatch '(?i)(^|[\\/])samples?([\\/._ -]|$)|[._ -]sample[._ -]')
+}
+
 function Get-SettleVerdicts {
 <#
         Rule 3b: a finished media file that nothing unfinished can improve is cut
@@ -3933,17 +4110,15 @@ function Get-SettleVerdicts {
 
             settled  <=>  no unfinished torrent covers any episode it holds
 
-        ALL OR NOTHING, PER TORRENT. This is the part that is not a preference.
-        Moving one file out from under a LIVE torrent entry means qBittorrent
-        rechecks, finds that file missing, and fetches it again - so the entry has
-        to go in the same breath, and it can only go once every one of its media
-        files has landed. A pack whose episode 1 is settled but whose episode 2 is
-        still beatable therefore waits in full, and that is the cost of not
-        re-downloading episode 1. Partial relocation is never attempted.
+        ALL EPISODES MUST QUALIFY before a pack is scheduled. A pack whose episode
+        1 is settled but episode 2 still has a rival waits in full. Once eligible,
+        a durable plan is saved, the stopped entry is removed WITHOUT data, and
+        the media is flattened. A locked file stays pending across restarts;
+        already moved episodes are recorded rather than lost or downloaded again.
 
-        WHAT MOVES. Only the media file: mkv, mp4, avi, m4v. .nfo, .txt, samples
-        and subtitles stay where they are, which is what the user does by hand -
-        the Euphoria season folder holds eight .mkv files and nothing else.
+        WHAT MOVES. Only main media: mkv, mp4, avi, m4v, excluding samples.
+        Listed sidecars, samples and subtitles are discarded only AFTER media is
+        verified and entry removal without data is confirmed.
 
         UNKNOWN IS THE REASON TO WAIT. A torrent with no media file in its listing
         is not settled, because there is nothing to say it holds one. An
@@ -3980,6 +4155,7 @@ function Get-SettleVerdicts {
 
         # Only a finished torrent has media worth settling.
         if ([double]$t.progress -lt 1) { continue }
+        if ([string]$t.state -eq 'error') { continue }
         if (-not $t.parts) { continue }
 
         $key = [string]$keys[$t.hash]
@@ -3994,7 +4170,7 @@ function Get-SettleVerdicts {
         try { $files = @(& $FileLister $t.hash) } catch { $files = @() }
         if ($files.Count -eq 0) { continue }
 
-        $media = @($files | Where-Object { [string]$_.name -match '(?i)\.(mkv|mp4|avi|m4v)$' })
+        $media = @($files | Where-Object { Test-SettleMedia -Name ([string]$_.name) })
         if ($media.Count -eq 0) { continue }
 
         # What is still out there that holds the same thing?
@@ -4006,22 +4182,18 @@ function Get-SettleVerdicts {
         # does not have. The overlap asks the question that is actually being asked:
         # do these two releases hold anything in common?
         #
-        # An UNIDENTIFIABLE torrent does not block, and that asymmetry is
-        # deliberate. It cannot be placed, so there is no evidence it holds this
-        # episode - and blocking on it would let one unparseable release freeze
-        # every settle in the run indefinitely. It is safe to let it pass because
-        # this rule MOVES files and never deletes them: settling while a better
-        # version is still coming leaves a valid copy in the library, and the better
-        # version simply downloads afterwards. The rules that delete cannot afford
-        # that; this one can.
+        # An unknown episode set blocks when its parsed show identity matches.
+        # Unrelated shows must not block merely because season/episode numbers
+        # overlap. Entirely unidentified titles provide no related identity.
         $blockers = @()
         $myTitle = [string]$t.parts.Title
         foreach ($u in $live) {
             if ($u.hash -eq $t.hash) { continue }
             if ($Gone.ContainsKey($u.hash)) { continue }
             if ([double]$u.progress -ge 1) { continue }
+            if (-not $u.parts -or [string]$u.parts.Title -ne $myTitle) { continue }
             $us = Get-SetKeySpan -Key ([string]$keys[$u.hash])
-            if (-not $us.Known) { continue }
+            if (-not $us.Known) { $blockers += $u; continue }
             if ($span.IsFilm) {
                 if (-not $us.IsFilm) { continue }
                 if (-not $u.parts) { continue }
@@ -4029,6 +4201,7 @@ function Get-SettleVerdicts {
             }
             else {
                 if ($us.IsFilm) { continue }
+                if (-not $u.parts -or [string]$u.parts.Title -ne $myTitle) { continue }
                 if (-not (Test-SpanOverlap -A $span -B $us)) { continue }
             }
             $blockers += $u
@@ -4075,6 +4248,17 @@ function Get-SettleVerdicts {
         }
 
         $plan = @()
+        $discard = @()
+        $pathError = ''
+        foreach ($f in $files) {
+            try { $path = Resolve-TorrentFilePath -T $t -Name ([string]$f.name) }
+            catch { $pathError = $_.Exception.Message; break }
+            if (-not (Test-SettleMedia -Name ([string]$f.name))) { $discard += $path }
+        }
+        if ($pathError) {
+            $out[$t.hash] = [pscustomobject]@{ Verdict = 'WAIT'; Torrent = $t; Files = @(); Reason = "cannot resolve torrent file paths: $pathError" }
+            continue
+        }
         foreach ($f in $media) {
             $name = [string]$f.name
             $leaf = Split-Path -Leaf $name
@@ -4082,7 +4266,7 @@ function Get-SettleVerdicts {
                 Name  = $name
                 Leaf  = $leaf
                 Bytes = [int64]$f.size
-                Path  = (Join-Path $t.content_path $name)
+                Path  = (Resolve-TorrentFilePath -T $t -Name $name)
                 Target = (Join-Path $dir $leaf)
             }
         }
@@ -4092,6 +4276,7 @@ function Get-SettleVerdicts {
             Torrent = $t
             Dir     = $dir
             Files   = $plan
+            Discard = $discard
             Reason  = ("finished, and nothing unfinished holds {0} - {1} media file(s) settled into {2}" -f `
                        $(if ($span.IsFilm) { "the film '" + $t.parts.Title + "'" } else { "S$($span.Season)E$($span.First)-E$($span.Last)" }), $plan.Count, $dir)
         }
@@ -4552,6 +4737,152 @@ function Move-ToLibrary {
     }
 }
 
+function Invoke-SettlePlan {
+    param($Plan, [object[]]$Torrents = @(), $Record = $null)
+    $t = $Plan.Torrent
+    $others = @($Torrents | Where-Object { $_.hash -ne $t.hash })
+    if ($DryRun) {
+        foreach ($f in @($Plan.Files)) {
+            [void]$script:actions.Add("WOULD SETTLE  $($f.Path) -> $($f.Target)")
+        }
+        Write-Log 'MOVE' "[DRY-RUN] would journal, remove entry without data, then flatten media and discard listed sidecars: $($t.name)"
+        return $true
+    }
+    $targets = @{}
+    try {
+        if (-not $Record) {
+            $Record = @(Get-PendingSettleRecords | Where-Object { $_.Plan.Torrent.hash -eq $t.hash }) | Select-Object -First 1
+        }
+        if ($Record) { $Plan = $Record.Plan; $t = $Plan.Torrent }
+        else {
+            $Record = [pscustomobject]@{ Plan = $Plan; EntryRemoved = $false; CreatedAt = (Get-Date).ToString('o') }
+            foreach ($file in @($Plan.Files)) { $file | Add-Member -NotePropertyName MoveStarted -NotePropertyValue $false -Force }
+        }
+        if ($Record.EntryRemoved -and @($Torrents | Where-Object { $_.hash -eq $t.hash }).Count -gt 0) {
+            throw 'a torrent with this hash reappeared; pending media remains protected'
+        }
+        # Preflight first. A lock does not affect length/readability of directory
+        # metadata, so locked media can still be journalled and deregistered.
+        foreach ($f in @($Plan.Files)) {
+            $src = [string]$f.Path; $dst = [string]$f.Target
+            if ($targets.ContainsKey($dst)) { throw "two media files have the same destination: $dst" }
+            $targets[$dst] = $true
+            $landed = ($Record.EntryRemoved -and $f.MoveStarted -and -not (Test-Path -LiteralPath $src) -and (Test-Path -LiteralPath $dst -PathType Leaf))
+            if (-not $landed) {
+                if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "source media is unavailable: $src" }
+                if ([int64](Get-Item -LiteralPath $src).Length -ne [int64]$f.Bytes) { throw "source media size does not match the file listing: $src" }
+            }
+            if (Test-Claimed -Path $src -Torrents $others) { throw "another torrent claims source media: $src" }
+            if (Test-Claimed -Path $dst -Torrents $others) { throw "another torrent claims destination media: $dst" }
+            if (-not $landed -and $src -ine $dst -and (Test-Path -LiteralPath $dst)) { throw "destination already in the library; refusing to overwrite: $dst" }
+        }
+        if (-not $Record.EntryRemoved) {
+            $remaining = @(Invoke-ApiGet -Endpoint ("torrents/info?hashes=" + $t.hash))
+            if ($remaining.Count -gt 0) {
+                if (-not (Stop-TorrentAndConfirm -T $t)) { return $false }
+                # Durable record MUST exist before removing qBittorrent's record.
+                Save-PendingSettleRecord -Record $Record
+                Remove-Torrent -T $t -Knows -DeleteFiles $false -Reason `
+                    "best finished media retained on disk; durable settle plan saved for $($Plan.Dir)"
+                $remaining = @(Invoke-ApiGet -Endpoint ("torrents/info?hashes=" + $t.hash))
+                if ($remaining.Count -gt 0) { throw 'torrent entry removal was not confirmed' }
+            }
+            $Record.EntryRemoved = $true
+            Save-PendingSettleRecord -Record $Record
+        }
+        foreach ($f in @($Plan.Files)) {
+            $src = [string]$f.Path; $dst = [string]$f.Target
+            if ($src -ine $dst -and (Test-Path -LiteralPath $src)) {
+                $parent = Split-Path -Parent $dst
+                if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+                $f.MoveStarted = $true
+                Save-PendingSettleRecord -Record $Record
+                Move-Item -LiteralPath $src -Destination $dst -ErrorAction Stop
+            }
+            $after = Get-Item -LiteralPath $dst -ErrorAction Stop
+            if (-not ($after.Length -eq [int64]$f.Bytes)) { throw "settle verification failed: $dst" }
+        }
+    }
+    catch {
+        $failure = $_.Exception.Message
+        Write-Log 'WARN' "settle pending '$($t.name)': $failure; saved plan retains file locations for a later retry; continuing with other torrents"
+        return $false
+    }
+
+    foreach ($f in @($Plan.Files)) {
+        Write-Log 'MOVE' "$($f.Path) -> $($f.Target) (size verified; torrent entry removed without data)"
+        [void]$script:actions.Add("SETTLED  $($f.Target)")
+    }
+    # Delete only API-listed non-media, not an arbitrary recursive directory.
+    $cleanupPending = $false
+    foreach ($path in @($Plan.Discard)) {
+        if (Test-Claimed -Path $path -Torrents $others) { $cleanupPending = $true; continue }
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            try { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+            catch { $cleanupPending = $true; Write-Log 'WARN' "could not discard sidecar '$path': $($_.Exception.Message); cleanup will retry" }
+        }
+    }
+    # Prune only empty private payload directories. Never remove a save root,
+    # library root, season folder, shared directory, or unlisted residual files.
+    $payload = [string]$t.content_path
+    $save = [string]$t.save_path
+    if ($payload -and $save -and $payload.TrimEnd('\') -ine $save.TrimEnd('\') -and
+        $payload.StartsWith($save.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $payload -PathType Container) -and
+        -not (Test-Claimed -Path $payload -Torrents $others) -and
+        -not ($Plan.Dir -ieq $payload -or $Plan.Dir.StartsWith($payload.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase))) {
+        $dirs = @(Get-ChildItem -LiteralPath $payload -Recurse -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { $_.FullName }) + @($payload)
+        foreach ($dir in $dirs) {
+            if (@(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+                try { [IO.Directory]::Delete($dir, $false) }
+                catch { $cleanupPending = $true; Write-Log 'WARN' "could not remove empty payload directory '$dir': $($_.Exception.Message)" }
+            }
+        }
+    }
+    if ($cleanupPending) { return $false }
+    try { Remove-Item -LiteralPath (Join-Path $script:settleJournalDir ($t.hash + '.json')) -ErrorAction Stop }
+    catch { Write-Log 'WARN' "could not clear completed settle record: $($_.Exception.Message)"; return $false }
+    $script:pendingSettleRecords = @(Get-PendingSettleRecords)
+    return $true
+}
+
+function Remove-EmptyLibraryReleaseFolders {
+    param([string]$SeriesDir, [object[]]$Torrents = @(), $Aliases = $null, [string]$SeasonDir = '')
+    foreach ($candidate in @(Get-EmptyLibraryReleaseFolders -SeriesDir $SeriesDir -Torrents $Torrents -Aliases $Aliases)) {
+        if ($SeasonDir -and (Split-Path -Parent $candidate.Root) -ine $SeasonDir) { continue }
+        if ($DryRun) {
+            [void]$script:actions.Add("WOULD PRUNE EMPTY RELEASE  $($candidate.Root)")
+            continue
+        }
+        foreach ($dir in $candidate.Dirs) {
+            try {
+                if ((Test-Claimed -Path $dir -Torrents $Torrents) -or (Test-PendingSettlePath -Path $dir)) { continue }
+                $item = Get-Item -LiteralPath $dir -Force -ErrorAction Stop
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                if (@(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop).Count -ne 0) { continue }
+                # Deliberately non-recursive: a file appearing after the check
+                # makes removal fail rather than causing user data to be deleted.
+                [IO.Directory]::Delete($dir, $false)
+                [void]$script:actions.Add("PRUNED EMPTY RELEASE  $dir")
+                Write-Log 'INFO' "removed empty library release folder '$dir'"
+            }
+            catch { Write-Log 'WARN' "could not prune empty release folder '$dir': $($_.Exception.Message)" }
+        }
+    }
+}
+
+function Invoke-PendingSettles {
+    param([object[]]$Torrents = @())
+    $completed = 0
+    foreach ($record in @(Get-PendingSettleRecords)) {
+        # A still-listed torrent is judged by the normal current blocker rules.
+        if (@($Torrents | Where-Object { $_.hash -eq $record.Plan.Torrent.hash }).Count -gt 0) { continue }
+        if (Invoke-SettlePlan -Plan $record.Plan -Record $record -Torrents $Torrents) { $completed++ }
+    }
+    return $completed
+}
+
 # Reap totals are usually tens of GB, but a small leftover should not be logged
 # as "0 GB".
 function Format-Bytes {
@@ -4571,6 +4902,11 @@ function Remove-OrphanPath {
         [string]$Path,
         [string[]]$Roots
     )
+
+    if (Test-PendingSettlePath -Path $Path) {
+        Write-Log 'INFO' "reap target '$Path' belongs to a pending settle; left in place"
+        return $false
+    }
 
     $inside = $false
     foreach ($r in @($Roots | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
@@ -4624,8 +4960,14 @@ function Ensure-Category {
 function Set-Category {
     param([object]$T, [string]$Category)
     if ($T.category -eq $Category) { return }
+    # Categories are user-editable in qBittorrent. Treat every existing value as
+    # an intentional choice, not something to repair from the parsed title.
+    if (-not [string]::IsNullOrWhiteSpace([string]$T.category)) {
+        Write-Log 'INFO' "category for '$($T.name)' remains '$($T.category)' (existing category is user-owned)"
+        return
+    }
     if ($DryRun) {
-        Write-Log 'ACTION' "[DRY-RUN] category '$($T.name)' -> '$Category'"
+        Write-Log 'ACTION' "[DRY-RUN] empty category '$($T.name)' -> '$Category'"
         return
     }
     Invoke-ApiPost -Endpoint 'torrents/setCategory' -Fields @{
@@ -4663,6 +5005,7 @@ try {
 
 Write-Log 'INFO' "run start; $($all.Count) torrent(s) seen; dryRun=$([bool]$DryRun)"
 Write-Host "fetched $($all.Count) torrent(s)"
+$script:pendingSettleRecords = @(Get-PendingSettleRecords)
 
 # -- annotate every torrent with its key ------------------------------------
 
@@ -4676,10 +5019,20 @@ try   { $parts = Get-TitleParts -Name $t.name }
       # spelling would put the release in a show of its own - see
       # Resolve-PartsAlias for the live queue this came from.
       if ($parts) {
-          $aliased = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases
-          if ($aliased.Title -ne $parts.Title) {
-              Write-Log 'INFO' ("titleAliases: '{0}' is '{1}'; grouping and filing it as '{1}'" -f $parts.Title, $aliased.Title)
-              $parts = $aliased
+          $special = Resolve-SpecialMovieAlias -Parts $parts -Name ([string]$t.name) -Aliases $cfg.specialMovieAliases
+          if ($parts.IsSeries -and -not $special.IsSeries) {
+              Write-Log 'INFO' ("specialMovieAliases: '{0}' is a movie; grouping it as '{1}'" -f $t.name, $special.Title)
+              $parts = $special
+          }
+          $titleAliased = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases
+          if ($titleAliased.Title -ne $parts.Title) {
+              Write-Log 'INFO' ("titleAliases: '{0}' is '{1}'; grouping and filing it as '{1}'" -f $parts.Title, $titleAliased.Title)
+              $parts = $titleAliased
+          }
+          $yearAliased = Resolve-YearScopedMovieAlias -Parts $parts -Aliases $cfg.yearScopedMovieAliases
+          if ($yearAliased.Title -ne $parts.Title) {
+              Write-Log 'INFO' ("yearScopedMovieAliases: '{0}' ({1}) is '{2}'" -f $parts.Title, $parts.Year, $yearAliased.Title)
+              $parts = $yearAliased
           }
       }
 
@@ -4768,16 +5121,14 @@ Write-Host 'Dolby Vision check'
 $doviHits = 0
 foreach ($t in $live) {
     if (Test-AlreadyGone $t) { continue }
-    $hit = Get-DoviHit -Name $t.name
+    $hit = Get-TorrentDoviHit -Torrent $t -IncludePayloadFiles
     if ($hit) {
         $doviHits++
         # -AllowErrored. This rule was specified as unconditional - "any state" -
-        # and an errored DoVi entry is still a DoVi entry. It reads the NAME and
-        # acts on the name alone, so there is nothing an error can change.
+        # and an errored DoVi entry is still a DoVi entry. It checks the display
+        # name and payload path, either of which can carry the format tag.
         #
-        # -Knows. The verdict comes from the release's own NAME, which is all the
-        # evidence there is to have: the marker is either in the name or it is not,
-        # and there is no further copy to go and find. If the best copy of an
+        # -Knows. The verdict comes from the release identity/path itself. If the best copy of an
         # episode happens to carry a DV marker, this rule still removes it - that
         # is what "in any state" was asked to mean. DoVi is a statement about the
         # format, not a comparison between copies. So this rule knows what it
@@ -5577,7 +5928,7 @@ foreach ($c in $setGroups) {
 $libraryDupOn = $true
 if ($cfg.PSObject.Properties['libraryDedupeEnabled']) { $libraryDupOn = [bool]$cfg.libraryDedupeEnabled }
 
-if (-not $libraryDupOn) {
+if ($SkipLibraryScan -or -not $libraryDupOn) {
     Write-Host ''
     Write-Host 'Library duplicate check' -ForegroundColor DarkGray
     Write-Host '  libraryDedupeEnabled is false, so a repeated episode inside a season folder is left alone' -ForegroundColor DarkGray
@@ -5693,7 +6044,7 @@ if ($cfg.PSObject.Properties['libraryRedundantTolerancePercent']) { $redundantTo
 $redundantOn = $true
 if ($cfg.PSObject.Properties['libraryRedundantEnabled']) { $redundantOn = [bool]$cfg.libraryRedundantEnabled }
 
-if (-not $redundantOn) {
+if ($SkipLibraryScan -or -not $redundantOn) {
     Write-Host ''
     Write-Host 'Redundant download check' -ForegroundColor DarkGray
     Write-Host '  libraryRedundantEnabled is false, so a download matching a library episode is left running' -ForegroundColor DarkGray
@@ -5851,14 +6202,13 @@ if ($cfg.moveCompletedToLibrary) {
 #
 # The move is a CUT of the media file, not a setLocation. Rule 3 has already put
 # the torrent in the library, possibly inside a pack's folder; this lifts the file
-# to the top of the season folder, which is where a library is supposed to be,
-# and leaves the sidecars behind for the reaper.
+# to the top of the season folder, then removes listed sidecars only after entry
+# removal without data is confirmed. Empty private payload folders are pruned.
 #
-# ORDER IS THE SAFETY. Stop, then move, then verify, then only remove the entry -
-# and only if every file verified. If a move fails the entry stays and the data
-# stays, and the next run tries again. Removing the entry first would make a
-# failed move an orphan the reaper eventually destroys, which is losing the file
-# to recover a folder.
+# ORDER IS THE SAFETY. Preflight and stop, save a durable pending plan, remove
+# the entry WITHOUT data, then move/verify media and clean the listed residues.
+# Locks defer only that plan, not the whole pass. Unresolved plans remain protected
+# state until completed; they are not seven-day logs or expendable backups.
 
 Write-Host ''
 Write-Host 'Settled (finished, and nothing unfinished could improve it)'
@@ -5866,6 +6216,18 @@ if ($cfg.PSObject.Properties['settleEnabled'] -and -not $cfg.settleEnabled) {
     Write-Host '  settleEnabled is false, so finished files are left where rule 3 put them' -ForegroundColor DarkGray
 }
 else {
+    # Rule 3 may have moved a payload, or qBittorrent may have updated its path.
+    # Settle must use a fresh snapshot, including newly added unfinished blockers.
+    if (-not $DryRun) {
+        $live = @(Invoke-ApiGet -Endpoint 'torrents/info')
+        foreach ($entry in $live) {
+            $parts = Get-TitleParts -Name $entry.name
+            if ($parts) { $parts = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases }
+            Add-Member -InputObject $entry -NotePropertyName parts -NotePropertyValue $parts -Force
+        }
+        $script:liveTorrents = $live
+    }
+    $resumedSettles = Invoke-PendingSettles -Torrents @($live | Where-Object { -not $script:gone.ContainsKey($_.hash) })
     $settleList = Get-SettleVerdicts -Torrents $live -Gone $script:gone `
                                     -MoviesDir $cfg.moviesDir -SeriesDir $cfg.seriesDir `
                                     -Aliases $cfg.titleAliases `
@@ -5874,7 +6236,7 @@ else {
         try { return @(Invoke-ApiGet -Endpoint "torrents/files?hash=$h") } catch { return @() }
     }
 
-    $settleCount = 0
+    $settleCount = $resumedSettles
     $settleWait = 0
 
     foreach ($hash in @($settleList.Keys | Sort-Object)) {
@@ -5891,135 +6253,20 @@ else {
 
         if (Test-AlreadyGone $t) { continue }
 
-        # A live entry over a file we are about to move is a recheck waiting to
-        # happen. Stopped first, and the stop is confirmed rather than assumed.
-        $stoppedOk = Stop-TorrentAndConfirm -T $t
-
-        $moved = @()
-        $failed = @()
-        foreach ($f in @($sv.Files)) {
-            $src = [string]$f.Path
-            $dst = [string]$f.Target
-
-            if (-not (Test-Path -LiteralPath $src)) {
-                $failed += $f
-                continue
-            }
-
-            # The destination is the library folder. Refuse to overwrite: if a file
-            # for this episode is already there, rule 4b owns that decision - it
-            # keeps the larger and deletes the smaller - and this rule must not
-            # quietly replace one with another.
-            if (Test-Path -LiteralPath $dst) {
-                $existing = Get-Item -LiteralPath $dst
-                if ([int64]$existing.Length -ge [int64]$f.Bytes) {
-                    Write-Log 'WARN' ("not settling '{0}': '{1}' is already in the library at {2:N2} GB" -f `
-                        $t.name, $f.Leaf, ([int64]$existing.Length / 1GB))
-                    $failed += $f
-                    continue
-                }
-            }
-
-            if ($DryRun) {
-                $moved += $f
-                continue
-            }
-
-            try {
-                $parent = Split-Path -Parent $dst
-                if (-not (Test-Path -LiteralPath $parent)) {
-                    New-Item -ItemType Directory -Path $parent -Force | Out-Null
-                }
-                Move-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop
-
-                # Verified by SIZE, not by the move command's exit status. A move
-                # that reports success and leaves a short file is the failure worth
-                # catching, and it is the one that would take the entry with it.
-                if (Test-Path -LiteralPath $dst) {
-                    $after = Get-Item -LiteralPath $dst
-                    if ([int64]$after.Length -eq [int64]$f.Bytes) {
-                        $moved += $f
-                        Write-Log 'MOVE' ("{0} -> {1} ({2:N2} GB, verified)" -f $src, $dst, ([int64]$f.Bytes / 1GB))
-                    }
-                    else {
-                        Write-Log 'WARN' ("settle size mismatch for '{0}': wrote {1} bytes, expected {2} - entry kept" -f `
-                            $f.Leaf, [int64]$after.Length, [int64]$f.Bytes)
-                        $failed += $f
-                    }
-                }
-                else {
-                    Write-Log 'WARN' ("settle could not verify '{0}' at {1} - entry kept" -f $f.Leaf, $dst)
-                    $failed += $f
-                }
-            }
-            catch {
-                Write-Log 'WARN' ("settle failed for '{0}': {1} - entry kept" -f $f.Leaf, $_.Exception.Message)
-                $failed += $f
-            }
-        }
-
-        if ($DryRun) {
-            foreach ($f in $moved) {
-                $short = $t.name
-                if ($short.Length -gt 40) { $short = $short.Substring(0, 40) }
-                [void]$script:actions.Add(("WOULD SETTLE  {0}  ->  {1}" -f $short, $f.Target))
-            }
-            Write-Log 'MOVE' ("[DRY-RUN] would settle {0} media file(s) from '{1}' into {2}" -f $moved.Count, $t.name, $sv.Dir)
-            $settleCount++
-            continue
-        }
-
-        if ($failed.Count -gt 0) {
-            # Partial success is still partial. The entry stays, because it is the
-            # only record of what the files that did not land were.
-            Write-Log 'WARN' ("'{0}' not settled: {1} of {2} file(s) did not verify - entry left in place" -f `
-                $t.name, $failed.Count, @($sv.Files).Count)
-            [void]$script:notes.Add(("settle incomplete: {0} - {1} file(s) did not verify" -f $t.name, $failed.Count))
-            continue
-        }
-
-        if (-not $stoppedOk) {
-            Write-Log 'WARN' ("'{0}' moved but not confirmed stopped - entry left in place" -f $t.name)
-            [void]$script:notes.Add("settle withheld: the stop could not be confirmed")
-            continue
-        }
-
-        # Every file is in the library and verified. The entry is now the only
-        # thing left of the torrent, and the data is not its to delete.
-        #
-        # -Knows. The entry is finished, so the burden of proof applies - and it is
-        # met: the files this rule just moved are named in its own log lines, and
-        # they were verified by size. This is a keeper that was SEEN, not one that
-        # was merely absent.
-        #
-        # -DeleteFiles $false. The bytes are the library's now. Deleting them would
-        # be the whole loss this rule exists to avoid.
-        $leafNames = @($moved | ForEach-Object { $_.Leaf }) -join ', '
-        Remove-Torrent -T $t -Knows -DeleteFiles $false -Reason `
-            ("finished, and nothing unfinished held {0}; {1} settled into {2} and verified, so the entry is left with nothing to own" -f `
-             $(if ($sv.Reason -match 'nothing unfinished holds (.+?) -') { $Matches[1] } else { 'these episodes' }), $leafNames, $sv.Dir)
-
-        # The folder the pack left behind. Only when it holds no media file at all,
-        # because anything that still carries an episode is the library's problem
-        # and not this rule's to reason about.
-        if ($t.content_path) {
-            $left = @(Get-ChildItem -LiteralPath $t.content_path -Recurse -File -ErrorAction SilentlyContinue |
-                      Where-Object { $_.Name -match '(?i)\.(mkv|mp4|avi|m4v)$' })
-            if ($left.Count -eq 0) {
-                try {
-                    Remove-Item -LiteralPath $t.content_path -Recurse -Force -ErrorAction Stop
-                    Write-Log 'INFO' ("removed the emptied folder '{0}'" -f $t.content_path)
-                }
-                catch {
-                    Write-Log 'WARN' ("could not remove the emptied folder '{0}': {1}" -f $t.content_path, $_.Exception.Message)
-                }
-            }
-        }
-
-        $settleCount++
+        $remainingLive = @($live | Where-Object { -not $script:gone.ContainsKey($_.hash) })
+        if (Invoke-SettlePlan -Plan $sv -Torrents $remainingLive) { $settleCount++ }
     }
 
     Write-Host ("  {0} settled, {1} held back" -f $settleCount, $settleWait)
+}
+
+# Empty release trees can be left at the destination by failed setLocation
+# attempts, even when the real payload was settled from a different source.
+if (-not $SkipLibraryScan -and $cfg.seriesDir -and (Test-Path -LiteralPath $cfg.seriesDir -PathType Container)) {
+    $cleanupTorrents = if ($DryRun) { @($all | Where-Object { -not $script:gone.ContainsKey($_.hash) }) }
+                       else { @(Invoke-ApiGet -Endpoint 'torrents/info') }
+    try { Remove-EmptyLibraryReleaseFolders -SeriesDir $cfg.seriesDir -Torrents $cleanupTorrents -Aliases $cfg.titleAliases }
+    catch { Write-Log 'WARN' "empty library release cleanup skipped: $($_.Exception.Message)" }
 }
 
 # -- rule 6: orphan reaper ---------------------------------------------------
@@ -6031,7 +6278,7 @@ else {
 # excluded regardless of config, an age gate, a fresh claim check, and a
 # containment re-check inside the delete itself.
 
-if ($cfg.PSObject.Properties['reapOrphans'] -and $cfg.reapOrphans) {
+if (-not $SkipLibraryScan -and $cfg.PSObject.Properties['reapOrphans'] -and $cfg.reapOrphans) {
 
     $reapRoots = @()
     if ($cfg.PSObject.Properties['reapRoots']) { $reapRoots = @($cfg.reapRoots) }
@@ -6041,6 +6288,12 @@ if ($cfg.PSObject.Properties['reapOrphans'] -and $cfg.reapOrphans) {
 
     # The library is never reaped, whatever the config happens to say.
     $reapExclude = @($cfg.moviesDir, $cfg.seriesDir)
+    foreach ($record in @(Get-PendingSettleRecords)) {
+        foreach ($file in @($record.Plan.Files)) {
+            $reapExclude += Split-Path -Parent $file.Path
+            $reapExclude += Split-Path -Parent $file.Target
+        }
+    }
 
     Write-Host ''
     Write-Host "Orphan reaper (untouched for $([int]$reapMinAge)h)"
