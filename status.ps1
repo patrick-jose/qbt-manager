@@ -337,7 +337,6 @@ function Get-Clusters {
         if ($verdict) { continue }
 
         $parts = $null
-$parts = $null
         try { $parts = Get-TitleParts -Name (Get-Prop $t 'name') } catch { $parts = $null }
 
         # Identity resolved through titleAliases, exactly as the manager does it.
@@ -355,10 +354,7 @@ $parts = $null
             $parts = Resolve-YearScopedMovieAlias -Parts $parts -Aliases $cfg.yearScopedMovieAliases
             $identity = Get-TmdbIdentity -Parts $parts -Name ([string](Get-Prop $t 'name')) -Cache $script:tmdbCache -CacheOnly
             if ($identity -and $identity.status -eq 'matched') {
-                $parts | Add-Member -NotePropertyName TmdbId -NotePropertyValue ([string]$identity.id) -Force
-                $parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue ([string]$identity.type) -Force
-                $parts | Add-Member -NotePropertyName TmdbName -NotePropertyValue ([string]$identity.name) -Force
-                $parts | Add-Member -NotePropertyName TmdbNameKey -NotePropertyValue (Get-TmdbTitleKey ([string]$identity.name)) -Force
+                $parts = Set-TmdbIdentity -Parts $parts -Identity $identity
             }
         }
 

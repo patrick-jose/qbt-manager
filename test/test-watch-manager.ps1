@@ -101,7 +101,10 @@ $installer = [IO.File]::ReadAllText((Join-Path $root 'install-launcher.ps1'))
 Check 'launcher installation disables old watchdog task' ($installer.Contains('Disable-ScheduledTask'))
 Check 'startup installation preserves qBittorrent original arguments' ($installer.Contains('-Arguments $settings.StartupArguments'))
 Check 'user shortcut installation keeps qBittorrent icon and arguments' ($installer.Contains('-Arguments $target.Arguments') -and $installer.Contains('$link.IconLocation ='))
-Check 'launcher terminal opens normally instead of hidden or minimized' (-not $installer.Contains('-WindowStyle Hidden') -and $installer.Contains('$link.WindowStyle = 1'))
+Check 'launcher terminal opens normally instead of hidden or minimized' ($installer.Contains('-NoProfile -ExecutionPolicy Bypass -EncodedCommand') -and $installer.Contains('$link.WindowStyle = 1'))
 Check 'magnet protocol handler is routed through the companion launcher' ($installer.Contains('magnetCommandKey') -and $installer.Contains('-Uri "%1"'))
+Check 'a logon watchdog covers qBittorrent launches that skip the launcher' ($installer.Contains("'watch-manager.ps1'") -and $installer.Contains('-Watchdog'))
+$startupBlock = [regex]::Match($installer, '(?s)if \(\$startup\) \{.*?\r?\n\}\r?\nif \(\$existingCompanionStartup\)').Value
+Check 'the logon watchdog is registered even when qBittorrent does not start with Windows' ($startupBlock -and -not $startupBlock.Contains('$companionRunName') -and $installer.Contains('Set-ItemProperty -LiteralPath $runKey -Name $companionRunName'))
 if ($script:fails) { exit 1 }
 exit 0

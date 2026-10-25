@@ -848,8 +848,11 @@ function Test-SameTitle {
     # A shared, unambiguous TMDB identity is stronger than localized spelling.
     # If both sides have IDs, a mismatch is definitive; do not fall through to
     # token similarity and accidentally merge two different works.
-    if ($A.TmdbId -and $B.TmdbId) {
-        return ([string]$A.TmdbType -eq [string]$B.TmdbType -and [string]$A.TmdbId -eq [string]$B.TmdbId)
+    $aTmdbId = [string](Get-PartValue -Parts $A -Name 'TmdbId')
+    $bTmdbId = [string](Get-PartValue -Parts $B -Name 'TmdbId')
+    if ($aTmdbId -and $bTmdbId) {
+        return ([string](Get-PartValue -Parts $A -Name 'TmdbType') -eq [string](Get-PartValue -Parts $B -Name 'TmdbType') -and
+                $aTmdbId -eq $bTmdbId)
     }
 
     # A year printed on one release and absent from another is not a
@@ -894,14 +897,34 @@ function Test-SameTitle {
     return $true
 }
 
+function Get-PartValue {
+    <#
+        Reads an optional field from a parsed release without assuming it exists.
+
+        TMDB identity fields are attached with Add-Member only when a unique
+        match was found, so most releases do not have them at all. Under strict
+        mode - which status.ps1 enables - reading $parts.TmdbId directly throws
+        instead of yielding $null, which took the whole preview down with
+        "A propriedade 'TmdbId' não foi encontrada neste objeto".
+    #>
+    param($Parts, [string]$Name)
+    if ($null -eq $Parts) { return $null }
+    $property = $Parts.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
 function Test-SameMediaIdentity {
     # Settle asks only whether two torrents refer to the same movie/show. If
     # both have an authoritative TMDB ID, honor it; otherwise retain the exact
     # title comparison this manager used before TMDB was configured.
     param($A, $B)
     if (-not $A -or -not $B -or $A.IsSeries -ne $B.IsSeries) { return $false }
-    if ($A.TmdbId -and $B.TmdbId) {
-        return ([string]$A.TmdbType -eq [string]$B.TmdbType -and [string]$A.TmdbId -eq [string]$B.TmdbId)
+    $aTmdbId = [string](Get-PartValue -Parts $A -Name 'TmdbId')
+    $bTmdbId = [string](Get-PartValue -Parts $B -Name 'TmdbId')
+    if ($aTmdbId -and $bTmdbId) {
+        return ([string](Get-PartValue -Parts $A -Name 'TmdbType') -eq [string](Get-PartValue -Parts $B -Name 'TmdbType') -and
+                $aTmdbId -eq $bTmdbId)
     }
     return ([string]$A.Title -ieq [string]$B.Title)
 }
@@ -1229,9 +1252,11 @@ function Set-FamilyLabels {
         $parts = $list[$i][0].parts
         if (-not $parts -or -not $parts.IsSeries) { continue }
         if ($null -eq $parts.Season -or $null -eq $parts.Episode) { continue }
-        if ($parts.TmdbType -eq 'tv' -and $parts.TmdbId -and $parts.TmdbNameKey) {
-            $show[$i] = [string]$parts.TmdbNameKey
-            $familyKey[$i] = 'tmdb:' + [string]$parts.TmdbId
+        $tmdbId = [string](Get-PartValue -Parts $parts -Name 'TmdbId')
+        $tmdbNameKey = [string](Get-PartValue -Parts $parts -Name 'TmdbNameKey')
+        if ((Get-PartValue -Parts $parts -Name 'TmdbType') -eq 'tv' -and $tmdbId -and $tmdbNameKey) {
+            $show[$i] = $tmdbNameKey
+            $familyKey[$i] = 'tmdb:' + $tmdbId
             continue
         }
         $tokenLists = @()
@@ -1326,8 +1351,10 @@ function Get-ClusterFamilies {
         $parts = $Clusters[$i][0].parts
         if (-not $parts -or -not $parts.IsSeries) { continue }
         if ($null -eq $parts.Season -or $null -eq $parts.Episode) { continue }
-        if ($parts.TmdbType -eq 'tv' -and $parts.TmdbId -and $parts.TmdbNameKey) {
-            $show[$i] = [string]$parts.TmdbNameKey
+        $tmdbId = [string](Get-PartValue -Parts $parts -Name 'TmdbId')
+        $tmdbNameKey = [string](Get-PartValue -Parts $parts -Name 'TmdbNameKey')
+        if ((Get-PartValue -Parts $parts -Name 'TmdbType') -eq 'tv' -and $tmdbId -and $tmdbNameKey) {
+            $show[$i] = $tmdbNameKey
             continue
         }
 
@@ -1374,7 +1401,8 @@ function Get-ClusterFamilies {
     for ($i = 0; $i -lt $count; $i++) {
         if (-not $show[$i]) { continue }
         $parts = $Clusters[$i][0].parts
-        if ($parts.TmdbType -eq 'tv' -and $parts.TmdbId) { $fam[$i] = 'tmdb:' + [string]$parts.TmdbId }
+        $tmdbId = [string](Get-PartValue -Parts $parts -Name 'TmdbId')
+        if ((Get-PartValue -Parts $parts -Name 'TmdbType') -eq 'tv' -and $tmdbId) { $fam[$i] = 'tmdb:' + $tmdbId }
         else { $fam[$i] = @($show[$i] -split ' ')[0] }
     }
     return [pscustomobject]@{ Show = $show; Family = $fam }
@@ -3019,65 +3047,65 @@ function Invoke-TmdbRequest {
     return Invoke-RestMethod -Method Get -Uri $Uri -Headers @{ Authorization = "Bearer $BearerToken"; Accept = 'application/json' } -TimeoutSec 8 -ErrorAction Stop
 }
 
-function Get-TmdbIdentity {
-    # Resolves only a unique exact-year work identity. Ambiguous, missing, or
-    # failed lookups never become alias guesses. Inject Request in tests to keep
-    # the suite offline.
-    param(
-        [object]$Parts,
-        [string]$Name,
-        [string]$BearerToken,
-        [hashtable]$Cache,
-        [scriptblock]$Request,
-        [int]$MaxLookups = 8,
-        [int]$MaxRequests = 16,
-        [switch]$CacheOnly
-    )
-    if (-not $Parts -or [string]::IsNullOrWhiteSpace([string]$Parts.Title)) { return $null }
-    $type = if ($Parts.IsSeries) { 'tv' } else { 'movie' }
-    $year = [string]$Parts.Year
-    # No year means the result cannot be checked against the release's identity;
-    # leave it to the existing title/alias rules instead of guessing.
-    if ($year -notmatch '^\d{4}$') { return $null }
-    $variants = @(Get-TmdbSearchVariants -Name $Name -ParsedTitle ([string]$Parts.Title))
-    if ($variants.Count -eq 0) { $variants = @((Get-TmdbTitleKey ([string]$Parts.Title))) }
-    $cacheKey = '{0}|{1}|{2}' -f $type, $year, (($variants | Sort-Object -Unique) -join '|')
-    if ($null -ne $Cache -and $Cache.ContainsKey($cacheKey)) {
-        $entry = $Cache[$cacheKey]
-        $age = 9999.0
-        try { $age = ((Get-Date) - [datetime]$entry.checkedAt).TotalDays } catch { }
-        $maxAge = if ([string]$entry.status -eq 'ambiguous') { 7 } else { 30 }
-        if ($age -le $maxAge) { return $entry }
-    }
-    if ($CacheOnly -or [string]::IsNullOrWhiteSpace($BearerToken) -or $MaxLookups -le 0) { return $null }
-    if ($null -eq $script:tmdbNewLookupCount) { $script:tmdbNewLookupCount = 0 }
-    if ($null -eq $script:tmdbRequestCount) { $script:tmdbRequestCount = 0 }
-    if ($script:tmdbNewLookupCount -ge $MaxLookups -or $script:tmdbRequestCount -ge $MaxRequests) { return $null }
-    $script:tmdbNewLookupCount++
-    if (-not $Request) { $Request = { param($uri) Invoke-TmdbRequest -Uri $uri -BearerToken $BearerToken }.GetNewClosure() }
+function Get-TmdbCorrectionKey {
+    <#
+        A marker-less release often carries its broadcaster ('BBC Louis Theroux:
+        Life on the Edge'), which is not part of the work's name. This key is
+        used only to decide whether TMDB may change the parsed MEDIA TYPE, so it
+        is deliberately stricter than Test-TmdbTitleName: after dropping a known
+        channel prefix the two names must be identical, not merely contained in
+        one another. A loose match here could turn a film into an unrelated show.
+    #>
+    param([string]$Title)
+    $key = Get-TmdbTitleKey $Title
+    if (-not $key) { return '' }
+    return ($key -replace '^(?:bbc|itv|pbs|hbo|amc|fx|abc|cbs|nbc|sky|netflix|amazon|disney|showtime|starz|mtv|bravo|channel 4|channel4)\s+', '')
+}
 
-    $base = 'https://api.themoviedb.org/3'
+function Test-TmdbExactTitle {
+    param([string]$InputTitle, [string]$CandidateTitle)
+    $inputKey = Get-TmdbCorrectionKey $InputTitle
+    $candidateKey = Get-TmdbCorrectionKey $CandidateTitle
+    return [bool]($inputKey -and $candidateKey -and $inputKey -eq $candidateKey)
+}
+
+function Search-TmdbType {
+    <#
+        One search endpoint, one media type. Returns Status/Id/Name, or $null
+        when the network itself failed - a failed request must not be cached as
+        a 'notfound' decision.
+    #>
+    param(
+        [string]$Type,
+        [string]$Year,
+        [string[]]$Variants,
+        [scriptblock]$Request,
+        [string]$Base,
+        [int]$MaxRequests,
+        [bool]$ExactTitle
+    )
+
     $candidateById = @{}
     $queryCount = 0
-    foreach ($variant in $variants) {
+    foreach ($variant in $Variants) {
         if ($queryCount -ge 5 -or $script:tmdbRequestCount -ge $MaxRequests) { break }
         $queryCount++
         $query = [uri]::EscapeDataString($variant)
-        $uri = "$base/search/$type`?query=$query&include_adult=false"
-        if ($year -match '^\d{4}$') {
-            if ($type -eq 'movie') { $uri += "&year=$year" } else { $uri += "&first_air_date_year=$year" }
+        $uri = "$Base/search/$Type`?query=$query&include_adult=false"
+        if ($Year -match '^\d{4}$') {
+            if ($Type -eq 'movie') { $uri += "&year=$Year" } else { $uri += "&first_air_date_year=$Year" }
         }
         try { $script:tmdbRequestCount++; $response = & $Request $uri }
         catch { return $null }
         foreach ($hit in @($response.results | Select-Object -First 12)) {
             $id = [string]$hit.id
             if (-not $id) { continue }
-            $date = if ($type -eq 'movie') { [string]$hit.release_date } else { [string]$hit.first_air_date }
+            $date = if ($Type -eq 'movie') { [string]$hit.release_date } else { [string]$hit.first_air_date }
             $hitYear = if ($date -match '^(\d{4})') { $Matches[1] } else { '' }
-            if ($year -match '^\d{4}$' -and $hitYear -ne $year) { continue }
+            if ($Year -match '^\d{4}$' -and $hitYear -ne $Year) { continue }
             if (-not $candidateById.ContainsKey($id)) {
-                $mainName = if ($type -eq 'movie') { [string]$hit.title } else { [string]$hit.name }
-                $original = if ($type -eq 'movie') { [string]$hit.original_title } else { [string]$hit.original_name }
+                $mainName = if ($Type -eq 'movie') { [string]$hit.title } else { [string]$hit.name }
+                $original = if ($Type -eq 'movie') { [string]$hit.original_title } else { [string]$hit.original_name }
                 $candidateById[$id] = [pscustomobject]@{ id = $id; name = $mainName; year = $hitYear; names = (New-Object System.Collections.ArrayList) }
                 if ($mainName) { [void]$candidateById[$id].names.Add($mainName) }
                 if ($original -and $original -ne $mainName) { [void]$candidateById[$id].names.Add($original) }
@@ -3089,21 +3117,25 @@ function Get-TmdbIdentity {
     foreach ($candidate in @($candidateById.Values | Select-Object -First 6)) {
         $matched = $false
         foreach ($candidateName in $candidate.names) {
-            foreach ($variant in $variants) {
-                if (Test-TmdbTitleName -InputTitle $variant -CandidateTitle ([string]$candidateName)) { $matched = $true; break }
+            foreach ($variant in $Variants) {
+                $ok = if ($ExactTitle) { Test-TmdbExactTitle -InputTitle $variant -CandidateTitle ([string]$candidateName) }
+                      else { Test-TmdbTitleName -InputTitle $variant -CandidateTitle ([string]$candidateName) }
+                if ($ok) { $matched = $true; break }
             }
             if ($matched) { break }
         }
         if (-not $matched) {
-            $altPath = if ($type -eq 'movie') { "movie/$($candidate.id)/alternative_titles" } else { "tv/$($candidate.id)/alternative_titles" }
+            $altPath = if ($Type -eq 'movie') { "movie/$($candidate.id)/alternative_titles" } else { "tv/$($candidate.id)/alternative_titles" }
             if ($script:tmdbRequestCount -ge $MaxRequests) { continue }
             try {
                 $script:tmdbRequestCount++
-                $alt = & $Request "$base/$altPath"
-                $altNames = if ($type -eq 'movie') { @($alt.titles | ForEach-Object { [string]$_.title }) } else { @($alt.results | ForEach-Object { [string]$_.name }) }
+                $alt = & $Request "$Base/$altPath"
+                $altNames = if ($Type -eq 'movie') { @($alt.titles | ForEach-Object { [string]$_.title }) } else { @($alt.results | ForEach-Object { [string]$_.name }) }
                 foreach ($candidateName in $altNames) {
-                    foreach ($variant in $variants) {
-                        if (Test-TmdbTitleName -InputTitle $variant -CandidateTitle $candidateName) { $matched = $true; break }
+                    foreach ($variant in $Variants) {
+                        $ok = if ($ExactTitle) { Test-TmdbExactTitle -InputTitle $variant -CandidateTitle $candidateName }
+                              else { Test-TmdbTitleName -InputTitle $variant -CandidateTitle $candidateName }
+                        if ($ok) { $matched = $true; break }
                     }
                     if ($matched) { break }
                 }
@@ -3113,17 +3145,150 @@ function Get-TmdbIdentity {
     }
 
     $status = if ($matching.Count -eq 1) { 'matched' } elseif ($matching.Count -gt 1) { 'ambiguous' } else { 'notfound' }
-    $result = [pscustomobject]@{
-        status = $status; type = $type; id = ''; name = ''; year = $year
-        checkedAt = (Get-Date).ToString('o')
+    if ($status -ne 'matched') { return [pscustomobject]@{ Status = $status; Id = ''; Name = '' } }
+    $winner = @($matching.Values)[0]
+    return [pscustomobject]@{ Status = 'matched'; Id = [string]$winner.id; Name = [string]$winner.name }
+}
+
+function Get-TmdbIdentity {
+    <#
+        Resolves a unique work identity. For releases the parser called films, a
+        failed movie lookup is retried against TV: a name with no SxxEyy marker
+        ('BBC Louis Theroux: Life on the Edge') is also exactly what a show pack
+        looks like. Only a unique exact-title TV result may change the parsed
+        type, and only when TMDB reports a single season that can be represented
+        as a season pack. Ambiguous, missing, wrong-year and failed lookups never
+        become guesses. Inject Request in tests to keep the suite offline.
+    #>
+    param(
+        [object]$Parts,
+        [string]$Name,
+        [string]$BearerToken,
+        [hashtable]$Cache,
+        [scriptblock]$Request,
+        [int]$MaxLookups = 8,
+        [int]$MaxRequests = 16,
+        [switch]$CacheOnly
+    )
+    if (-not $Parts -or [string]::IsNullOrWhiteSpace([string]$Parts.Title)) { return $null }
+    $parserType = if ($Parts.IsSeries) { 'tv' } else { 'movie' }
+    $year = [string]$Parts.Year
+    $hasYear = $year -match '^\d{4}$'
+    # A series is recognised by its markers; without a year there is nothing to
+    # hold a TV result to, and re-typing is never allowed in this direction.
+    if ($parserType -eq 'tv' -and -not $hasYear) { return $null }
+
+    $variants = @(Get-TmdbSearchVariants -Name $Name -ParsedTitle ([string]$Parts.Title))
+    if ($variants.Count -eq 0) { $variants = @((Get-TmdbTitleKey ([string]$Parts.Title))) }
+    if ($parserType -eq 'movie') {
+        # Searching for 'bbc louis theroux life on the edge' finds nothing even
+        # though TMDB has the show: the channel is part of the release name, not
+        # the work. Ask once more without it. The stricter exact match still
+        # decides whether the result may change the media type.
+        $stripped = @($variants | ForEach-Object { Get-TmdbCorrectionKey $_ } | Where-Object { $_ })
+        if ($stripped.Count -gt 0) { $variants = @(@($variants) + $stripped | Select-Object -Unique) }
     }
-    if ($status -eq 'matched') {
-        $winner = @($matching.Values)[0]
-        $result.id = [string]$winner.id
-        $result.name = [string]$winner.name
+    $variantKey = ($variants | Sort-Object -Unique) -join '|'
+
+    $plans = New-Object System.Collections.ArrayList
+    if ($parserType -eq 'tv') {
+        [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $false })
+    } else {
+        # A yearless film is checked as a film first, by identical title, so an
+        # existing movie keeps it a film. TV is asked next because that is the
+        # only way a marker-less show can be recognised at all.
+        [void]$plans.Add([pscustomobject]@{ Type = 'movie'; Exact = (-not $hasYear) })
+        [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $true })
     }
-    if ($null -ne $Cache) { $Cache[$cacheKey] = $result }
-    return $result
+
+    if ($null -eq $script:tmdbNewLookupCount) { $script:tmdbNewLookupCount = 0 }
+    if ($null -eq $script:tmdbRequestCount) { $script:tmdbRequestCount = 0 }
+    if (-not $Request) { $Request = { param($uri) Invoke-TmdbRequest -Uri $uri -BearerToken $BearerToken }.GetNewClosure() }
+    $base = 'https://api.themoviedb.org/3'
+    $last = $null
+
+    foreach ($plan in $plans) {
+        $type = [string]$plan.Type
+        $cacheKey = '{0}|{1}|{2}' -f $type, $year, $variantKey
+        if ($null -ne $Cache -and $Cache.ContainsKey($cacheKey)) {
+            $entry = $Cache[$cacheKey]
+            $age = 9999.0
+            try { $age = ((Get-Date) - [datetime]$entry.checkedAt).TotalDays } catch { }
+            $maxAge = if ([string]$entry.status -eq 'ambiguous') { 7 } else { 30 }
+            if ($age -le $maxAge) {
+                if ([string]$entry.status -eq 'notfound') { $last = $entry; continue }
+                return $entry
+            }
+        }
+        if ($CacheOnly -or [string]::IsNullOrWhiteSpace($BearerToken) -or $MaxLookups -le 0) { return $null }
+        if ($script:tmdbNewLookupCount -ge $MaxLookups -or $script:tmdbRequestCount -ge $MaxRequests) { return $null }
+        $script:tmdbNewLookupCount++
+
+        $search = Search-TmdbType -Type $type -Year $(if ($hasYear) { $year } else { '' }) `
+            -Variants $variants -Request $Request -Base $base -MaxRequests $MaxRequests -ExactTitle ([bool]$plan.Exact)
+        if ($null -eq $search) { return $null }
+
+        $result = [pscustomobject]@{
+            status = $search.Status; type = $type; id = [string]$search.Id; name = [string]$search.Name; year = $year
+            seasons = 0; season = 0; corrected = $false
+            checkedAt = (Get-Date).ToString('o')
+        }
+        if ($result.status -eq 'matched' -and $type -eq 'tv' -and -not $Parts.IsSeries) {
+            # The single season is what makes the correction representable. More
+            # than one season means the name would have to invent which season
+            # this pack holds, so it stays a film.
+            $seasons = 0
+            if ($script:tmdbRequestCount -lt $MaxRequests) {
+                try {
+                    $script:tmdbRequestCount++
+                    $details = & $Request "$base/tv/$($result.id)"
+                    $seasons = [int]$details.number_of_seasons
+                } catch { $seasons = 0 }
+            }
+            $result.seasons = $seasons
+            if ($seasons -eq 1) {
+                $result.corrected = $true
+                $result.season = 1
+            }
+        }
+        if ($null -ne $Cache) { $Cache[$cacheKey] = $result }
+        if ($result.status -eq 'notfound') { $last = $result; continue }
+        return $result
+    }
+    return $last
+}
+
+function Set-TmdbIdentity {
+    <#
+        Attaches a matched identity to parsed parts and, when TMDB established
+        that a marker-less "film" is a one-season show, turns it into a season
+        pack. Episode 0 is the manager's existing whole-season representation,
+        so the corrected release takes part in dedup and settling as S<n>-ALL
+        instead of pretending to be a film. The parsed title is never rewritten:
+        filing names come from the release and from explicit local aliases.
+    #>
+    param($Parts, $Identity)
+
+    if (-not $Parts -or -not $Identity) { return $Parts }
+    if ([string](Get-PartValue -Parts $Identity -Name 'status') -ne 'matched') { return $Parts }
+
+    $Parts | Add-Member -NotePropertyName TmdbId -NotePropertyValue ([string](Get-PartValue -Parts $Identity -Name 'id')) -Force
+    $Parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue ([string](Get-PartValue -Parts $Identity -Name 'type')) -Force
+    $Parts | Add-Member -NotePropertyName TmdbName -NotePropertyValue ([string](Get-PartValue -Parts $Identity -Name 'name')) -Force
+    $Parts | Add-Member -NotePropertyName TmdbNameKey -NotePropertyValue (Get-TmdbTitleKey ([string](Get-PartValue -Parts $Identity -Name 'name'))) -Force
+
+    $corrected = [bool](Get-PartValue -Parts $Identity -Name 'corrected')
+    $season = [int](Get-PartValue -Parts $Identity -Name 'season')
+    if (-not $corrected -or $Parts.IsSeries -or $season -le 0) { return $Parts }
+
+    $out = [ordered]@{}
+    foreach ($property in $Parts.PSObject.Properties) { $out[$property.Name] = $property.Value }
+    $out['IsSeries'] = $true
+    $out['Season'] = $season
+    $out['Episode'] = 0
+    $out['EpisodeLast'] = $null
+    $out['IsMultiEpisode'] = $false
+    return [pscustomobject]$out
 }
 
 function Read-TmdbCache {
@@ -5430,11 +5595,12 @@ try   { $parts = Get-TitleParts -Name $t.name }
                   -BearerToken $script:tmdbBearerToken -Cache $script:tmdbCache `
                   -MaxLookups $tmdbMaxLookups -MaxRequests $tmdbMaxRequests
               if ($identity -and $identity.status -eq 'matched') {
-                  $parts | Add-Member -NotePropertyName TmdbId -NotePropertyValue ([string]$identity.id) -Force
-                  $parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue ([string]$identity.type) -Force
-                  $parts | Add-Member -NotePropertyName TmdbName -NotePropertyValue ([string]$identity.name) -Force
-                  $parts | Add-Member -NotePropertyName TmdbNameKey -NotePropertyValue (Get-TmdbTitleKey ([string]$identity.name)) -Force
+                  $wasSeries = $parts.IsSeries
+                  $parts = Set-TmdbIdentity -Parts $parts -Identity $identity
                   Write-Log 'INFO' ("TMDB {0} identity: '{1}' ({2}) -> '{3}' [id {4}]" -f $identity.type, $rawParts.Title, $rawParts.Year, $identity.name, $identity.id)
+                  if ($parts.IsSeries -and -not $wasSeries) {
+                      Write-Log 'INFO' ("TMDB identifies '{0}' as a one-season show; filing it as a Season {1} pack" -f $rawParts.Title, $parts.Season)
+                  }
               } elseif ($identity -and $identity.status -eq 'ambiguous') {
                   $parts | Add-Member -NotePropertyName TmdbStatus -NotePropertyValue 'ambiguous' -Force
                   Write-Log 'WARN' ("TMDB result ambiguous for '{0}' ({1}); no external identity applied" -f $rawParts.Title, $rawParts.Year)
@@ -6639,10 +6805,7 @@ else {
                 $parts = Resolve-YearScopedMovieAlias -Parts $parts -Aliases $cfg.yearScopedMovieAliases
                 $identity = Get-TmdbIdentity -Parts $parts -Name ([string]$entry.name) -Cache $script:tmdbCache -CacheOnly
                 if ($identity -and $identity.status -eq 'matched') {
-                    $parts | Add-Member -NotePropertyName TmdbId -NotePropertyValue ([string]$identity.id) -Force
-                    $parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue ([string]$identity.type) -Force
-                    $parts | Add-Member -NotePropertyName TmdbName -NotePropertyValue ([string]$identity.name) -Force
-                    $parts | Add-Member -NotePropertyName TmdbNameKey -NotePropertyValue (Get-TmdbTitleKey ([string]$identity.name)) -Force
+                    $parts = Set-TmdbIdentity -Parts $parts -Identity $identity
                 }
             }
             Add-Member -InputObject $entry -NotePropertyName parts -NotePropertyValue $parts -Force

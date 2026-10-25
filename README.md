@@ -134,10 +134,12 @@ The scheduled task is **not** committed, because it names absolute paths.
 [COMMANDS.md](COMMANDS.md#the-scheduled-task) has the exact
 launcher installer that connects the manager to qBittorrent's lifetime. Launching
 qBittorrent through the installed shortcut or Windows startup entry starts its
-companion; closing qBittorrent ends the companion after any active pass finishes.
+companion; a logon watchdog also covers launches that skip the launcher, such as
+a browser handing a magnet straight to qBittorrent. Closing qBittorrent ends the
+companion after any active pass finishes.
 It checks relevant queue changes every 5 seconds, time-based rules every minute,
 and pending settles every 30 seconds. Broad scans run on queue changes and every
-15 minutes. No manager remains waiting while qBittorrent is closed.
+15 minutes. No manager pass runs while qBittorrent is closed.
 
 ## Configuration
 

@@ -102,17 +102,20 @@ foreach ($root in $roots) {
 if ($startup) {
     [pscustomobject]@{ Command = $startup } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'startup.json') -Encoding UTF8
     Set-ItemProperty -LiteralPath $runKey -Name qBittorrent -Value ('"' + $powershell + '" ' + (Get-LauncherArguments -Arguments $settings.StartupArguments))
-    if ($existingCompanionStartup) {
-        [pscustomobject]@{ Command = $existingCompanionStartup } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'companion-startup.json') -Encoding UTF8
-    }
-    # qBittorrent can rewrite its own Run value when its startup setting is
-    # saved. Keep an independently named entry so that cannot silently restore
-    # a direct launch that bypasses the manager. Duplicate qBittorrent launches
-    # are handed off to its existing process; the watcher mutex prevents a
-    # duplicate companion.
-    Set-ItemProperty -LiteralPath $runKey -Name $companionRunName -Value ('"' + $powershell + '" ' + (Get-LauncherArguments -Arguments $settings.StartupArguments))
-    Write-Output 'qBittorrent startup entries now start the companion.'
 }
+if ($existingCompanionStartup) {
+    [pscustomobject]@{ Command = $existingCompanionStartup } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'companion-startup.json') -Encoding UTF8
+}
+# qBittorrent is not always started through the launcher: a browser can hand a
+# magnet straight to qbittorrent.exe, and qBittorrent may rewrite its own Run
+# value. Run the companion at logon with -Watchdog, which makes no API calls
+# and takes no action until qBittorrent appears, so a launch from anywhere is
+# covered. The watcher mutex keeps this and the launcher from running two
+# companions at once.
+$companionCommand = '"' + $powershell + '" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' +
+    (Join-Path $PSScriptRoot 'watch-manager.ps1') + '" -Watchdog'
+Set-ItemProperty -LiteralPath $runKey -Name $companionRunName -Value $companionCommand
+Write-Output 'Logon companion entry now watches for qBittorrent started outside the launcher.'
 if ($magnetCommand -and $magnetCommand -match '(?i)qbittorrent\.exe') {
     [pscustomobject]@{ Command = $magnetCommand } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'magnet-open-command.json') -Encoding UTF8
     $protocolCommand = '"' + $powershell + '" -NoProfile -ExecutionPolicy Bypass -File "' + $launcher + '" -Uri "%1"'
@@ -121,4 +124,4 @@ if ($magnetCommand -and $magnetCommand -match '(?i)qbittorrent\.exe') {
     finally { $magnetKey.Dispose() }
     Write-Output 'Magnet links now start qBittorrent through the companion launcher.'
 }
-Write-Output 'Old watchdog task disabled. The companion now runs only with qBittorrent.'
+Write-Output 'Old watchdog task disabled. The companion runs with qBittorrent and after logon.'

@@ -191,8 +191,13 @@ around it with nothing to notice.
 
 ## The scheduled task
 
-The old scheduled watchdog is disabled. A hidden companion starts with qBittorrent
+The old scheduled watchdog task is disabled. The companion starts with qBittorrent
 through the installed Start menu/user shortcuts and existing Windows startup entry.
+A separate logon entry also runs `watch-manager.ps1 -Watchdog`: it makes no API
+calls and takes no action while qBittorrent is closed, and starts a fresh
+evaluation as soon as qBittorrent appears however it was launched - including a
+browser handing a magnet straight to `qbittorrent.exe`, or qBittorrent started
+directly. A mutex keeps these paths from running two companions at once.
 Closing qBittorrent ends the companion after any active manager pass finishes safely.
 While qBittorrent is open, it checks relevant
 queue changes every 5 seconds. Manager passes are serial, never overlapping.
@@ -202,8 +207,9 @@ the polling interval. Changes during a pass are read on the next poll.
 Time-based rules run every minute; pending settles retry every 30 seconds.
 These timer passes skip broad library/reaper scans. Queue changes and 15-minute
 maintenance passes include those scans. Transfer bytes and speed alone do not
-trigger extra passes. With qBittorrent closed, no companion remains running.
-Reopening through a launcher shortcut starts a fresh evaluation.
+trigger extra passes. Outside a manager pass, the logon watchdog is the only
+process waiting while qBittorrent is closed; it polls for the process without
+touching the API. Starting qBittorrent any way at all starts a fresh evaluation.
 
 ```powershell
 # Is it there, and when does it next run?
@@ -228,16 +234,16 @@ Recreate it after cloning:
 .\install-launcher.ps1
 ```
 
-The installer backs up the old task and affected shortcuts/startup entry under
+The installer backs up the old task and affected shortcuts/startup entries under
 `backup\`, disables the task, creates a per-user Start menu launcher, updates
-existing user/pinned shortcuts, and preserves Windows startup arguments.
-Machine-specific executable settings live in ignored `launcher.local.json`.
-It refuses installation while the old task is running, to avoid interrupting
-file operations. No qBittorrent download settings are changed.
+existing user/pinned shortcuts, registers a logon watchdog entry, and preserves
+Windows startup arguments. Machine-specific executable settings live in ignored
+`launcher.local.json`. It refuses installation while the old task is running, to
+avoid interrupting file operations. No qBittorrent download settings are changed.
 
-Launching `qbittorrent.exe` directly (including an unmodified file/protocol
-association or a third-party launcher) bypasses the companion. Use an installed
-launcher shortcut, Windows startup, or `launch-qbittorrent.ps1` for paired execution.
+A direct `qbittorrent.exe` launch (a file/protocol association, a third-party
+launcher, or a browser opening a magnet) skips the launcher, but the logon
+watchdog notices the running process and starts the manager anyway.
 
 For an interactive companion that exits when qBittorrent closes:
 
