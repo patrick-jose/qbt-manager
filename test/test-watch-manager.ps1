@@ -96,9 +96,12 @@ Check 'installation saves previous task and refuses an active file operation' ($
 $launcher = [IO.File]::ReadAllText((Join-Path $root 'launch-qbittorrent.ps1'))
 Check 'launcher starts qBittorrent before starting its companion' ($launcher.IndexOf('[Diagnostics.Process]::Start') -lt $launcher.IndexOf("& (Join-Path `$PSScriptRoot 'watch-manager.ps1')"))
 Check 'launcher invokes app-bound companion without watchdog switch' (($launcher.TrimEnd() -split '\r?\n')[-1] -eq "& (Join-Path `$PSScriptRoot 'watch-manager.ps1')")
+Check 'launcher accepts a magnet or torrent URI and appends it to qBittorrent arguments' ($launcher.Contains('[string]$Uri =') -and $launcher.Contains('$arguments = ($arguments.Trim()'))
 $installer = [IO.File]::ReadAllText((Join-Path $root 'install-launcher.ps1'))
 Check 'launcher installation disables old watchdog task' ($installer.Contains('Disable-ScheduledTask'))
 Check 'startup installation preserves qBittorrent original arguments' ($installer.Contains('-Arguments $settings.StartupArguments'))
 Check 'user shortcut installation keeps qBittorrent icon and arguments' ($installer.Contains('-Arguments $target.Arguments') -and $installer.Contains('$link.IconLocation ='))
+Check 'launcher terminal opens normally instead of hidden or minimized' (-not $installer.Contains('-WindowStyle Hidden') -and $installer.Contains('$link.WindowStyle = 1'))
+Check 'magnet protocol handler is routed through the companion launcher' ($installer.Contains('magnetCommandKey') -and $installer.Contains('-Uri "%1"'))
 if ($script:fails) { exit 1 }
 exit 0

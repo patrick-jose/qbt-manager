@@ -6,6 +6,10 @@ $launcher = Join-Path $PSScriptRoot 'launch-qbittorrent.ps1'
 $localPath = Join-Path $PSScriptRoot 'launcher.local.json'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $startup = (Get-ItemProperty -LiteralPath $runKey -ErrorAction SilentlyContinue).qBittorrent
+$companionRunName = 'qbt-manager-companion'
+$existingCompanionStartup = (Get-ItemProperty -LiteralPath $runKey -ErrorAction SilentlyContinue).$companionRunName
+$magnetCommandKey = 'HKCU:\Software\Classes\magnet\shell\open\command'
+$magnetCommand = if (Test-Path -LiteralPath $magnetCommandKey) { (Get-Item $magnetCommandKey).GetValue('') } else { $null }
 if (-not $Executable) {
     if (Test-Path -LiteralPath $localPath) { $Executable = ([IO.File]::ReadAllText($localPath) | ConvertFrom-Json).Executable }
     else {
@@ -37,7 +41,7 @@ $settings | ConvertTo-Json | Set-Content -LiteralPath $localPath -Encoding UTF8
 function Get-LauncherArguments {
     param([string]$Arguments = '')
     $command = "& '$($launcher.Replace("'", "''"))' -QbtArguments '$($Arguments.Replace("'", "''"))'"
-    '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    '-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
 }
 $powershell = Join-Path $PSHOME 'powershell.exe'
 $shell = New-Object -ComObject WScript.Shell
@@ -66,15 +70,55 @@ foreach ($target in $targets) {
     $link.Arguments = Get-LauncherArguments -Arguments $target.Arguments
     $link.WorkingDirectory = $PSScriptRoot
     $link.IconLocation = "$Executable,0"
-    $link.WindowStyle = 7
+    $link.WindowStyle = 1
     $link.Description = 'qBittorrent with its manager companion'
     $link.Save()
     Write-Output "Launcher shortcut: $($target.Path)"
+}
+# Existing taskbar pins already target PowerShell with an encoded launcher
+# command, so they are not in the direct-qBittorrent list above. Upgrade those
+# launcher shortcuts in place: remove a stale hidden-window switch and restore
+# a normal visible console window.
+$visibleIndex = 0
+foreach ($root in $roots) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    foreach ($path in Get-ChildItem -LiteralPath $root -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue) {
+        $link = $shell.CreateShortcut($path.FullName)
+        if ($link.TargetPath -ine $powershell) { continue }
+        $encoded = [regex]::Match([string]$link.Arguments, '(?i)-EncodedCommand\s+(\S+)')
+        if (-not $encoded.Success) { continue }
+        try { $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded.Groups[1].Value)) }
+        catch { continue }
+        if ($decoded.IndexOf($launcher, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $visibleIndex++
+        Copy-Item -LiteralPath $path.FullName -Destination (Join-Path $backup ("visible-wrapper-$visibleIndex.lnk"))
+        $link.Arguments = [regex]::Replace([string]$link.Arguments, '(?i)-WindowStyle\s+Hidden\s*', '')
+        $link.WindowStyle = 1
+        $link.Save()
+        Write-Output "Visible launcher terminal: $($path.FullName)"
+    }
 }
 # Preserve whether qBittorrent was configured to start with Windows and its args.
 if ($startup) {
     [pscustomobject]@{ Command = $startup } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'startup.json') -Encoding UTF8
     Set-ItemProperty -LiteralPath $runKey -Name qBittorrent -Value ('"' + $powershell + '" ' + (Get-LauncherArguments -Arguments $settings.StartupArguments))
-    Write-Output 'qBittorrent startup entry now starts its companion too.'
+    if ($existingCompanionStartup) {
+        [pscustomobject]@{ Command = $existingCompanionStartup } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'companion-startup.json') -Encoding UTF8
+    }
+    # qBittorrent can rewrite its own Run value when its startup setting is
+    # saved. Keep an independently named entry so that cannot silently restore
+    # a direct launch that bypasses the manager. Duplicate qBittorrent launches
+    # are handed off to its existing process; the watcher mutex prevents a
+    # duplicate companion.
+    Set-ItemProperty -LiteralPath $runKey -Name $companionRunName -Value ('"' + $powershell + '" ' + (Get-LauncherArguments -Arguments $settings.StartupArguments))
+    Write-Output 'qBittorrent startup entries now start the companion.'
+}
+if ($magnetCommand -and $magnetCommand -match '(?i)qbittorrent\.exe') {
+    [pscustomobject]@{ Command = $magnetCommand } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'magnet-open-command.json') -Encoding UTF8
+    $protocolCommand = '"' + $powershell + '" -NoProfile -ExecutionPolicy Bypass -File "' + $launcher + '" -Uri "%1"'
+    $magnetKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\Classes\magnet\shell\open\command')
+    try { $magnetKey.SetValue('', $protocolCommand, [Microsoft.Win32.RegistryValueKind]::String) }
+    finally { $magnetKey.Dispose() }
+    Write-Output 'Magnet links now start qBittorrent through the companion launcher.'
 }
 Write-Output 'Old watchdog task disabled. The companion now runs only with qBittorrent.'

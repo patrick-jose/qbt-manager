@@ -11,8 +11,10 @@ For every command, see [COMMANDS.md](../COMMANDS.md).
 
 ## Rules, in the order they run
 
-1. **Dolby Vision** â€” any torrent whose name advertises DoVi (`DV`, `DoVi`,
-   `Dolby Vision`) is deleted with its files, in any state. Runs first.
+1. **Dolby Vision** â€” any torrent or payload whose release name, payload
+   filename, or embedded video metadata identifies DoVi (`DV`, `DoVi`,
+   `Dolby Vision`, or a Dolby Vision codec profile) is deleted with its files,
+   in any state. Runs first. Metadata inspection uses the MediaInfo CLI.
 2. **No availability** - a magnet that reports no size (`size == 0` or state
    `metaDL`) is deleted once it has been **really trying** for longer than
    `metadataTimeoutMinutes`. "Really trying" means two things at once:
@@ -71,7 +73,7 @@ For every command, see [COMMANDS.md](../COMMANDS.md).
 5. **Categories** â€” every identified torrent is put in `Filmes` or `SÃ©ries`
    (series detection is automatic, by `SxxEyy` / `Season N` markers).
 6. **Dedup** â€” torrents are grouped by title, and groups of one show family are
-   then folded together so a comparison is not lost to a spelling difference.
+    then folded together so a comparison is not lost to a spelling difference.
    Within a group the largest version that is **100% downloaded** is the keeper,
    and every other version smaller than it is deleted, whether or not it is itself
    finished. Versions *bigger* than the keeper are left alone. Nothing is deleted
@@ -80,12 +82,23 @@ For every command, see [COMMANDS.md](../COMMANDS.md).
    different range is not (see [Episode sets](#episode-sets-packs-compete-only-on-an-identical-range)).
    A name claiming a whole season is checked against the release's own file list
    first, because `S3-ALL` equals no range key and would otherwise opt out of
-   dedup silently.
+    dedup silently.
+    When `tmdbEnabled` is on and a bearer token exists only in the ignored
+    `config.local.json`, the manager may attach a TMDB ID after a unique exact
+    title-and-year match. IDs can join localized spellings of the same movie or
+    series and keep different works apart; they never rewrite library filing
+    titles. Explicit aliases take precedence. Ambiguous and wrong-year results
+    are not used. Results are cached in ignored `tmdb-cache.json`; lookup and
+    request budgets are bounded per run. Without a token, title-based safeguards
+    are unchanged. `status.ps1` uses cached identities only and never calls TMDB.
 7. **Library** â€” survivors that are complete are moved to `moviesDir` or
    `seriesDir`. The move is then **verified**, not assumed, and is refused while
    another torrent holds the folder (see [Moving to the library](#moving-to-the-library)).
-8. **Orphan reaper** â€” leftovers in `reapRoots` that no torrent claims any more.
-9. **Retention** â€” `.bak` backups, and everything in `logs\`, older than **7 days**
+ 8. **Orphan reaper** â€” leftovers in `reapRoots` that no torrent claims any more.
+ 9. **Empty directories** â€” empty descendants of `moviesDir`, `seriesDir`, and
+    `reapRoots` are pruned after torrent/file actions. Roots, links, live-torrent
+    claims, and pending-settle paths are preserved; the removal is non-recursive.
+10. **Retention** â€” `.bak` backups, and everything in `logs\`, older than **7 days**
    are destroyed. See [Retention](#retention) â€” the one thing spared is the log
    the current run is still writing to.
 
@@ -111,7 +124,7 @@ Three rules pass `-AllowErrored` and delete an errored torrent:
 
 | Rule | Why the error changes nothing |
 |---|---|
-| **Dolby Vision** | decided by the torrent's *name*, in any state by specification |
+| **Dolby Vision** | decided by release/payload names and embedded video metadata, in any state |
 | **Disc rip** | decided by the on-disk structure, never by progress |
 | **Dedup, set level** | a **finished** torrent of the **identical** episode set is bigger |
 
@@ -799,6 +812,17 @@ holding no bytes is exempt: its empty `content_path` proves nothing.
 
 The delete itself re-checks that the path is still strictly inside a reap root,
 so a root can never delete itself and a caller cannot pass in an arbitrary path.
+
+### Empty-directory cleanup
+
+Every normal manager pass removes empty directories below the configured movie,
+series, and temporary/reap roots. It runs after torrent deletions, completed
+moves, and orphan reaping, so empty payload folders left behind by those actions
+are cleaned automatically. It never removes a configured root, follows a
+reparse-point directory, removes a path claimed by a live torrent, or removes a
+directory referenced by a pending settle plan. Each deletion is non-recursive and
+rechecks that the directory is empty immediately before removal. `-DryRun` only
+reports the directories it would remove.
 
 `status.ps1` shows the candidates and the total, so the decision is visible
 before it is made rather than only in the log afterwards.

@@ -104,6 +104,7 @@ try {
         param($Message)
         $log = Join-Path $logDir ('watcher-{0}.log' -f (Get-Date -Format 'yyyy-MM-dd'))
         Add-Content -LiteralPath $log -Encoding UTF8 -Value ("{0:HH:mm:ss} {1}" -f (Get-Date), $Message)
+        Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $Message)
     }
     & $report 'watcher started'
     Invoke-QueueWatch -Watchdog ([bool]$Watchdog) -PollSeconds $PollSeconds -TimerSeconds $TimerSeconds `
@@ -129,7 +130,9 @@ try {
             if ($Kind -eq 'Quick') { $arguments += '-SkipLibraryScan' }
             if ($DryRun) { $arguments += '-DryRun' }
             & powershell.exe @arguments | Out-Null
-            return $LASTEXITCODE
+            $code = $LASTEXITCODE
+            & $report "manager pass finished (exit $code)"
+            return $code
         }
 }
 finally {

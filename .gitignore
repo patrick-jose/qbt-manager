@@ -1,6 +1,7 @@
 # YOUR machine. Never committed - these files are state and local settings.
 config.local.json
 state.json
+tmdb-cache.json
 pending-settle/
 launcher.local.json
 watch-stop

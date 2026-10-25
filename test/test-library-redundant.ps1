@@ -93,8 +93,8 @@ function Dl {
 }
 
 function Judge {
-    param([object[]]$Torrents, [double]$Tol = 10)
-    return @(Get-LibraryRedundantVerdicts -Torrents $Torrents -MoviesDir $films -SeriesDir $seriesDir -TolerancePercent $Tol)
+    param([object[]]$Torrents, [double]$Tol = 10, [object]$Aliases = $null)
+    return @(Get-LibraryRedundantVerdicts -Torrents $Torrents -MoviesDir $films -SeriesDir $seriesDir -TolerancePercent $Tol -Aliases $Aliases)
 }
 
 
@@ -122,6 +122,16 @@ Check 'the reason states what it will finish at' ($r[0].Reason -match ('will fin
 Check 'and the two really are equal here' (($r[0].LibBytes -eq [int64]$kitsune.size))
 Check 'the reason names the tolerance'   ($r[0].Reason -match '10%')
 Check 'and the library file it matched'  ($r[0].Reason -match 'S18E6')
+
+Write-Host ''
+Write-Host '== settled movie with a source filename =='
+$somFile = Join-Path $films 'Neighbouring.sounds.2012.1080p.bluray.dts.x264.mkv'
+$stream = [System.IO.File]::Create($somFile); $stream.SetLength(10MB); $stream.Close()
+$somTorrent = Dl 'som1' 'Sound around / Neighboring sounds / O som ao redor [2012, Brazil, drama, HDRip-AVC] Original + Sub Rus' 3
+$somAlias = @{ 'neighbouring sounds' = 'o som ao redor'; 'sound around neighboring sounds o som ao redor' = 'o som ao redor' }
+$somTorrent.parts = Resolve-PartsAlias -Parts $somTorrent.parts -Aliases $somAlias
+$r = Judge -Torrents @($somTorrent) -Tol 10 -Aliases $somAlias
+Check 'a smaller in-progress movie is recognized against the settled source-named library file' (@($r).Count -eq 1 -and $r[0].LibLabel -eq 'Neighbouring.sounds.2012.1080p.bluray.dts.x264.mkv')
 
 Write-Host ''
 Write-Host '== it acts on FINAL size, at 0% =='

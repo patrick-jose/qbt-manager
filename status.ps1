@@ -143,6 +143,7 @@ if ($sliceStart -lt 0 -or $sliceEnd -le $sliceStart) {
 Invoke-Expression $src.Substring($sliceStart, $sliceEnd - $sliceStart)
 $script:settleJournalDir = Join-Path $PSScriptRoot 'pending-settle'
 $script:pendingSettleRecords = @(Get-PendingSettleRecords)
+$script:tmdbCache = Read-TmdbCache -Path (Join-Path $PSScriptRoot 'tmdb-cache.json')
 
 # ---- small helpers ---------------------------------------------------------
 
@@ -311,7 +312,7 @@ function Test-Errored {
 
 function Get-ExclusionVerdict {
     param($T)
-    $dovi = Get-TorrentDoviHit -Torrent $T
+    $dovi = Get-TorrentDoviHit -Torrent $T -IncludePayloadFiles
     if ($dovi) {
         return [pscustomobject]@{ Verdict = 'EXCLUDE'; Rule = 'DoVi'; Reason = "Dolby Vision marker '$dovi'" }
     }
@@ -352,6 +353,13 @@ $parts = $null
             $parts = Resolve-SpecialMovieAlias -Parts $parts -Name ([string](Get-Prop $t 'name')) -Aliases $cfg.specialMovieAliases
             $parts = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases
             $parts = Resolve-YearScopedMovieAlias -Parts $parts -Aliases $cfg.yearScopedMovieAliases
+            $identity = Get-TmdbIdentity -Parts $parts -Name ([string](Get-Prop $t 'name')) -Cache $script:tmdbCache -CacheOnly
+            if ($identity -and $identity.status -eq 'matched') {
+                $parts | Add-Member -NotePropertyName TmdbId -NotePropertyValue ([string]$identity.id) -Force
+                $parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue ([string]$identity.type) -Force
+                $parts | Add-Member -NotePropertyName TmdbName -NotePropertyValue ([string]$identity.name) -Force
+                $parts | Add-Member -NotePropertyName TmdbNameKey -NotePropertyValue (Get-TmdbTitleKey ([string]$identity.name)) -Force
+            }
         }
 
         Add-Member -InputObject $t -NotePropertyName parts -NotePropertyValue $parts -Force

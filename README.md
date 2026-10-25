@@ -5,6 +5,10 @@ through its Web API. Watches qBittorrent for changes, deletes what you have deci
 should not be downloaded, files what should be kept, and tells you what it did
 and why.
 
+The Dolby Vision guard reads MediaInfo track metadata in addition to torrent and
+payload filenames. Install the MediaInfo CLI (`mediainfo`) for metadata-based
+detection; the manager also checks the per-user WinGet install location.
+
 It is written for one specific person's rules rather than for everyone, so it is
 opinionated. The opinions are the point: a smaller version of this that deleted
 "probably duplicates" would eventually delete the only copy of something.
@@ -13,7 +17,7 @@ opinionated. The opinions are the point: a smaller version of this that deleted
 # See what it would do. Changes nothing.
 .\qbt-manager.ps1 -DryRun
 
-# Watch it work. Read-only, refreshes every 30 seconds.
+# Watch it work. Read-only, refreshes every 60 seconds.
 .\status.ps1 -Watch
 ```
 
@@ -23,7 +27,7 @@ Nine rules, run in this order:
 
 | # | Rule | In one line |
 |---|---|---|
-| 1 | **Dolby Vision** | A torrent advertising DoVi is deleted with its files, in any state. |
+| 1 | **Dolby Vision** | A torrent with DoVi in its name, payload filename, or embedded video metadata is deleted with its files, in any state. |
 | 1b | **Disc rip** | A full Blu-ray disc structure is deleted. Transcodes and REMUXes are not disc rips and are left alone. |
 | 2 | **No availability** | A magnet reporting no size is deleted after being *really* trying — see below. |
 | 2b | **Stalled** | An unfinished torrent whose byte count has not moved for 7 days. |

@@ -187,6 +187,8 @@ $logPath   = Join-Path $logDir ('manager-{0}.log' -f (Get-Date -Format 'yyyy-MM-
 $script:actions = New-Object System.Collections.ArrayList
 $script:notes   = New-Object System.Collections.ArrayList
 $script:gone    = @{}
+$script:tmdbNewLookupCount = 0
+$script:tmdbRequestCount = 0
 
 # Which show folder each parsed title resolves to. Populated on first use and
 # deliberately NOT cleared mid-run: the folder cannot change under a run, and a
@@ -843,6 +845,13 @@ function Test-SameTitle {
         if ($A.Episode -ne $B.Episode) { return $false }
     }
 
+    # A shared, unambiguous TMDB identity is stronger than localized spelling.
+    # If both sides have IDs, a mismatch is definitive; do not fall through to
+    # token similarity and accidentally merge two different works.
+    if ($A.TmdbId -and $B.TmdbId) {
+        return ([string]$A.TmdbType -eq [string]$B.TmdbType -and [string]$A.TmdbId -eq [string]$B.TmdbId)
+    }
+
     # A year printed on one release and absent from another is not a
     # disagreement about which work this is. 'Its Always Sunny in Philadelphia
     # S18E04 2026 A Virtual Insanity' and 'Its.Always.Sunny.in.Philadelphia.
@@ -883,6 +892,18 @@ function Test-SameTitle {
     }
 
     return $true
+}
+
+function Test-SameMediaIdentity {
+    # Settle asks only whether two torrents refer to the same movie/show. If
+    # both have an authoritative TMDB ID, honor it; otherwise retain the exact
+    # title comparison this manager used before TMDB was configured.
+    param($A, $B)
+    if (-not $A -or -not $B -or $A.IsSeries -ne $B.IsSeries) { return $false }
+    if ($A.TmdbId -and $B.TmdbId) {
+        return ([string]$A.TmdbType -eq [string]$B.TmdbType -and [string]$A.TmdbId -eq [string]$B.TmdbId)
+    }
+    return ([string]$A.Title -ieq [string]$B.Title)
 }
 function Get-EpisodeSetKey {
     <#
@@ -1203,13 +1224,20 @@ function Set-FamilyLabels {
     # One show name per cluster: the run of leading words its own members agree
     # on. Same helper the merge pass uses, so the two agree on what a name is.
     $show = @('') * $count
+    $familyKey = @('') * $count
     for ($i = 0; $i -lt $count; $i++) {
         $parts = $list[$i][0].parts
         if (-not $parts -or -not $parts.IsSeries) { continue }
         if ($null -eq $parts.Season -or $null -eq $parts.Episode) { continue }
+        if ($parts.TmdbType -eq 'tv' -and $parts.TmdbId -and $parts.TmdbNameKey) {
+            $show[$i] = [string]$parts.TmdbNameKey
+            $familyKey[$i] = 'tmdb:' + [string]$parts.TmdbId
+            continue
+        }
         $tokenLists = @()
         foreach ($m in $list[$i]) { $tokenLists += , @($m.parts.Tokens) }
         $show[$i] = Get-CommonRun -TokenLists $tokenLists
+        if ($show[$i]) { $familyKey[$i] = @($show[$i] -split ' ')[0] }
     }
 
     # The same lost-apostrophe repair the merge pass performs, under the same
@@ -1239,7 +1267,8 @@ function Set-FamilyLabels {
     $family = @{}
     for ($i = 0; $i -lt $count; $i++) {
         if (-not $show[$i]) { continue }
-        $f = @($show[$i] -split ' ')[0]
+        $f = $familyKey[$i]
+        if (-not $f) { $f = @($show[$i] -split ' ')[0] }
         if (-not $family.ContainsKey($f)) { $family[$f] = New-Object System.Collections.ArrayList }
         [void]$family[$f].Add($i)
     }
@@ -1263,7 +1292,8 @@ function Set-FamilyLabels {
 
     for ($i = 0; $i -lt $count; $i++) {
         if (-not $show[$i]) { continue }
-        $f = @($show[$i] -split ' ')[0]
+        $f = $familyKey[$i]
+        if (-not $f) { $f = @($show[$i] -split ' ')[0] }
         if (-not $familyLabel.ContainsKey($f)) { continue }
         foreach ($m in $list[$i]) {
             Add-Member -InputObject $m -NotePropertyName 'showLabel' -NotePropertyValue $familyLabel[$f] -Force
@@ -1296,6 +1326,10 @@ function Get-ClusterFamilies {
         $parts = $Clusters[$i][0].parts
         if (-not $parts -or -not $parts.IsSeries) { continue }
         if ($null -eq $parts.Season -or $null -eq $parts.Episode) { continue }
+        if ($parts.TmdbType -eq 'tv' -and $parts.TmdbId -and $parts.TmdbNameKey) {
+            $show[$i] = [string]$parts.TmdbNameKey
+            continue
+        }
 
         # One element per title, each element being that title's whole word
         # list. Written as an explicit loop rather than a pipeline, because a
@@ -1338,7 +1372,10 @@ function Get-ClusterFamilies {
 
     $fam = @('') * $count
     for ($i = 0; $i -lt $count; $i++) {
-        if ($show[$i]) { $fam[$i] = @($show[$i] -split ' ')[0] }
+        if (-not $show[$i]) { continue }
+        $parts = $Clusters[$i][0].parts
+        if ($parts.TmdbType -eq 'tv' -and $parts.TmdbId) { $fam[$i] = 'tmdb:' + [string]$parts.TmdbId }
+        else { $fam[$i] = @($show[$i] -split ' ')[0] }
     }
     return [pscustomobject]@{ Show = $show; Family = $fam }
 }
@@ -1425,7 +1462,7 @@ function Merge-SeriesClustersCore {
         # key. Letting it merge would let it bridge two clusters whose
         # singles are different episodes, quietly folding them together.
         if ($Clusters[$i][0].parts.IsMultiEpisode) { $show[$i] = ''; continue }
-        $f = @($famInfo.Family[$i] -split ' ')[0]
+        $f = [string]$famInfo.Family[$i]
         if (-not $family.ContainsKey($f)) { $family[$f] = New-Object System.Collections.ArrayList }
         [void]$family[$f].Add($i)
     }
@@ -1482,7 +1519,7 @@ function Merge-SeriesClustersCore {
     $onEpisode = @{}
     for ($i = 0; $i -lt $count; $i++) {
         if (-not $suffix[$i]) { continue }
-        $f = @($show[$i] -split ' ')[0]
+        $f = [string]$famInfo.Family[$i]
         $k = "$f|$($suffix[$i])"
         if (-not $onEpisode.ContainsKey($k)) { $onEpisode[$k] = New-Object System.Collections.ArrayList }
         [void]$onEpisode[$k].Add($key[$i])
@@ -1500,10 +1537,10 @@ function Merge-SeriesClustersCore {
     $merged = 0
     for ($i = 0; $i -lt $count; $i++) {
         if (-not $show[$i]) { continue }
-        $f = @($show[$i] -split ' ')[0]
+        $f = [string]$famInfo.Family[$i]
         for ($j = $i + 1; $j -lt $count; $j++) {
             if (-not $show[$j]) { continue }
-            if (@($show[$j] -split ' ')[0] -ne $f) { continue }
+            if ([string]$famInfo.Family[$j] -ne $f) { continue }
             if ($key[$i] -ne $key[$j]) { continue }
             if ($suffix[$i] -and $isQualifier.ContainsKey("$f|$($suffix[$i])")) { continue }
             if ($suffix[$j] -and $isQualifier.ContainsKey("$f|$($suffix[$j])")) { continue }
@@ -1557,6 +1594,65 @@ function Get-DoviHit {
     return $null
 }
 
+function Get-DoviMetadataHitFromJson {
+    param([string]$Json)
+    if ([string]::IsNullOrWhiteSpace($Json)) { return $null }
+    try { $doc = $Json | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($doc)
+    while ($stack.Count -gt 0) {
+        $item = $stack.Pop()
+        if ($null -eq $item) { continue }
+        if ($item -is [string]) {
+            if ($item -match '(?i)\bDolby[\s._-]*Vision\b|\bDoVi\b|\bDOVI\b|\b(?:dvhe|dvh1)(?:[._][0-9]{2})?\b') { return $Matches[0] }
+            continue
+        }
+        if ($item -is [System.Collections.IDictionary]) {
+            foreach ($value in $item.Values) { $stack.Push($value) }
+            continue
+        }
+        if ($item -is [System.Array]) {
+            foreach ($value in $item) { $stack.Push($value) }
+            continue
+        }
+        foreach ($property in $item.PSObject.Properties) { $stack.Push($property.Value) }
+    }
+    return $null
+}
+
+function Get-MediaInfoExecutable {
+    foreach ($commandName in @('mediainfo.exe', 'MediaInfo.exe', 'mediainfo')) {
+        $command = Get-Command $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($command -and $command.Source -and (Test-Path -LiteralPath $command.Source -PathType Leaf)) { return $command.Source }
+    }
+    # Winget's per-user CLI install; this also works in already-open shells
+    # whose PATH predates the install.
+    $wingetPath = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages\MediaArea.MediaInfo_Microsoft.Winget.Source_8wekyb3d8bbwe\MediaInfo.exe'
+    if (Test-Path -LiteralPath $wingetPath -PathType Leaf) { return $wingetPath }
+    return $null
+}
+
+function Get-DoviMetadataHit {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $extension = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($extension -notin @('.mkv', '.mp4', '.m4v', '.mov', '.ts', '.m2ts')) { return $null }
+    if ($null -eq (Get-Variable -Name doviMetadataCache -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) {
+        $script:doviMetadataCache = @{}
+    }
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $key = $Path.ToLowerInvariant() + '|' + $item.Length + '|' + $item.LastWriteTimeUtc.Ticks
+        if ($script:doviMetadataCache.ContainsKey($key)) { return $script:doviMetadataCache[$key] }
+        $exe = Get-MediaInfoExecutable
+        if (-not $exe) { $script:doviMetadataCache[$key] = $null; return $null }
+        $json = (& $exe '--Output=JSON' $Path 2>$null | Out-String)
+        $hit = Get-DoviMetadataHitFromJson -Json $json
+        $script:doviMetadataCache[$key] = $hit
+        return $hit
+    } catch { return $null }
+}
+
 function Get-TorrentDoviHit {
     param([object]$Torrent, [switch]$IncludePayloadFiles)
     # qBittorrent's display name may omit a format tag that remains on the
@@ -1568,7 +1664,9 @@ function Get-TorrentDoviHit {
     # metadata is available, inspect the actual payload filenames too; this is
     # the authoritative filename that qBittorrent will write. Cache once per
     # manager pass so other rules can reuse the same result.
-    if ($null -eq $script:doviPayloadFileCache) { $script:doviPayloadFileCache = @{} }
+    if ($null -eq (Get-Variable -Name doviPayloadFileCache -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) {
+        $script:doviPayloadFileCache = @{}
+    }
     $key = ([string]$Torrent.hash).ToLowerInvariant()
     if (-not $script:doviPayloadFileCache.ContainsKey($key)) {
         try { $script:doviPayloadFileCache[$key] = @(Invoke-ApiGet -Endpoint "torrents/files?hash=$($Torrent.hash)") }
@@ -1577,6 +1675,32 @@ function Get-TorrentDoviHit {
     foreach ($file in @($script:doviPayloadFileCache[$key])) {
         $hit = Get-DoviHit -Name ([string]$file.name)
         if ($hit) { return $hit }
+    }
+    # Metadata is the final evidence source when both the torrent and payload
+    # filename omit the tag. Probe media files already present on disk.
+    $contentPath = [string]$Torrent.content_path
+    if (-not [string]::IsNullOrWhiteSpace($contentPath)) {
+        $contentIsFile = [IO.Path]::HasExtension($contentPath)
+        foreach ($file in @($script:doviPayloadFileCache[$key])) {
+            $relative = ([string]$file.name).Replace('/', '\')
+            $candidatePaths = New-Object System.Collections.ArrayList
+            if ($contentIsFile) {
+                [void]$candidatePaths.Add($contentPath)
+            } else {
+                [void]$candidatePaths.Add((Join-Path $contentPath $relative))
+                [void]$candidatePaths.Add((Join-Path $contentPath (Split-Path -Leaf $relative)))
+                $savePath = [string]$Torrent.save_path
+                if ($savePath) { [void]$candidatePaths.Add((Join-Path $savePath $relative)) }
+                $contentLeaf = Split-Path -Leaf $contentPath
+                if ($relative.StartsWith($contentLeaf + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    [void]$candidatePaths.Add((Join-Path (Split-Path -Parent $contentPath) $relative))
+                }
+            }
+            foreach ($candidate in @($candidatePaths | Select-Object -Unique)) {
+                $hit = Get-DoviMetadataHit -Path ([string]$candidate)
+                if ($hit) { return $hit }
+            }
+        }
     }
     return $null
 }
@@ -2833,12 +2957,197 @@ function Resolve-YearScopedMovieAlias {
     $pairs = if ($Aliases -is [System.Collections.IDictionary]) { $Aliases.GetEnumerator() } else { $Aliases.PSObject.Properties }
     foreach ($pair in $pairs) {
         $key = if ($Aliases -is [System.Collections.IDictionary]) { [string]$pair.Key } else { [string]$pair.Name }
-        $value = if ($Aliases -is [System.Collections.IDictionary]) { [string]$pair.Value } else { [string]$pair.Value }
+        $value = if ($Aliases -is [System.Collections.IDictionary]) { $pair.Value } else { $pair.Value }
         if ($key -notmatch '^(\d{4})\|(.*)$' -or $Matches[1] -ne [string]$Parts.Year -or $Matches[2] -ine [string]$Parts.Title) { continue }
-        if ([string]::IsNullOrWhiteSpace($value)) { continue }
-        return (Resolve-PartsAlias -Parts $Parts -Aliases (@{ ([string]$Parts.Title) = $value }))
+        $targetTitle = [string]$value
+        $targetYear = $null
+        if ($value -is [System.Collections.IDictionary]) {
+            $targetTitle = [string]$value.title
+            $targetYear = [string]$value.year
+        } elseif ($null -ne $value -and $value -isnot [string]) {
+            $targetTitle = [string]$value.title
+            $targetYear = [string]$value.year
+        }
+        if ([string]::IsNullOrWhiteSpace($targetTitle)) { continue }
+        $aliased = Resolve-PartsAlias -Parts $Parts -Aliases (@{ ([string]$Parts.Title) = $targetTitle })
+        if ($targetYear -match '^(?:19|20)\d{2}$') {
+            $out = [ordered]@{}
+            foreach ($property in $aliased.PSObject.Properties) { $out[$property.Name] = $property.Value }
+            $out['Year'] = $targetYear
+            $aliased = [pscustomobject]$out
+        }
+        return $aliased
     }
     return $Parts
+}
+
+function Get-TmdbTitleKey {
+    param([string]$Title)
+    if ([string]::IsNullOrWhiteSpace($Title)) { return '' }
+    $formD = $Title.Normalize([Text.NormalizationForm]::FormD)
+    $plain = [regex]::Replace($formD, '\p{Mn}', '')
+    return ([regex]::Replace($plain.ToLowerInvariant(), '[^\p{L}\p{Nd}]+', ' ').Trim() -replace '\s+', ' ')
+}
+
+function Test-TmdbTitleName {
+    param([string]$InputTitle, [string]$CandidateTitle)
+    $inputKey = Get-TmdbTitleKey $InputTitle
+    $candidateKey = Get-TmdbTitleKey $CandidateTitle
+    if (-not $inputKey -or -not $candidateKey) { return $false }
+    if ($inputKey -eq $candidateKey) { return $true }
+    $candidateWords = @($candidateKey -split ' ' | Where-Object { $_ })
+    if ($candidateWords.Count -lt 2) { return $false }
+    return (' ' + $inputKey + ' ').Contains(' ' + $candidateKey + ' ')
+}
+
+function Get-TmdbSearchVariants {
+    param([string]$Name, [string]$ParsedTitle)
+    $out = New-Object System.Collections.ArrayList
+    foreach ($piece in @($Name -split '(?i)\baka\b|[/|]')) {
+        try { $p = Get-TitleParts -Name $piece; $title = [string]$p.Title } catch { $title = '' }
+        $title = Get-TmdbTitleKey $title
+        if ($title -and @($title -split ' ').Count -ge 2 -and -not $out.Contains($title)) { [void]$out.Add($title) }
+    }
+    $parsed = Get-TmdbTitleKey $ParsedTitle
+    if ($parsed -and @($parsed -split ' ').Count -ge 2 -and -not $out.Contains($parsed)) { [void]$out.Insert(0, $parsed) }
+    if ($out.Count -gt 5) { return @($out | Select-Object -First 5) }
+    return @($out)
+}
+
+function Invoke-TmdbRequest {
+    param([string]$Uri, [string]$BearerToken)
+    return Invoke-RestMethod -Method Get -Uri $Uri -Headers @{ Authorization = "Bearer $BearerToken"; Accept = 'application/json' } -TimeoutSec 8 -ErrorAction Stop
+}
+
+function Get-TmdbIdentity {
+    # Resolves only a unique exact-year work identity. Ambiguous, missing, or
+    # failed lookups never become alias guesses. Inject Request in tests to keep
+    # the suite offline.
+    param(
+        [object]$Parts,
+        [string]$Name,
+        [string]$BearerToken,
+        [hashtable]$Cache,
+        [scriptblock]$Request,
+        [int]$MaxLookups = 8,
+        [int]$MaxRequests = 16,
+        [switch]$CacheOnly
+    )
+    if (-not $Parts -or [string]::IsNullOrWhiteSpace([string]$Parts.Title)) { return $null }
+    $type = if ($Parts.IsSeries) { 'tv' } else { 'movie' }
+    $year = [string]$Parts.Year
+    # No year means the result cannot be checked against the release's identity;
+    # leave it to the existing title/alias rules instead of guessing.
+    if ($year -notmatch '^\d{4}$') { return $null }
+    $variants = @(Get-TmdbSearchVariants -Name $Name -ParsedTitle ([string]$Parts.Title))
+    if ($variants.Count -eq 0) { $variants = @((Get-TmdbTitleKey ([string]$Parts.Title))) }
+    $cacheKey = '{0}|{1}|{2}' -f $type, $year, (($variants | Sort-Object -Unique) -join '|')
+    if ($null -ne $Cache -and $Cache.ContainsKey($cacheKey)) {
+        $entry = $Cache[$cacheKey]
+        $age = 9999.0
+        try { $age = ((Get-Date) - [datetime]$entry.checkedAt).TotalDays } catch { }
+        $maxAge = if ([string]$entry.status -eq 'ambiguous') { 7 } else { 30 }
+        if ($age -le $maxAge) { return $entry }
+    }
+    if ($CacheOnly -or [string]::IsNullOrWhiteSpace($BearerToken) -or $MaxLookups -le 0) { return $null }
+    if ($null -eq $script:tmdbNewLookupCount) { $script:tmdbNewLookupCount = 0 }
+    if ($null -eq $script:tmdbRequestCount) { $script:tmdbRequestCount = 0 }
+    if ($script:tmdbNewLookupCount -ge $MaxLookups -or $script:tmdbRequestCount -ge $MaxRequests) { return $null }
+    $script:tmdbNewLookupCount++
+    if (-not $Request) { $Request = { param($uri) Invoke-TmdbRequest -Uri $uri -BearerToken $BearerToken }.GetNewClosure() }
+
+    $base = 'https://api.themoviedb.org/3'
+    $candidateById = @{}
+    $queryCount = 0
+    foreach ($variant in $variants) {
+        if ($queryCount -ge 5 -or $script:tmdbRequestCount -ge $MaxRequests) { break }
+        $queryCount++
+        $query = [uri]::EscapeDataString($variant)
+        $uri = "$base/search/$type`?query=$query&include_adult=false"
+        if ($year -match '^\d{4}$') {
+            if ($type -eq 'movie') { $uri += "&year=$year" } else { $uri += "&first_air_date_year=$year" }
+        }
+        try { $script:tmdbRequestCount++; $response = & $Request $uri }
+        catch { return $null }
+        foreach ($hit in @($response.results | Select-Object -First 12)) {
+            $id = [string]$hit.id
+            if (-not $id) { continue }
+            $date = if ($type -eq 'movie') { [string]$hit.release_date } else { [string]$hit.first_air_date }
+            $hitYear = if ($date -match '^(\d{4})') { $Matches[1] } else { '' }
+            if ($year -match '^\d{4}$' -and $hitYear -ne $year) { continue }
+            if (-not $candidateById.ContainsKey($id)) {
+                $mainName = if ($type -eq 'movie') { [string]$hit.title } else { [string]$hit.name }
+                $original = if ($type -eq 'movie') { [string]$hit.original_title } else { [string]$hit.original_name }
+                $candidateById[$id] = [pscustomobject]@{ id = $id; name = $mainName; year = $hitYear; names = (New-Object System.Collections.ArrayList) }
+                if ($mainName) { [void]$candidateById[$id].names.Add($mainName) }
+                if ($original -and $original -ne $mainName) { [void]$candidateById[$id].names.Add($original) }
+            }
+        }
+    }
+
+    $matching = @{}
+    foreach ($candidate in @($candidateById.Values | Select-Object -First 6)) {
+        $matched = $false
+        foreach ($candidateName in $candidate.names) {
+            foreach ($variant in $variants) {
+                if (Test-TmdbTitleName -InputTitle $variant -CandidateTitle ([string]$candidateName)) { $matched = $true; break }
+            }
+            if ($matched) { break }
+        }
+        if (-not $matched) {
+            $altPath = if ($type -eq 'movie') { "movie/$($candidate.id)/alternative_titles" } else { "tv/$($candidate.id)/alternative_titles" }
+            if ($script:tmdbRequestCount -ge $MaxRequests) { continue }
+            try {
+                $script:tmdbRequestCount++
+                $alt = & $Request "$base/$altPath"
+                $altNames = if ($type -eq 'movie') { @($alt.titles | ForEach-Object { [string]$_.title }) } else { @($alt.results | ForEach-Object { [string]$_.name }) }
+                foreach ($candidateName in $altNames) {
+                    foreach ($variant in $variants) {
+                        if (Test-TmdbTitleName -InputTitle $variant -CandidateTitle $candidateName) { $matched = $true; break }
+                    }
+                    if ($matched) { break }
+                }
+            } catch { }
+        }
+        if ($matched) { $matching[$candidate.id] = $candidate }
+    }
+
+    $status = if ($matching.Count -eq 1) { 'matched' } elseif ($matching.Count -gt 1) { 'ambiguous' } else { 'notfound' }
+    $result = [pscustomobject]@{
+        status = $status; type = $type; id = ''; name = ''; year = $year
+        checkedAt = (Get-Date).ToString('o')
+    }
+    if ($status -eq 'matched') {
+        $winner = @($matching.Values)[0]
+        $result.id = [string]$winner.id
+        $result.name = [string]$winner.name
+    }
+    if ($null -ne $Cache) { $Cache[$cacheKey] = $result }
+    return $result
+}
+
+function Read-TmdbCache {
+    param([string]$Path)
+    $cache = @{}
+    if (-not (Test-Path -LiteralPath $Path)) { return $cache }
+    try {
+        $obj = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        foreach ($p in $obj.PSObject.Properties) { $cache[$p.Name] = $p.Value }
+    } catch { Write-Log 'WARN' "TMDB cache unreadable; starting with an empty cache: $($_.Exception.Message)" }
+    return $cache
+}
+
+function Write-TmdbCache {
+    param([string]$Path, [hashtable]$Cache)
+    $tmp = $Path + '.tmp'
+    try {
+        $json = ConvertTo-Json -InputObject $Cache -Depth 12
+        [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        Write-Log 'WARN' "could not save TMDB cache: $($_.Exception.Message)"
+    }
 }
 
 function Resolve-LibraryShowDir {
@@ -3675,7 +3984,9 @@ function Get-LibraryRedundantVerdicts {
         [double]$TolerancePercent = 10,
         [hashtable]$Gone = @{},
         # titleAliases, forwarded to the folder resolver - see the note there.
-        [object]$Aliases = $null
+        [object]$Aliases = $null,
+        [object]$YearAliases = $null,
+        [hashtable]$TmdbCache = $null
     )
 
     $out = New-Object System.Collections.ArrayList
@@ -3696,11 +4007,25 @@ function Get-LibraryRedundantVerdicts {
         $mine = [int64]$t.size
 
         if (-not $t.parts.IsSeries) {
-            # A film: replaced by a file of the same name in the movies folder.
+            # First check the canonical filename, then inspect other top-level
+            # movie filenames by parsed identity. Settled files keep their source
+            # release names, so requiring '<canonical title>.<ext>' misses them.
             $libFile = $null
             foreach ($ext in @('mkv', 'mp4', 'avi', 'm4v')) {
                 $c = Join-Path $MoviesDir ($t.parts.Title + '.' + $ext)
                 if (Test-Path -LiteralPath $c) { $libFile = Get-Item -LiteralPath $c; break }
+            }
+            if ($null -eq $libFile -and (Test-Path -LiteralPath $MoviesDir)) {
+                foreach ($candidate in Get-ChildItem -LiteralPath $MoviesDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -match '^\.(mkv|mp4|avi|m4v)$' }) {
+                    $candidateParts = Resolve-PartsAlias -Parts (Get-TitleParts -Name $candidate.Name) -Aliases $Aliases
+                    $candidateParts = Resolve-YearScopedMovieAlias -Parts $candidateParts -Aliases $YearAliases
+                    $candidateIdentity = Get-TmdbIdentity -Parts $candidateParts -Name $candidate.Name -Cache $TmdbCache -CacheOnly
+                    if ($candidateIdentity -and $candidateIdentity.status -eq 'matched') {
+                        $candidateParts | Add-Member -NotePropertyName TmdbId -NotePropertyValue ([string]$candidateIdentity.id) -Force
+                        $candidateParts | Add-Member -NotePropertyName TmdbType -NotePropertyValue ([string]$candidateIdentity.type) -Force
+                    }
+                    if (Test-SameTitle -A $t.parts -B $candidateParts) { $libFile = $candidate; break }
+                }
             }
             if ($null -eq $libFile) { continue }
             # Its own file is not a rival.
@@ -4191,17 +4516,17 @@ function Get-SettleVerdicts {
             if ($u.hash -eq $t.hash) { continue }
             if ($Gone.ContainsKey($u.hash)) { continue }
             if ([double]$u.progress -ge 1) { continue }
-            if (-not $u.parts -or [string]$u.parts.Title -ne $myTitle) { continue }
+            if (-not $u.parts -or -not (Test-SameMediaIdentity -A $t.parts -B $u.parts)) { continue }
             $us = Get-SetKeySpan -Key ([string]$keys[$u.hash])
             if (-not $us.Known) { $blockers += $u; continue }
             if ($span.IsFilm) {
                 if (-not $us.IsFilm) { continue }
                 if (-not $u.parts) { continue }
-                if ([string]$u.parts.Title -ne $myTitle) { continue }
+                if (-not (Test-SameMediaIdentity -A $t.parts -B $u.parts)) { continue }
             }
             else {
                 if ($us.IsFilm) { continue }
-                if (-not $u.parts -or [string]$u.parts.Title -ne $myTitle) { continue }
+                if (-not $u.parts -or -not (Test-SameMediaIdentity -A $t.parts -B $u.parts)) { continue }
                 if (-not (Test-SpanOverlap -A $span -B $us)) { continue }
             }
             $blockers += $u
@@ -4872,6 +5197,53 @@ function Remove-EmptyLibraryReleaseFolders {
     }
 }
 
+function Remove-EmptyManagedDirectories {
+    # Empty payload directories are common after qBittorrent removes a torrent's
+    # files. Prune only descendants of explicitly managed roots; never the root,
+    # a reparse point, a path claimed by a live torrent, or a pending settle path.
+    param([string[]]$Roots, [object[]]$Torrents = @())
+
+    foreach ($rootInput in @($Roots | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })) {
+        if (-not (Test-Path -LiteralPath $rootInput -PathType Container)) { continue }
+        try { $root = [IO.Path]::GetFullPath($rootInput).TrimEnd('\', '/') }
+        catch { continue }
+        $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction SilentlyContinue
+        if (-not $rootItem -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+
+        # Walk explicitly so directory junctions/symlinks are not traversed.
+        $stack = New-Object System.Collections.Stack
+        foreach ($child in @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue)) { $stack.Push($child.FullName) }
+        $dirs = New-Object System.Collections.ArrayList
+        while ($stack.Count -gt 0) {
+            $path = [string]$stack.Pop()
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if (-not $item -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+            [void]$dirs.Add($path)
+            foreach ($child in @(Get-ChildItem -LiteralPath $path -Directory -Force -ErrorAction SilentlyContinue)) { $stack.Push($child.FullName) }
+        }
+
+        foreach ($dir in @($dirs | Sort-Object { $_.Length } -Descending)) {
+            $full = [IO.Path]::GetFullPath([string]$dir).TrimEnd('\', '/')
+            if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ((Test-Claimed -Path $full -Torrents $Torrents) -or (Test-PendingSettlePath -Path $full)) { continue }
+            try {
+                $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                if (@(Get-ChildItem -LiteralPath $full -Force -ErrorAction Stop).Count -ne 0) { continue }
+                if ($DryRun) {
+                    [void]$script:actions.Add("WOULD REMOVE EMPTY DIRECTORY  $full")
+                    continue
+                }
+                # Non-recursive delete closes the race with a new payload arriving.
+                [IO.Directory]::Delete($full, $false)
+                [void]$script:actions.Add("REMOVED EMPTY DIRECTORY  $full")
+                Write-Log 'INFO' "removed empty managed directory '$full'"
+            }
+            catch { Write-Log 'WARN' "could not remove empty managed directory '$full': $($_.Exception.Message)" }
+        }
+    }
+}
+
 function Invoke-PendingSettles {
     param([object[]]$Torrents = @())
     $completed = 0
@@ -5006,6 +5378,17 @@ try {
 Write-Log 'INFO' "run start; $($all.Count) torrent(s) seen; dryRun=$([bool]$DryRun)"
 Write-Host "fetched $($all.Count) torrent(s)"
 $script:pendingSettleRecords = @(Get-PendingSettleRecords)
+$script:tmdbCachePath = Join-Path $PSScriptRoot 'tmdb-cache.json'
+$script:tmdbCache = Read-TmdbCache -Path $script:tmdbCachePath
+$script:tmdbBearerToken = [string]$cfg.tmdbBearerToken
+$script:tmdbEnabled = $cfg.PSObject.Properties['tmdbEnabled'] -and [bool]$cfg.tmdbEnabled
+$tmdbMaxLookups = 8
+if ($cfg.PSObject.Properties['tmdbMaxLookupsPerRun']) { $tmdbMaxLookups = [Math]::Max(0, [int]$cfg.tmdbMaxLookupsPerRun) }
+$tmdbMaxRequests = 16
+if ($cfg.PSObject.Properties['tmdbMaxRequestsPerRun']) { $tmdbMaxRequests = [Math]::Max(0, [int]$cfg.tmdbMaxRequestsPerRun) }
+if ($script:tmdbEnabled -and [string]::IsNullOrWhiteSpace($script:tmdbBearerToken)) {
+    Write-Log 'WARN' 'TMDB identity lookup is enabled but no local tmdbBearerToken is configured; existing title safeguards remain in effect'
+}
 
 # -- annotate every torrent with its key ------------------------------------
 
@@ -5019,20 +5402,43 @@ try   { $parts = Get-TitleParts -Name $t.name }
       # spelling would put the release in a show of its own - see
       # Resolve-PartsAlias for the live queue this came from.
       if ($parts) {
+          $rawParts = $parts
+          $hasExplicitAlias = $false
           $special = Resolve-SpecialMovieAlias -Parts $parts -Name ([string]$t.name) -Aliases $cfg.specialMovieAliases
           if ($parts.IsSeries -and -not $special.IsSeries) {
               Write-Log 'INFO' ("specialMovieAliases: '{0}' is a movie; grouping it as '{1}'" -f $t.name, $special.Title)
               $parts = $special
+              $hasExplicitAlias = $true
           }
           $titleAliased = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases
           if ($titleAliased.Title -ne $parts.Title) {
               Write-Log 'INFO' ("titleAliases: '{0}' is '{1}'; grouping and filing it as '{1}'" -f $parts.Title, $titleAliased.Title)
               $parts = $titleAliased
+              $hasExplicitAlias = $true
           }
           $yearAliased = Resolve-YearScopedMovieAlias -Parts $parts -Aliases $cfg.yearScopedMovieAliases
-          if ($yearAliased.Title -ne $parts.Title) {
+          if ($yearAliased.Title -ne $parts.Title -or $yearAliased.Year -ne $parts.Year) {
               Write-Log 'INFO' ("yearScopedMovieAliases: '{0}' ({1}) is '{2}'" -f $parts.Title, $parts.Year, $yearAliased.Title)
               $parts = $yearAliased
+              $hasExplicitAlias = $true
+          }
+          # User-maintained aliases stay authoritative. TMDB adds an identity ID
+          # only for otherwise-unresolved titles with a unique exact-year result;
+          # the parsed title and library filing name are not rewritten.
+          if ($script:tmdbEnabled -and -not $hasExplicitAlias -and -not [string]::IsNullOrWhiteSpace($script:tmdbBearerToken)) {
+              $identity = Get-TmdbIdentity -Parts $rawParts -Name ([string]$t.name) `
+                  -BearerToken $script:tmdbBearerToken -Cache $script:tmdbCache `
+                  -MaxLookups $tmdbMaxLookups -MaxRequests $tmdbMaxRequests
+              if ($identity -and $identity.status -eq 'matched') {
+                  $parts | Add-Member -NotePropertyName TmdbId -NotePropertyValue ([string]$identity.id) -Force
+                  $parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue ([string]$identity.type) -Force
+                  $parts | Add-Member -NotePropertyName TmdbName -NotePropertyValue ([string]$identity.name) -Force
+                  $parts | Add-Member -NotePropertyName TmdbNameKey -NotePropertyValue (Get-TmdbTitleKey ([string]$identity.name)) -Force
+                  Write-Log 'INFO' ("TMDB {0} identity: '{1}' ({2}) -> '{3}' [id {4}]" -f $identity.type, $rawParts.Title, $rawParts.Year, $identity.name, $identity.id)
+              } elseif ($identity -and $identity.status -eq 'ambiguous') {
+                  $parts | Add-Member -NotePropertyName TmdbStatus -NotePropertyValue 'ambiguous' -Force
+                  Write-Log 'WARN' ("TMDB result ambiguous for '{0}' ({1}); no external identity applied" -f $rawParts.Title, $rawParts.Year)
+              }
           }
       }
 
@@ -5043,6 +5449,10 @@ try   { $parts = Get-TitleParts -Name $t.name }
     } else {
         Write-Log 'INFO' "parsed '$($t.name)' -> title='$($parts.Title)' year='$($parts.Year)' series=$($parts.IsSeries) S$($parts.Season)E$($parts.Episode)"
     }
+}
+
+if ($script:tmdbEnabled -and -not $DryRun -and $script:tmdbCache.Count -gt 0) {
+    Write-TmdbCache -Path $script:tmdbCachePath -Cache $script:tmdbCache
 }
 
 $live = New-Object System.Collections.ArrayList
@@ -6054,7 +6464,8 @@ else {
     Write-Host ("Redundant download check (within {0:N0}% of an episode already in the library)" -f $redundantTol)
     $redundant = @(Get-LibraryRedundantVerdicts -Torrents $all -MoviesDir $cfg.moviesDir `
                                                 -SeriesDir $cfg.seriesDir -TolerancePercent $redundantTol `
-                                                -Aliases $cfg.titleAliases)
+                                                -Aliases $cfg.titleAliases -YearAliases $cfg.yearScopedMovieAliases `
+                                                -TmdbCache $script:tmdbCache)
 
     if ($redundant.Count -eq 0) {
         Write-Host ("  no download is within {0:N0}% of an episode already in the library" -f $redundantTol) -ForegroundColor DarkGray
@@ -6222,7 +6633,18 @@ else {
         $live = @(Invoke-ApiGet -Endpoint 'torrents/info')
         foreach ($entry in $live) {
             $parts = Get-TitleParts -Name $entry.name
-            if ($parts) { $parts = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases }
+            if ($parts) {
+                $parts = Resolve-SpecialMovieAlias -Parts $parts -Name ([string]$entry.name) -Aliases $cfg.specialMovieAliases
+                $parts = Resolve-PartsAlias -Parts $parts -Aliases $cfg.titleAliases
+                $parts = Resolve-YearScopedMovieAlias -Parts $parts -Aliases $cfg.yearScopedMovieAliases
+                $identity = Get-TmdbIdentity -Parts $parts -Name ([string]$entry.name) -Cache $script:tmdbCache -CacheOnly
+                if ($identity -and $identity.status -eq 'matched') {
+                    $parts | Add-Member -NotePropertyName TmdbId -NotePropertyValue ([string]$identity.id) -Force
+                    $parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue ([string]$identity.type) -Force
+                    $parts | Add-Member -NotePropertyName TmdbName -NotePropertyValue ([string]$identity.name) -Force
+                    $parts | Add-Member -NotePropertyName TmdbNameKey -NotePropertyValue (Get-TmdbTitleKey ([string]$identity.name)) -Force
+                }
+            }
             Add-Member -InputObject $entry -NotePropertyName parts -NotePropertyValue $parts -Force
         }
         $script:liveTorrents = $live
@@ -6361,6 +6783,24 @@ if (-not $SkipLibraryScan -and $cfg.PSObject.Properties['reapOrphans'] -and $cfg
             }
         }
     }
+}
+
+# Torrent removals and successful moves can leave empty payload/release trees.
+# Clean them every pass (not only series release folders), under the configured
+# library and temp roots. Re-fetch claims after all torrent/file actions so a
+# recently added or still-active payload's folders are protected.
+if (-not $SkipLibraryScan) {
+    $emptyRoots = @($cfg.moviesDir, $cfg.seriesDir)
+    if ($cfg.PSObject.Properties['reapRoots']) { $emptyRoots += @($cfg.reapRoots) }
+    $emptyTorrents = @()
+    if ($DryRun) {
+        $emptyTorrents = @($all | Where-Object { -not $script:gone.ContainsKey($_.hash) })
+    } else {
+        try { $emptyTorrents = @(Invoke-ApiGet -Endpoint 'torrents/info') }
+        catch { Write-Log 'WARN' "empty directory cleanup could not refresh torrent claims: $($_.Exception.Message)"; $emptyTorrents = @($all) }
+    }
+    try { Remove-EmptyManagedDirectories -Roots $emptyRoots -Torrents $emptyTorrents }
+    catch { Write-Log 'WARN' "empty managed directory cleanup skipped: $($_.Exception.Message)" }
 }
 
 # -- rule 7: backup reaper -----------------------------------------------------
