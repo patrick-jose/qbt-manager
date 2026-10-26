@@ -585,6 +585,23 @@ $script:softTokens = @(
     'swe','nor','fin','hun','gre','pol','rus','jpn','kor','chi'
 )
 
+function Repair-Utf8Mojibake {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    # Repair only byte-shaped mojibake sequences, not the whole title: a release
+    # can mix Latin text with Cyrillic/CJK characters that Windows-1252 cannot
+    # represent, and round-tripping the whole string would destroy those names.
+    $pattern = '(?:[\u00C2\u00C3][\u0080-\u00BF]|\u00E2[\u0080-\u00BF]{2})+'
+    if ($Text -notmatch $pattern) { return $Text }
+    $legacy = [Text.Encoding]::GetEncoding(1252)
+    $utf8 = New-Object Text.UTF8Encoding($false, $true)
+    return [regex]::Replace($Text, $pattern, {
+        param($match)
+        try { $utf8.GetString($legacy.GetBytes($match.Value)) }
+        catch { $match.Value }
+    })
+}
+
 function Get-TitleParts {
     <#
         Splits a release name into the parts used for matching.
@@ -594,6 +611,7 @@ function Get-TitleParts {
     param([string]$Name)
 
     if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    $Name = Repair-Utf8Mojibake -Text $Name
 
     $orig = $Name
     $work = $Name
@@ -729,6 +747,23 @@ function Get-TitleParts {
     if ($leadingYearMatch.Success) {
         $leadingYear = $leadingYearMatch.Groups['year'].Value
         $work = $work.Substring($leadingYearMatch.Length)
+    }
+    else {
+        # Some catalogs prefix the release year with a dash: "1999 - Girl
+        # Interrupted - James Mangold". Without separating that label, the
+        # parser mistakes the year for the entire movie title, and TMDB can
+        # confidently return an unrelated film also named "1999".
+        $prefixedYearMatch = [regex]::Match($work, '^\s*(?<year>(?:19|20)\d{2})\s+-\s+(?<title>.+)$')
+        if ($prefixedYearMatch.Success) {
+            $leadingYear = $prefixedYearMatch.Groups['year'].Value
+            $work = $prefixedYearMatch.Groups['title'].Value
+            # In this naming form a second spaced dash commonly introduces the
+            # director, source, or uploader after the actual title. Keep that
+            # metadata out of the parsed identity (the unspaced hyphen in a title
+            # such as Spider-Man is unaffected).
+            $titleTail = [regex]::Match($work, '^\s*(?<title>.+?)\s+-\s+.+$')
+            if ($titleTail.Success) { $work = $titleTail.Groups['title'].Value }
+        }
     }
 
     # --- year, from anywhere in the name (brackets included) ---------------
@@ -3374,6 +3409,7 @@ function Resolve-YearScopedMovieAlias {
 function Get-TmdbTitleKey {
     param([string]$Title)
     if ([string]::IsNullOrWhiteSpace($Title)) { return '' }
+    $Title = Repair-Utf8Mojibake -Text $Title
     $formD = $Title.Normalize([Text.NormalizationForm]::FormD)
     $plain = [regex]::Replace($formD, '\p{Mn}', '')
     return ([regex]::Replace($plain.ToLowerInvariant(), '[^\p{L}\p{Nd}]+', ' ').Trim() -replace '\s+', ' ')
@@ -3481,15 +3517,29 @@ function Search-TmdbType {
     }
 
     $matching = @{}
+    $matchingScores = @{}
     foreach ($candidate in @($candidateById.Values | Select-Object -First 6)) {
         $matched = $false
+        $bestScore = 0
         foreach ($candidateName in $candidate.names) {
             foreach ($variant in $Variants) {
                 $ok = if ($ExactTitle) { Test-TmdbExactTitle -InputTitle $variant -CandidateTitle ([string]$candidateName) }
                       else { Test-TmdbTitleName -InputTitle $variant -CandidateTitle ([string]$candidateName) }
-                if ($ok) { $matched = $true; break }
+                if ($ok) {
+                    $matched = $true
+                    # A release title can list several localized/alternate names
+                    # separated by slashes. Those aliases may independently find
+                    # unrelated works with short, generic names (e.g. "On Edge").
+                    # Rank a candidate by the length of the actual catalog name
+                    # that matches, with a small exact-match bonus; keep ties
+                    # ambiguous. This lets a specific canonical title outrank a
+                    # short incidental alias without guessing between equals.
+                    $candidateKey = Get-TmdbTitleKey ([string]$candidateName)
+                    $variantKey = Get-TmdbTitleKey ([string]$variant)
+                    $score = ($candidateKey.Length * 10) + $(if ($candidateKey -eq $variantKey) { 1 } else { 0 })
+                    if ($score -gt $bestScore) { $bestScore = $score }
+                }
             }
-            if ($matched) { break }
         }
         if (-not $matched) {
             $altPath = if ($Type -eq 'movie') { "movie/$($candidate.id)/alternative_titles" } else { "tv/$($candidate.id)/alternative_titles" }
@@ -3502,18 +3552,29 @@ function Search-TmdbType {
                     foreach ($variant in $Variants) {
                         $ok = if ($ExactTitle) { Test-TmdbExactTitle -InputTitle $variant -CandidateTitle $candidateName }
                               else { Test-TmdbTitleName -InputTitle $variant -CandidateTitle $candidateName }
-                        if ($ok) { $matched = $true; break }
+                        if ($ok) {
+                            $matched = $true
+                            $candidateKey = Get-TmdbTitleKey ([string]$candidateName)
+                            $variantKey = Get-TmdbTitleKey ([string]$variant)
+                            $score = ($candidateKey.Length * 10) + $(if ($candidateKey -eq $variantKey) { 1 } else { 0 })
+                            if ($score -gt $bestScore) { $bestScore = $score }
+                        }
                     }
-                    if ($matched) { break }
                 }
             } catch { }
         }
-        if ($matched) { $matching[$candidate.id] = $candidate }
+        if ($matched) {
+            $matching[$candidate.id] = $candidate
+            $matchingScores[$candidate.id] = $bestScore
+        }
     }
 
-    $status = if ($matching.Count -eq 1) { 'matched' } elseif ($matching.Count -gt 1) { 'ambiguous' } else { 'notfound' }
+    $topScore = 0
+    foreach ($score in $matchingScores.Values) { if ([int]$score -gt $topScore) { $topScore = [int]$score } }
+    $winners = @($matching.Keys | Where-Object { [int]$matchingScores[$_] -eq $topScore })
+    $status = if ($winners.Count -eq 1) { 'matched' } elseif ($winners.Count -gt 1) { 'ambiguous' } else { 'notfound' }
     if ($status -ne 'matched') { return [pscustomobject]@{ Status = $status; Id = ''; Name = '' } }
-    $winner = @($matching.Values)[0]
+    $winner = $matching[[string]$winners[0]]
     return [pscustomobject]@{ Status = 'matched'; Id = [string]$winner.id; Name = [string]$winner.name }
 }
 
@@ -3596,7 +3657,14 @@ function Get-TmdbIdentity {
             $age = 9999.0
             try { $age = ((Get-Date) - [datetime]$entry.checkedAt).TotalDays } catch { }
             $maxAge = if ([string]$entry.status -eq 'ambiguous') { 7 } else { 30 }
-            if ($age -le $maxAge) {
+            # An ambiguous result from before the specificity-ranking resolver
+            # is not authoritative: old cache entries can contain a short alias
+            # collision even though one longer catalog title is decisive.
+            $resolverVersion = 2
+            $cachedVersion = 0
+            try { $cachedVersion = [int](Get-PartValue -Parts $entry -Name 'resolverVersion') } catch { }
+            $oldAmbiguous = ([string]$entry.status -eq 'ambiguous' -and $cachedVersion -lt $resolverVersion)
+            if ($age -le $maxAge -and -not $oldAmbiguous) {
                 if ([string]$entry.status -eq 'notfound') { $last = $entry; continue }
                 return $entry
             }
@@ -3612,7 +3680,7 @@ function Get-TmdbIdentity {
 
         $result = [pscustomobject]@{
             status = $search.Status; type = $type; id = [string]$search.Id; name = [string]$search.Name; year = $planYear
-            seasons = 0; season = 0; corrected = $false
+            seasons = 0; season = 0; corrected = $false; resolverVersion = 2
             checkedAt = (Get-Date).ToString('o')
         }
         if ($result.status -eq 'matched' -and $type -eq 'tv' -and -not $Parts.IsSeries) {

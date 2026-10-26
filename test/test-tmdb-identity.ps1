@@ -35,6 +35,18 @@ $request = {
         if ($script:tmdbMode -eq 'movie-yearless') {
             return [pscustomobject]@{ results = @([pscustomobject]@{ id = 555; title = 'Some Indie Film'; original_title = 'Some Indie Film'; release_date = '' }) }
         }
+        if ($script:tmdbMode -eq 'alternate-titles') {
+            $queryMatch = [regex]::Match($uri, '[?&]query=([^&]+)')
+            $query = if ($queryMatch.Success) { [uri]::UnescapeDataString($queryMatch.Groups[1].Value) } else { '' }
+            $results = @()
+            if ($query -match '(?i)girl interrupted') {
+                $results += [pscustomobject]@{ id = 3558; title = 'Girl, Interrupted'; original_title = 'Girl, Interrupted'; release_date = '1999-12-21' }
+            }
+            if ($query -match '(?i)on edge') {
+                $results += [pscustomobject]@{ id = 108909; title = 'On Edge'; original_title = 'On Edge'; release_date = '1999-05-05' }
+            }
+            return [pscustomobject]@{ results = $results }
+        }
         return [pscustomobject]@{ results = @([pscustomobject]@{ id = 123; title = 'Mars One'; original_title = 'Mars One'; release_date = '2022-01-01' }) }
     }
     if ($uri -match '/search/tv') {
@@ -77,6 +89,53 @@ $firstCalls = $script:tmdbCalls
 $again = Get-TmdbIdentity -Parts $mars -Name 'Marte Um aka Mars One (2022) 720p WEB-DL' `
     -BearerToken 'test-token' -Cache $cache -Request $request -MaxLookups 8
 Check 'resolved identities are served from cache without more requests' ($again.id -eq '123' -and $script:tmdbCalls -eq $firstCalls)
+
+$script:tmdbMode = 'alternate-titles'
+Reset-TmdbBudget
+$prefixedMovie = Get-TitleParts -Name '1999 - Girl Interrupted - James Mangold'
+Check 'a year-prefixed release parses its actual film title instead of treating the year as the title' `
+    ($prefixedMovie.Title -like 'girl interrupted*' -and $prefixedMovie.Title -ne '1999' -and $prefixedMovie.Year -eq '1999')
+$prefixedIdentity = Get-TmdbIdentity -Parts $prefixedMovie -Name '1999 - Girl Interrupted - James Mangold' `
+    -BearerToken 'test-token' -Cache @{} -Request $request -MaxLookups 8
+Check 'the year-prefixed film resolves to the same TMDB work as its ordinary title' `
+    ($prefixedIdentity.status -eq 'matched' -and $prefixedIdentity.id -eq '3558')
+
+Reset-TmdbBudget
+$manyAliases = Get-TitleParts -Name 'Interrupted life / On edge / Girl with a shift / Girl, Interrupted (1999)'
+$aliasIdentity = Get-TmdbIdentity -Parts $manyAliases -Name 'Interrupted life / On edge / Girl with a shift / Girl, Interrupted (1999)' `
+    -BearerToken 'test-token' -Cache @{} -Request $request -MaxLookups 8
+Check 'a descriptive canonical title outranks a short incidental alternate-title hit, but ties remain ambiguous' `
+    ($aliasIdentity.status -eq 'matched' -and $aliasIdentity.id -eq '3558')
+$oldAmbiguousKey = 'movie|1999|' + ((Get-TmdbSearchVariants `
+    -Name 'Interrupted life / On edge / Girl with a shift / Girl, Interrupted (1999)' `
+    -ParsedTitle $manyAliases.Title | Sort-Object -Unique) -join '|')
+$oldAmbiguousCache = @{
+    $oldAmbiguousKey = [pscustomobject]@{ status='ambiguous'; type='movie'; id=''; name=''; year='1999'; checkedAt=(Get-Date).ToString('o') }
+}
+Reset-TmdbBudget
+$refreshedAmbiguous = Get-TmdbIdentity -Parts $manyAliases `
+    -Name 'Interrupted life / On edge / Girl with a shift / Girl, Interrupted (1999)' `
+    -BearerToken 'test-token' -Cache $oldAmbiguousCache -Request $request -MaxLookups 8
+Check 'a pre-ranking ambiguous cache entry is refreshed under the improved matcher' `
+    ($refreshedAmbiguous.status -eq 'matched' -and $refreshedAmbiguous.id -eq '3558' -and
+     $oldAmbiguousCache[$oldAmbiguousKey].resolverVersion -eq 2)
+
+$mojibakeName = 'Une.Vie.Vol' + [char]0x00C3 + [char]0x00A9 + 'e.(Girl.Interrupted).1999.Multi.Custom.1080p'
+$repairedParts = Get-TitleParts -Name $mojibakeName
+Check 'misdecoded UTF-8 accents are repaired before movie-title parsing' `
+    ($repairedParts.Title -eq ('une vie vol' + [char]0x00E9 + 'e girl interrupted') -and $repairedParts.Year -eq '1999')
+$mixedScript = 'CJK ' + [char]0x4E2D + ' Vol' + [char]0x00C3 + [char]0x00A9 + 'e'
+Check 'mojibake repair preserves non-Latin characters in mixed-language titles' `
+    ((Repair-Utf8Mojibake -Text $mixedScript) -ceq ('CJK ' + [char]0x4E2D + ' Vol' + [char]0x00E9 + 'e'))
+$localizedCache = @{
+    'movie|1999|une vie volee girl interrupted' = [pscustomobject]@{
+        status='matched'; id='3558'; type='movie'; name='Girl, Interrupted'; year='1999'
+        seasons=0; season=0; corrected=$false; checkedAt=(Get-Date).ToString('o')
+    }
+}
+$localizedIdentity = Get-TmdbIdentity -Parts $repairedParts -Name $mojibakeName -Cache $localizedCache -CacheOnly
+Check 'the repaired title reaches the existing localized-title TMDB cache entry' `
+    ($localizedIdentity.status -eq 'matched' -and $localizedIdentity.id -eq '3558')
 
 $script:tmdbMode = 'wrong-year'
 Reset-TmdbBudget
