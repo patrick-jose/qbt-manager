@@ -2735,6 +2735,76 @@ function Test-Claimed {
     }
     return $null
 }
+
+# A path can only be removed as data when no OTHER live torrent claims any part
+# of it. content_path is the per-torrent ownership boundary; save_path is shared
+# and is deliberately not used here. Overlapping paths are treated conservatively
+# because a parent/child relationship can still refer to the same payload.
+function Test-OtherTorrentClaimsPath {
+    param(
+        [string]$Path,
+        [object[]]$Torrents,
+        [string]$ExcludeHash = ''
+    )
+
+    foreach ($torrent in @($Torrents)) {
+        if (-not $torrent -or [string]::IsNullOrWhiteSpace([string]$torrent.content_path)) { continue }
+        if ($ExcludeHash -and [string]$torrent.hash -eq $ExcludeHash) { continue }
+        $owner = Test-Claimed -Path $Path -Torrents @($torrent)
+        if ($owner) { return $owner }
+    }
+    return $null
+}
+
+# Exclude one already-duplicated file from a retained torrent without leaving
+# qBittorrent believing that the file is still wanted. Only a uniquely mapped
+# file with an API index can be skipped; ambiguous mappings are a no-op.
+function Set-TorrentFilePriorityVerified {
+    param(
+        [object]$Torrent,
+        [string]$Path,
+        [int]$Priority = 0
+    )
+
+    if (-not $Torrent -or [string]::IsNullOrWhiteSpace([string]$Torrent.hash) -or
+        [string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+    $resolveMatch = {
+        param([object[]]$Files, [string]$WantedPath)
+        $matches = @()
+        foreach ($file in @($Files)) {
+            if ($null -eq $file.PSObject.Properties['index'] -or
+                $null -eq $file.PSObject.Properties['priority'] -or
+                [string]::IsNullOrWhiteSpace([string]$file.name)) { continue }
+            $fileIndex = 0
+            $filePriority = 0
+            if (-not [int]::TryParse([string]$file.index, [ref]$fileIndex) -or $fileIndex -lt 0 -or
+                -not [int]::TryParse([string]$file.priority, [ref]$filePriority)) { continue }
+            try { $resolved = Resolve-TorrentFilePath -T $Torrent -Name ([string]$file.name) }
+            catch { continue }
+            if ($resolved.Equals($WantedPath, [StringComparison]::OrdinalIgnoreCase)) { $matches += $file }
+        }
+        return $matches
+    }.GetNewClosure()
+
+    $files = @(Invoke-ApiGet -Endpoint ("torrents/files?hash={0}" -f [string]$Torrent.hash))
+    $match = @(& $resolveMatch $files $Path)
+    if ($match.Count -ne 1) { return $false }
+    if ([int]$match[0].priority -ne $Priority) {
+        Invoke-ApiPost -Endpoint 'torrents/filePrio' -Fields @{
+            hash = [string]$Torrent.hash
+            id = [string]$match[0].index
+            priority = [string]$Priority
+        }
+    }
+
+    # The POST endpoint does not return a result body. Confirm the setting from
+    # qBittorrent before unlinking bytes it still tracks.
+    $verified = @(Invoke-ApiGet -Endpoint ("torrents/files?hash={0}" -f [string]$Torrent.hash))
+    $after = @(& $resolveMatch $verified $Path)
+    return ($after.Count -eq 1 -and [int]$after[0].priority -eq $Priority)
+}
+
 # Has this torrent's data actually arrived under the library folder? The one
 # question the library rule is allowed to believe. A 200 from setLocation says
 # the move was QUEUED, not that it happened: on this box setLocation answered
@@ -5224,6 +5294,15 @@ function Remove-Torrent {
     }
 
     $wantFiles = if ($null -ne $DeleteFiles) { [bool]$DeleteFiles } else { [bool]$cfg.deleteDataFiles }
+    if ($wantFiles) {
+        $otherOwner = Test-OtherTorrentClaimsPath -Path ([string]$T.content_path) `
+            -Torrents @($script:allTorrents) -ExcludeHash ([string]$T.hash)
+        if ($otherOwner) {
+            $wantFiles = $false
+            Write-Log 'WARN' ("preserving data for '{0}': overlapping content_path is also claimed by '{1}' [{2}]" -f `
+                $T.name, $otherOwner.name, ([string]$otherOwner.hash).Substring(0, [Math]::Min(8, ([string]$otherOwner.hash).Length)))
+        }
+    }
     $deleteFiles = 'false'
     if ($wantFiles) { $deleteFiles = 'true' }
 
@@ -5674,6 +5753,7 @@ Write-Host ''
 # anything unforeseen.
 try {
     $all = @(Invoke-ApiGet -Endpoint 'torrents/info')
+    $script:allTorrents = $all
 } catch {
     Write-Log 'ERROR' "unexpected failure reading torrents: $($_.Exception.Message)"
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
@@ -6661,6 +6741,18 @@ else {
             Write-Host ("          {0}" -f $d.Reason) -ForegroundColor DarkGray
         }
 
+        # Do not stop a torrent if the proposed direct unlink cannot proceed
+        # without invalidating its tracked data. The ownership check is repeated
+        # just before Remove-Item below to narrow the add-torrent race as well.
+        if ($d.Action -ne 'delete-file-only' -and -not $d.Owner) {
+            $fileOwner = Test-OtherTorrentClaimsPath -Path $d.File -Torrents @($all)
+            if ($fileOwner) {
+                Write-Log 'WARN' ("preserving duplicate file {0}: it is still claimed by torrent '{1}' [{2}]" -f `
+                    $d.File, $fileOwner.name, ([string]$fileOwner.hash).Substring(0, [Math]::Min(8, ([string]$fileOwner.hash).Length)))
+                continue
+            }
+        }
+
         # Both sides are stopped before anything is removed: the duplicate, and the
         # larger copy it loses to. The survivor is left STOPPED and never
         # restarted - same discipline as the pack-vs-single pass in rule 4, and
@@ -6686,10 +6778,19 @@ else {
         # the pack's other - usually wanted, sometimes unique - episodes with it.
         # So only the file goes, by path, and the entry is left stopped as it was.
         if ($d.Action -eq 'delete-file-only') {
+            $fileOwners = @($all | Where-Object { Test-Claimed -Path $d.File -Torrents @($_) })
+            if ($fileOwners.Count -ne 1) {
+                Write-Log 'WARN' ("preserving duplicate file {0}: expected one owning torrent, found {1}" -f $d.File, $fileOwners.Count)
+                continue
+            }
+            if (-not (Set-TorrentFilePriorityVerified -Torrent $fileOwners[0] -Path $d.File -Priority 0)) {
+                Write-Log 'WARN' ("preserving duplicate file {0}: qBittorrent did not confirm that the owning torrent skips it" -f $d.File)
+                continue
+            }
             try {
                 Remove-Item -LiteralPath $d.File -Force -ErrorAction Stop
                 [void]$script:actions.Add("DELETED FILE  $($d.File) - $($d.Reason)")
-                Write-Log 'DELETE' "$($d.File) - $($d.Reason) (pack entry kept: it still holds other episodes)"
+                Write-Log 'DELETE' "$($d.File) - $($d.Reason) (file priority set to Do Not Download; pack entry kept)"
             }
             catch {
                 Write-Log 'WARN' "could not delete duplicate file $($d.File): $($_.Exception.Message)"
@@ -6714,6 +6815,12 @@ else {
         else {
             # No torrent claims it, so there is nothing to ask qBittorrent to
             # remove. The file is deleted directly, and says so in the log.
+            $fileOwner = Test-OtherTorrentClaimsPath -Path $d.File -Torrents @($all)
+            if ($fileOwner) {
+                Write-Log 'WARN' ("preserving duplicate file {0}: it is still claimed by torrent '{1}' [{2}]" -f `
+                    $d.File, $fileOwner.name, ([string]$fileOwner.hash).Substring(0, [Math]::Min(8, ([string]$fileOwner.hash).Length)))
+                continue
+            }
             try {
                 Remove-Item -LiteralPath $d.File -Force -ErrorAction Stop
                 [void]$script:actions.Add("DELETED FILE  $($d.File) - $($d.Reason)")

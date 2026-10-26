@@ -11,6 +11,20 @@ function Check { param($Name, $Ok) if ($Ok) { "[PASS] $Name" } else { $script:fa
 function Test-AlreadyGone { param($T) $script:gone.ContainsKey($T.hash) }
 function Test-Errored { param($T) $false }
 function Test-Claimed { param($Path, $Torrents) if ($Path -eq $Torrents[0].content_path) { $Torrents[0] } }
+function Test-OtherTorrentClaimsPath {
+    param($Path, $Torrents, $ExcludeHash = '')
+    foreach ($torrent in @($Torrents)) {
+        if ($ExcludeHash -and $torrent.hash -eq $ExcludeHash) { continue }
+        $owner = Test-Claimed -Path $Path -Torrents @($torrent)
+        if ($owner) { return $owner }
+    }
+    return $null
+}
+function Set-TorrentFilePriorityVerified {
+    param($Torrent, $Path, $Priority = 0)
+    $script:fileSkipCalls += ,([pscustomobject]@{ Hash = $Torrent.hash; Path = $Path; Priority = $Priority })
+    return $script:fileSkipConfirmed
+}
 function Stop-TorrentAndConfirm {
     param($T)
     [void]$script:stops.Add($T.hash)
@@ -68,13 +82,15 @@ try {
     $file = Join-Path $base 'duplicate.mkv'
     foreach ($action in 'delete-file-only', 'delete') {
         [IO.File]::WriteAllText($file, 'tiny fixture')
-        $all = @((CopyOf 'keeper' 100 1), (CopyOf 'pack' 50 1))
+        $packPath = if ($action -eq 'delete-file-only') { $file } else { '' }
+        $all = @((CopyOf 'keeper' 100 1), (CopyOf 'pack' 50 1 $packPath))
         $libDupes = @([pscustomobject]@{
             Action = $action; Owner = $null; OwnerHash = ''; File = $file
             Episode = '1-E1'; Reason = 'synthetic duplicate'; KeeperHashes = @('keeper')
             StopHashes = @('keeper', 'pack')
         })
         $script:actions = New-Object Collections.ArrayList
+        $script:fileSkipCalls = @(); $script:fileSkipConfirmed = $true
         $DryRun = $true
         Invoke-Expression $loop.Extent.Text
         Check "$action dry run leaves duplicate bytes intact" (Test-Path -LiteralPath $file)
@@ -88,7 +104,28 @@ try {
         Invoke-Expression $loop.Extent.Text
         Check "$action confirmed stops permit removal" (-not (Test-Path -LiteralPath $file))
         Check "$action stops both keeper and duplicate owner" ($script:stops -contains 'keeper' -and $script:stops -contains 'pack')
+        if ($action -eq 'delete-file-only') {
+            Check 'pack episode is marked Do Not Download before unlink' `
+                ($script:fileSkipCalls.Count -eq 1 -and $script:fileSkipCalls[0].Hash -eq 'pack' -and $script:fileSkipCalls[0].Priority -eq 0)
+        }
     }
+
+    [IO.File]::WriteAllText($file, 'torrent-owned bytes')
+    $all = @((CopyOf 'pack' 50 1 $file))
+    $libDupes = @([pscustomobject]@{
+        Action = 'delete-file-only'; Owner = $null; OwnerHash = ''; File = $file
+        Episode = '1-E1'; Reason = 'duplicate inside retained pack'; KeeperHashes = @()
+        StopHashes = @('pack')
+    })
+    $script:actions = New-Object Collections.ArrayList
+    $DryRun = $false; $script:stopFailure = ''; $script:fileSkipCalls = @(); $script:fileSkipConfirmed = $false
+    Invoke-Expression $loop.Extent.Text
+    Check 'unconfirmed skip setting preserves the duplicate file' (Test-Path -LiteralPath $file)
+    Check 'unconfirmed skip setting prevents the unlink' ($script:fileSkipCalls.Count -eq 1)
+
+    $script:fileSkipConfirmed = $true
+    Invoke-Expression $loop.Extent.Text
+    Check 'confirmed skip setting permits removing the smaller episode' (-not (Test-Path -LiteralPath $file))
 }
 finally { Remove-Item -LiteralPath $base -Recurse -Force }
 if ($script:fails) { exit 1 }

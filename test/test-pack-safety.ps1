@@ -311,7 +311,7 @@ for ($k = $callAt; $k -lt $callAt + 140; $k++) {
 Check 'the panel branch was located'       ($panelAt -gt 0)
 Check 'the removal was located'            ($removeAt -gt $panelAt)
 $panelBlock = ($runBody[$panelAt..($removeAt - 1)]) -join "`n"
-$panelOnly = ($panelBlock -split '# Both sides are stopped')[0]
+$panelOnly = ($panelBlock -split '# Do not stop a torrent')[0]
 Check 'the panel itself does NOT skip deletion' (-not ($panelOnly -cmatch '(?m)^\s*continue\s*$'))
 Write-Host '  a `continue` between the panel and the removal skips the removal.'
 

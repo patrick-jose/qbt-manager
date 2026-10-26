@@ -44,6 +44,14 @@ $de = $src.IndexOf('function Get-DoviHit')
 if ($ds -lt 0 -or $de -le $ds) { throw 'could not locate the detection block' }
 Invoke-Expression $src.Substring($ds, $de - $ds)
 
+# The central delete-files safeguard uses the same path-ownership helper as the
+# library cleanup rule. Load it here because this suite extracts Remove-Torrent
+# separately from the top-level detection helpers.
+$os = $src.IndexOf('function Test-Claimed {')
+$oe = $src.IndexOf('# Has this torrent''s data actually arrived', $os)
+if ($os -lt 0 -or $oe -le $os) { throw 'could not locate torrent path ownership helpers' }
+Invoke-Expression $src.Substring($os, $oe - $os)
+
 # Get-IncomingBetterVerdict, the guard that keeps a finished entry when a bigger
 # copy is still downloading. It lives in the actions region but BEFORE
 # Remove-Torrent, so the slice above misses it - and the first version of these
@@ -60,6 +68,7 @@ $cfg = [pscustomobject]@{ deleteDataFiles = $true }
 $script:actions = New-Object System.Collections.ArrayList
 $script:notes   = New-Object System.Collections.ArrayList
 $script:gone    = @{}
+$script:allTorrents = @()
 $script:posted  = New-Object System.Collections.ArrayList
 $script:logged  = New-Object System.Collections.ArrayList
 function Write-Log { param([string]$Level, [string]$Message) $script:logged += "$Level $Message" }
