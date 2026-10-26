@@ -527,18 +527,6 @@ function Get-DedupVerdicts {
                     if ((Get-Prop $m 'size') -le 0) { continue }
                     if ((Get-Prop $m 'size') -le 0) { continue }
                     
-                    # Bigger than the keeper: left alone, UNLESS it is an unfinished
-                    # copy that is not MEANINGFULLY bigger - the same tolerance the
-                    # manager applies, read from the same config key.
-                    #
-                    # A FINISHED copy bigger than the keeper IS the keeper, so the
-                    # tolerance can only ever reach an unfinished one.
-                    #
-                    # Mirrored from qbt-manager.ps1 on purpose. Left at a strict
-                    # '>=', this copy previews three downloads of one episode as
-                    # clean while the scheduled run deletes them - the panel lying
-                    # about the run, which is the same failure as the drain printing
-                    # 'witness at position 0' when there was no witness at all.
                     $gap = ''
                     if ((Get-Prop $m 'size') -gt (Get-Prop $keeper 'size') -or
                         ((Get-Prop $m 'size') -eq (Get-Prop $keeper 'size') -and (Get-Prop $m 'progress') -lt 1)) {
@@ -549,19 +537,8 @@ function Get-DedupVerdicts {
                         $gap = (" - only {0:N2}% bigger, inside the {1:N0}% tolerance" -f ($over * 100), $TolerancePercent)
                     }
                     else {
-                        # NO errored guard here, and that is deliberate and must stay in
-                        # step with the manager.
-                        #
-                        # Elsewhere an errored torrent is protected. Here it is not,
-                        # because $k is Resolve-SetKey - the keeper holds the
-                        # IDENTICAL episodes and is FINISHED - so an errored member of
-                        # this group is a spare copy that failed, not lost data.
-                        #
-                        # The guard belongs on the DoVi / disc-rip path (an unconditional
-                        # rule that never established anything better existed) and on the
-                        # pack-vs-single path (which requires BOTH sides complete, so an
-                        # errored single is skipped there anyway). This set-level
-                        # comparison is the one place the manager passes -AllowErrored.
+                        # This exact-set comparison has positively identified the
+                        # finished keeper, so errored duplicates are removable too.
                         $why = if ((Get-Prop $m 'progress') -ge 1 -and (Get-Prop $m 'size') -eq (Get-Prop $keeper 'size')) { 'equal-size completed duplicate' }
                                elseif ((Get-Prop $m 'progress') -ge 1) { 'smaller completed version' }
                                elseif (Test-Errored $m) { 'errored, and the same episodes are already finished elsewhere' }
@@ -570,7 +547,7 @@ function Get-DedupVerdicts {
                     $verdicts[$m.hash] = [pscustomobject]@{
                         Verdict = 'DELETE'; Rule = 'dedup'
                           Reason  = ("{0}{1} of '{2}' ({3}); '{4}' is finished at {5:N2} GB against {6:N2} GB" -f `
-                                     $why, $gap, $label, $k, $keeper.name,
+                                     $why, $gap, $label, $k, (Get-Prop $keeper 'name'),
                                    ((Get-Prop $keeper 'size') / $GB), ((Get-Prop $m 'size') / $GB))
                     }
                 }
@@ -896,21 +873,21 @@ function Get-StalledDays {
     return [double]$p
 }
 
-# The manager's own stalled table, read fresh so the countdowns shown here are
-# the same ones it will act on. Get-StalledWatch updates the object it is given
-# as it goes, which is how the manager accumulates history between runs; this is
-# an in-memory copy that is discarded when the snapshot ends, so watching can
-# never advance the manager's clocks.
+# The manager's own state, read fresh so the countdowns and outage pause shown
+# here are the same ones it will act on. The preview mutates only this in-memory
+# copy, so watching can never advance or persist the manager's clocks.
 function Get-StalledTable {
-    $table = [pscustomobject]@{}
-    if (-not (Test-Path -LiteralPath $statePath)) { return $table }
+    $empty = [pscustomobject]@{ stalled = [pscustomobject]@{} }
+    if (-not (Test-Path -LiteralPath $statePath)) { return $empty }
     try {
         $state = [System.IO.File]::ReadAllText($statePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-        $p = $state.PSObject.Properties['stalled']
-        if ($null -ne $p) { return $p.Value }
+        if (-not $state.PSObject.Properties['stalled']) {
+            $state | Add-Member -NotePropertyName 'stalled' -NotePropertyValue ([pscustomobject]@{})
+        }
+        return $state
     }
     catch { }
-    return $table
+    return $empty
 }
 
 # ---- log parsing -----------------------------------------------------------
@@ -1228,7 +1205,14 @@ function Show-Snapshot {
         Write-Host '  unknown while the API is down' -ForegroundColor DarkGray
     }
     else {
-        $rows = @(Get-StalledWatch -Torrents $torrents -Stalled (Get-StalledTable) -Now (Get-Date))
+        $stalledState = Get-StalledTable
+        $stalledProbeUrl = [string](Get-Prop $cfg 'stallInternetProbeUrl' 'https://www.cloudflare.com/cdn-cgi/trace')
+        $internetUp = Test-InternetReachable -Url $stalledProbeUrl
+        $paused = Update-StalledInternetPause -State $stalledState -Now (Get-Date) -InternetReachable $internetUp
+        if ($paused) {
+            Write-Host '  internet unavailable; inactive-torrent removals are on hold and their clocks are paused' -ForegroundColor Yellow
+        }
+        $rows = @(Get-StalledWatch -Torrents $torrents -Stalled $stalledState.stalled -Now (Get-Date))
         if ($rows.Count -eq 0) {
             Write-Host '  nothing incomplete to judge' -ForegroundColor DarkGray
         }

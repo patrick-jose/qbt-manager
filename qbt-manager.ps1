@@ -972,6 +972,25 @@ function Get-EpisodeSetKey {
     return "$s-E$($Parts.Episode)"
 }
 
+function Test-PackContainsEpisode {
+    param([object]$PackParts, [Nullable[int]]$Episode)
+
+    if (-not $PackParts -or $null -eq $Episode -or $Episode -le 0) { return $false }
+    if ($PackParts.IsMultiEpisode) {
+        return ($null -ne $PackParts.EpisodeLast -and
+                $Episode -ge $PackParts.Episode -and
+                $Episode -le $PackParts.EpisodeLast)
+    }
+    # Episode 0 represents a whole-season pack: it has no numeric upper bound
+    # in the release name. The pack's own file list is checked before deletion.
+    return ($PackParts.Episode -eq 0)
+}
+
+function Test-PackEpisodeOutweighsSingle {
+    param([long]$PackEpisodeBytes, [long]$SingleTotalBytes)
+    return ($PackEpisodeBytes -gt $SingleTotalBytes)
+}
+
 # The episode set a release REALLY holds, read from its own file list. Returns
 # '' whenever the files cannot say, and '' always means "no opinion" - never a
 # wildcard.
@@ -996,8 +1015,9 @@ function Get-EpisodeSetKey {
 # Every refusal returns '' and the caller keeps the name it read, which is the
 # safe direction: S<n>-ALL only ever meets S<n>-ALL, which is today's behaviour.
 #
-#   - every file must place itself by an S..E token in its own NAME, and not in
-#     the folders above it, or there is no opinion;
+#   - every video file must place itself by an S..E token in its own NAME, and
+#     not in the folders above it, or there is no opinion; known sidecars do not
+#     determine episode coverage;
 #   - the run must not span seasons;
 #   - the run must not skip an episode, because a range is the only shape
 #     Get-EpisodeSetKey can compare and 'E01 E02 E04' is not a range;
@@ -1013,6 +1033,8 @@ function Get-EpisodeSetFromFiles {
 
     $season = $null
     $eps = New-Object System.Collections.Generic.HashSet[int]
+    $videoExtensions = @('.mkv', '.mp4', '.m4v', '.mov', '.ts', '.m2ts', '.avi', '.webm', '.mpg', '.mpeg')
+    $sidecarExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.nfo', '.txt', '.html', '.htm', '.pdf', '.jpg', '.jpeg', '.png', '.gif', '.sfv', '.url')
 
     foreach ($f in $list) {
         $path = [string]$f.name
@@ -1025,6 +1047,10 @@ function Get-EpisodeSetFromFiles {
         $cut = $path.LastIndexOfAny([char[]]@('/', '\'))
         if ($cut -ge 0) { $leaf = $path.Substring($cut + 1) }
 
+        $extension = [IO.Path]::GetExtension($leaf).ToLowerInvariant()
+        if ($extension -in $sidecarExtensions) { continue }
+        if ($extension -notin $videoExtensions) { return '' }
+
         # The tail carries (?!\d) so it must be the WHOLE number that follows.
         # Without it .NET backtracks: on 'Show.S03E01-720p.mkv' the two-digit
         # tail matches '-72', reads it as episode 72, and the file is believed to
@@ -1032,7 +1058,16 @@ function Get-EpisodeSetFromFiles {
         # the same show and let it be deleted as a duplicate of it.
         $ms = [regex]::Matches($leaf,
             '(?i)S(\d{1,3})[ ._-]?E(\d{1,3})(?:-(0?\d{1,2})(?!\d)|\.E(0?\d{1,2})(?!\d))?')
-        if ($ms.Count -eq 0) { return '' }
+        if ($ms.Count -eq 0) {
+            # A torrent may include tiny uploader promo/sample clips beside the
+            # actual episodes. Ignore only a known-sized clip <=100 MB; a normal
+            # sized unnumbered video remains ambiguous and refuses the set key.
+            $fileSize = $null
+            if ($null -ne $f.PSObject.Properties['size']) { $fileSize = [long]$f.size }
+            if ($extension -in $videoExtensions -and $null -ne $fileSize -and
+                $fileSize -gt 0 -and $fileSize -le 100MB) { continue }
+            return ''
+        }
 
         # A dash and digits that the tail could not take is not an episode range
         # at all - it is the resolution, as in 'S03E01-720p'. Reading that as a
@@ -1204,6 +1239,23 @@ function Get-ShowLabel {
     return $show
 }
 
+function Get-FamilyKeyWord {
+    <#
+        The first word of a show name is used to keep different shows apart.
+        But a leading article ('The', 'A', 'An') is not a show name - it is
+        grammar. Keying on it put every 'The X' show in one family ('the'), so
+        'The Office' and 'The Bear' ended up merged under a single label.
+    #>
+    param([string]$ShowName)
+    if ([string]::IsNullOrWhiteSpace($ShowName)) { return '' }
+    foreach ($word in @($ShowName -split ' ' | Where-Object { $_ })) {
+        if ($word -notin @('the', 'a', 'an')) { return $word }
+    }
+    $words = @($ShowName -split ' ' | Where-Object { $_ })
+    if ($words.Count -gt 0) { return $words[0] }
+    return ''
+}
+
 function Set-FamilyLabels {
     <#
         DISPLAY ONLY. Stamp every member of every series cluster with one
@@ -1262,7 +1314,7 @@ function Set-FamilyLabels {
         $tokenLists = @()
         foreach ($m in $list[$i]) { $tokenLists += , @($m.parts.Tokens) }
         $show[$i] = Get-CommonRun -TokenLists $tokenLists
-        if ($show[$i]) { $familyKey[$i] = @($show[$i] -split ' ')[0] }
+        if ($show[$i]) { $familyKey[$i] = Get-FamilyKeyWord $show[$i] }
     }
 
     # The same lost-apostrophe repair the merge pass performs, under the same
@@ -1293,7 +1345,7 @@ function Set-FamilyLabels {
     for ($i = 0; $i -lt $count; $i++) {
         if (-not $show[$i]) { continue }
         $f = $familyKey[$i]
-        if (-not $f) { $f = @($show[$i] -split ' ')[0] }
+        if (-not $f) { $f = Get-FamilyKeyWord $show[$i] }
         if (-not $family.ContainsKey($f)) { $family[$f] = New-Object System.Collections.ArrayList }
         [void]$family[$f].Add($i)
     }
@@ -1318,7 +1370,7 @@ function Set-FamilyLabels {
     for ($i = 0; $i -lt $count; $i++) {
         if (-not $show[$i]) { continue }
         $f = $familyKey[$i]
-        if (-not $f) { $f = @($show[$i] -split ' ')[0] }
+        if (-not $f) { $f = Get-FamilyKeyWord $show[$i] }
         if (-not $familyLabel.ContainsKey($f)) { continue }
         foreach ($m in $list[$i]) {
             Add-Member -InputObject $m -NotePropertyName 'showLabel' -NotePropertyValue $familyLabel[$f] -Force
@@ -1403,7 +1455,7 @@ function Get-ClusterFamilies {
         $parts = $Clusters[$i][0].parts
         $tmdbId = [string](Get-PartValue -Parts $parts -Name 'TmdbId')
         if ((Get-PartValue -Parts $parts -Name 'TmdbType') -eq 'tv' -and $tmdbId) { $fam[$i] = 'tmdb:' + $tmdbId }
-        else { $fam[$i] = @($show[$i] -split ' ')[0] }
+        else { $fam[$i] = Get-FamilyKeyWord $show[$i] }
     }
     return [pscustomobject]@{ Show = $show; Family = $fam }
 }
@@ -1795,6 +1847,49 @@ function Get-DiscRipHit {
 function Test-AlreadyGone {
     param([object]$T)
     return $script:gone.ContainsKey($T.hash)
+}
+
+function Update-StalledInternetPause {
+    param(
+        [object]$State,
+        [datetime]$Now,
+        [bool]$InternetReachable
+    )
+
+    if ($null -eq $State) { return $false }
+    if (-not $State.PSObject.Properties['stalled']) {
+        $State | Add-Member -NotePropertyName 'stalled' -NotePropertyValue ([pscustomobject]@{})
+    }
+    $pauseProp = $State.PSObject.Properties['stalledInternetDownSince']
+
+    if (-not $InternetReachable) {
+        if ($null -eq $pauseProp -or -not $pauseProp.Value) {
+            $State | Add-Member -NotePropertyName 'stalledInternetDownSince' -NotePropertyValue $Now.ToString('o') -Force
+        }
+        return $true
+    }
+
+    if ($null -ne $pauseProp -and $pauseProp.Value) {
+        $downSince = $null
+        try { $downSince = [datetime]::Parse([string]$pauseProp.Value) } catch { $downSince = $null }
+        if ($null -ne $downSince) {
+            $pausedFor = $Now - $downSince
+            if ($pausedFor.TotalSeconds -gt 0) {
+                # Exclude the outage from every tracked inactivity clock. Without
+                # this shift, the first online run would immediately expire torrents
+                # merely because the connection had been down.
+                foreach ($entry in @($State.stalled.PSObject.Properties)) {
+                    try {
+                        $last = [datetime]::Parse([string]$entry.Value.lastProgressAt)
+                        $entry.Value.lastProgressAt = $last.Add($pausedFor).ToString('o')
+                    } catch { }
+                }
+            }
+        }
+        $State.PSObject.Properties.Remove('stalledInternetDownSince')
+    }
+
+    return $false
 }
 
 function Get-StalledWatch {
@@ -3024,6 +3119,11 @@ function Test-TmdbTitleName {
     if (-not $inputKey -or -not $candidateKey) { return $false }
     if ($inputKey -eq $candidateKey) { return $true }
     $candidateWords = @($candidateKey -split ' ' | Where-Object { $_ })
+    # Single-word show name (e.g. "From"): accept when it appears as a whole
+    # word in the input. TMDB's uniqueness check is what keeps this safe.
+    if ($candidateWords.Count -eq 1) {
+        return (' ' + $inputKey + ' ').Contains(' ' + $candidateKey + ' ')
+    }
     if ($candidateWords.Count -lt 2) { return $false }
     return (' ' + $inputKey + ' ').Contains(' ' + $candidateKey + ' ')
 }
@@ -3174,9 +3274,6 @@ function Get-TmdbIdentity {
     $parserType = if ($Parts.IsSeries) { 'tv' } else { 'movie' }
     $year = [string]$Parts.Year
     $hasYear = $year -match '^\d{4}$'
-    # A series is recognised by its markers; without a year there is nothing to
-    # hold a TV result to, and re-typing is never allowed in this direction.
-    if ($parserType -eq 'tv' -and -not $hasYear) { return $null }
 
     $variants = @(Get-TmdbSearchVariants -Name $Name -ParsedTitle ([string]$Parts.Title))
     if ($variants.Count -eq 0) { $variants = @((Get-TmdbTitleKey ([string]$Parts.Title))) }
@@ -3192,17 +3289,27 @@ function Get-TmdbIdentity {
 
     $plans = New-Object System.Collections.ArrayList
     if ($parserType -eq 'tv') {
-        [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $false })
+        if ($hasYear) {
+            [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $false; Year = $year })
+            # A release year for a TV show is often the season year, not the
+            # premiere year; if the filtered search misses, retry without it.
+            [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $false; Year = '' })
+        } else {
+            [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $false; Year = '' })
+        }
     } else {
         # A yearless film is checked as a film first, by identical title, so an
         # existing movie keeps it a film. TV is asked next because that is the
         # only way a marker-less show can be recognised at all.
-        [void]$plans.Add([pscustomobject]@{ Type = 'movie'; Exact = (-not $hasYear) })
-        # TV matching uses containment, not only equality: a release named
-        # 'South Park America (1997) S29E01' still contains 'South Park', and
-        # TMDB returned that show and nothing else, so it is the same work with
-        # extra words in the release name. Exact matching would leave it a film.
-        [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $false })
+        # For a film with a year, we do NOT retry without year - a wrong-year
+        # match would be incorrect. Only a yearless film retries without year.
+        if ($hasYear) {
+            [void]$plans.Add([pscustomobject]@{ Type = 'movie'; Exact = (-not $hasYear); Year = $year })
+            [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $false; Year = $year })
+        } else {
+            [void]$plans.Add([pscustomobject]@{ Type = 'movie'; Exact = $true; Year = '' })
+            [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $false; Year = '' })
+        }
     }
 
     $lookupVar = Get-Variable -Name 'tmdbNewLookupCount' -Scope Script -ErrorAction SilentlyContinue
@@ -3215,7 +3322,8 @@ function Get-TmdbIdentity {
 
     foreach ($plan in $plans) {
         $type = [string]$plan.Type
-        $cacheKey = '{0}|{1}|{2}' -f $type, $year, $variantKey
+        $planYear = [string]$plan.Year
+        $cacheKey = '{0}|{1}|{2}' -f $type, $planYear, $variantKey
         if ($null -ne $Cache -and $Cache.ContainsKey($cacheKey)) {
             $entry = $Cache[$cacheKey]
             $age = 9999.0
@@ -3230,12 +3338,13 @@ function Get-TmdbIdentity {
         if ($script:tmdbNewLookupCount -ge $MaxLookups -or $script:tmdbRequestCount -ge $MaxRequests) { return $null }
         $script:tmdbNewLookupCount++
 
-        $search = Search-TmdbType -Type $type -Year $(if ($hasYear) { $year } else { '' }) `
+        $planYear = [string]$plan.Year
+        $search = Search-TmdbType -Type $type -Year $planYear `
             -Variants $variants -Request $Request -Base $base -MaxRequests $MaxRequests -ExactTitle ([bool]$plan.Exact)
         if ($null -eq $search) { return $null }
 
         $result = [pscustomobject]@{
-            status = $search.Status; type = $type; id = [string]$search.Id; name = [string]$search.Name; year = $year
+            status = $search.Status; type = $type; id = [string]$search.Id; name = [string]$search.Name; year = $planYear
             seasons = 0; season = 0; corrected = $false
             checkedAt = (Get-Date).ToString('o')
         }
@@ -4994,12 +5103,10 @@ function Remove-Torrent {
         # nullable value type parameter is easy to coerce into $false by
         # accident, and the failure would be silent data left on disk.
         [object]$DeleteFiles = $null,
-        # Escape hatch, used by exactly ONE rule: dedup's set-level comparison.
-        # An errored torrent is deleted there only when a FINISHED torrent of the
-        # IDENTICAL episode set is bigger - pack against pack of the same range, or
-        # the same episode against itself - so nothing unique is lost. See the
-        # comment at that call site. It exists so that "protected" stays a decision
-        # someone makes on purpose rather than a wall.
+        # Escape hatch for dedup comparisons that have positively established a
+        # finished, larger copy of the identical content: set-level comparison or
+        # the pack-vs-single check against that episode's measured file. See those
+        # call sites. It exists so that "protected" stays a deliberate decision.
         [switch]$AllowErrored,
         # The rule has ESTABLISHED that a better copy of this content exists -
         # a finished torrent it compared against, or a file in the library - rather
@@ -6010,8 +6117,16 @@ if ($cfg.PSObject.Properties['stalledDeleteDays'] -and [double]$cfg.stalledDelet
         $state | Add-Member -NotePropertyName 'stalled' -NotePropertyValue ([pscustomobject]@{})
     }
 
+    $stalledProbeUrl = 'https://www.cloudflare.com/cdn-cgi/trace'
+    if ($cfg.PSObject.Properties['stallInternetProbeUrl']) { $stalledProbeUrl = [string]$cfg.stallInternetProbeUrl }
+    $stalledInternetUp = Test-InternetReachable -Url $stalledProbeUrl
+    $stalledInternetPaused = Update-StalledInternetPause -State $state -Now $now -InternetReachable $stalledInternetUp
+
     Write-Host ''
     Write-Host "Stalled check (no new data for $([int]$cfg.stalledDeleteDays) day(s))"
+    if ($stalledInternetPaused) {
+        Write-Host '  internet unavailable; inactive-torrent removals are on hold and their clocks are paused' -ForegroundColor Yellow
+    }
     $stalledRows = @(Get-StalledWatch -Torrents $live -Stalled $state.stalled -Now $now)
 
     if ($stalledRows.Count -eq 0) {
@@ -6020,7 +6135,7 @@ if ($cfg.PSObject.Properties['stalledDeleteDays'] -and [double]$cfg.stalledDelet
 
     foreach ($r in $stalledRows) {
         $short = $r.Name.Substring(0, [Math]::Min(46, $r.Name.Length))
-        if ($r.WillDelete) {
+        if ($r.WillDelete -and -not $stalledInternetPaused) {
             # Partial data from a torrent that has not moved in a week is dead
             # weight on the disk, so this rule removes the files too. That is the
             # same orphan growth that filled Downloads\temp before, and leaving
@@ -6028,6 +6143,10 @@ if ($cfg.PSObject.Properties['stalledDeleteDays'] -and [double]$cfg.stalledDelet
             Remove-Torrent -T $r.Torrent -DeleteFiles $true -Reason (
                 "no data received for {0:N1} day(s), stuck at {1:N2} GB of {2:N2} GB (state {3})" -f
                 $r.IdleDays, ($r.Completed / 1GB), ($r.Total / 1GB), $r.State)
+        }
+        elseif ($r.WillDelete) {
+            Write-Host ("  HOLD     {0,-46}  {1,6:N2}/{2,6:N2} GB  internet unavailable" -f `
+                $short, ($r.Completed / 1GB), ($r.Total / 1GB)) -ForegroundColor Yellow
         }
         else {
             Write-Host ("  {0,5:N1}d left  {1,-46} {2,6:N2}/{3,6:N2} GB  {4}" -f `
@@ -6293,41 +6412,11 @@ foreach ($c in $setGroups) {
 
                         if ($m.size -gt $keeper.size -or ($m.size -eq $keeper.size -and [double]$m.progress -lt 1)) {
                             # Finished ties go through the duplicate branch instead.
-                            # A finished copy larger than the selected largest
-                            # keeper cannot normally occur. Keep it defensively. So
-                            # the tolerance below is deliberately one-sided: it can
-                            # only ever reach an UNFINISHED copy.
+                            # The tolerance is deliberately one-sided: it can only
+                            # reach an unfinished copy, never a finished keeper.
                             if ([double]$m.progress -ge 1) { continue }
-
-                            # BIGGER IS NOT ACTUALLY BIGGER.
-                            #
-                            # A download that would finish larger is the better
-                            # version, and throwing it away throws away the better
-                            # version. But 61 KB out of 9 GB is not a better version,
-                            # it is the difference between two releases of the same
-                            # encode: a padded track, a container detail, a slightly
-                            # different tag. Measured on a live queue, one episode:
-                            #
-                            #    9.057.610.150 B    0,6%   +0,00067%   kept
-                            #    9.057.552.150 B   12,8%   +0,00003%   kept
-                            #    9.057.550.486 B    6,1%   +0,00001%   kept
-                            #    9.057.549.336 B  100,0%              finished keeper
-                            #
-                            # Three downloads of one episode, each a rounding error
-                            # larger than the copy ALREADY FINISHED, all kept by a
-                            # strict ">=" and all fetching the same thing. On a size
-                            # ratio they are indistinguishable, and the finished copy
-                            # is the one that is done.
-                            #
-                            # The tolerance is the same 10% rule 4d applies against
-                            # the library, read the same way: "no more than 10%
-                            # bigger" counts as within it, so a download exactly on
-                            # the limit is redundant. Anything past it is a different
-                            # encode and stays - a 2160p next to a finished 1080p is
-                            # a genuine better copy and is not touched.
                             $over = ([double]$m.size - [double]$keeper.size) / [double]$keeper.size
                             if ($over -gt ($tolerance / 100.0)) { continue }
-
                             $why = 'incomplete, and not meaningfully bigger than a finished version'
                         }
                         else {
@@ -6446,8 +6535,10 @@ foreach ($c in $setGroups) {
     foreach ($pack in $members) {
         if (Test-AlreadyGone $pack) { continue }
         if (-not $pack.parts) { continue }
-        if (-not $pack.parts.IsMultiEpisode) { continue }
-        if (-not $pack.parts.EpisodeLast) { continue }
+        # A pack is either an explicit multi-episode range (IsMultiEpisode + EpisodeLast)
+        # OR a bare season pack (Episode -eq 0, meaning "whole season").
+        if (-not $pack.parts.IsMultiEpisode -and $pack.parts.Episode -ne 0) { continue }
+        if ($pack.parts.IsMultiEpisode -and -not $pack.parts.EpisodeLast) { continue }
         if ($pack.progress -lt 1) { continue }
 
         foreach ($single in $members) {
@@ -6458,9 +6549,7 @@ foreach ($c in $setGroups) {
             if ($single.parts.Title -ne $pack.parts.Title) { continue }
             if ($single.parts.Season -ne $pack.parts.Season) { continue }
             if ($null -eq $single.parts.Episode) { continue }
-            if ($single.parts.Episode -lt $pack.parts.Episode) { continue }
-            if ($single.parts.Episode -gt $pack.parts.EpisodeLast) { continue }
-            if ($single.progress -lt 1) { continue }
+            if (-not (Test-PackContainsEpisode -PackParts $pack.parts -Episode $single.parts.Episode)) { continue }
 
             # The two are compared on the ONE episode they share: that episode's
             # real file inside the pack, against the single's own file. Neither
@@ -6486,11 +6575,11 @@ foreach ($c in $setGroups) {
             # other copy anywhere - were left on disk belonging to no torrent.
             # A 46 MB difference between two encodes of one episode says nothing
             # about the seven other episodes.
-            if ($epFileBytes -lt $single.size) {
-                # The pack's copy is smaller, so the pack's episode is the spare
-                # and the single survives. The pack is left completely alone -
-                # which is the whole point: the pack holds episodes the single
-                # cannot replace.
+            if (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes $epFileBytes -SingleTotalBytes $single.size)) {
+                # The pack's copy is not strictly bigger, so this rule does not
+                # establish that the single is redundant. Keep the single on an
+                # equal-size comparison; only a strictly larger pack episode
+                # qualifies it for deletion.
                 continue
             }
 
@@ -6500,14 +6589,15 @@ foreach ($c in $setGroups) {
                 if (-not (Stop-TorrentAndConfirm -T $pack)) { continue }
             }
 
-            $reason = ("duplicate of '{0}': both are complete, and the single's own copy of S{1}E{2} is smaller or equal ({3:N2} GB) to the pack's file for that episode ({4:N2} GB); the pack holds other episodes this single cannot replace, so the single goes" `
+            $singleState = if ($single.progress -ge 1) { 'finished' } else { 'unfinished' }
+            $reason = ("duplicate of '{0}': pack is finished and its S{1}E{2} file ({3:N2} GB) is larger than the {4} single's total size ({5:N2} GB); the pack holds other episodes this single cannot replace, so the single goes" `
                 -f $pack.name, $pack.parts.Season, $single.parts.Episode,
-                   ($single.size / 1GB), ($epFileBytes / 1GB))
+                   ($epFileBytes / 1GB), $singleState, ($single.size / 1GB))
             # -Knows. It SEES its keeper: $pack is a real torrent, both are
             # complete, and $epFileBytes is that pack's own file for this episode -
             # measured, not inferred. The single is one episode and the pack holds
             # it, so nothing unique goes with it.
-            $rt = @{ T = $single; Knows = $true; Reason = $reason; DeleteFiles = $true }
+            $rt = @{ T = $single; AllowErrored = $true; Knows = $true; Reason = $reason; DeleteFiles = $true }
             if (-not $guardDuplicates) { $rt.AllowIncomingBetter = $true }
             if ($single.content_path -and $pack.content_path -and
                 (Test-Claimed -Path $single.content_path -Torrents @($pack))) { $rt.DeleteFiles = $false }

@@ -22,7 +22,7 @@
   "stallMaxWaitSeconds": 75,
   "stallMaxDeletions": 10,
   "stallInternetProbeUrl": "https://www.cloudflare.com/cdn-cgi/trace",
-  "stalledDeleteDays": 7,
+  "stalledDeleteDays": 5,
   "backupMaxAgeDays": 7,
   "logRetentionDays": 7,
 

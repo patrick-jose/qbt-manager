@@ -240,6 +240,7 @@ $allowCalls = ([regex]::Matches($bodyAll, '(?m)^\s*Remove-Torrent[^\r\n]*-AllowE
 # and the check failed on correct code. The window is generous because the two
 # are ~110 lines apart inside the set loop.
 Check 'and it is the set-level dedup delete'         ($bodyAll -cmatch '(?ms)Get-EpisodeSetKey.{0,20000}?T = \$m; AllowErrored = \$true; Knows = \$true;')
+Check 'pack-vs-single allows an errored single only after measuring the pack episode' ($bodyAll -cmatch '(?ms)Test-PackEpisodeOutweighsSingle.{0,2500}?T = \$single; AllowErrored = \$true; Knows = \$true;')
 
 # The three call sites that DO reach it, each named rather than counted, so a
 # new one cannot slip in unnoticed and a moved one is still found.
@@ -257,7 +258,8 @@ $allowAt = @(
     # dedup now builds a hash-splat and passes flags there and only calls
 # Remove-Torrent @rt at the end - so the pin searches for the splat's
 # contents: T = $m is what makes this line the dedup one and not rule 1's.
-@{ n = 'set dedup';    p = 'T = $m; AllowErrored = $true; Knows = $true;' }
+    @{ n = 'set dedup';    p = 'T = $m; AllowErrored = $true; Knows = $true;' }
+    @{ n = 'pack-vs-single'; p = 'T = $single; AllowErrored = $true; Knows = $true; Reason = $reason' }
 )
 foreach ($c in $allowAt) {
     $i = $bodyAll.IndexOf($c.p)
@@ -279,7 +281,6 @@ Check 'and no other rule passes it'   ($allowCalls -eq 2)
 # when nothing of the sort had happened.
 $noAllow = @(
     @{ n = 'the stalled rule';    p = '$r.Torrent -DeleteFiles $true -Reason (' }
-    @{ n = 'pack-vs-single';      p = 'T = $single; Knows = $true; Reason = $reason' }
     @{ n = 'the phantom rule';    p = '$p.Torrent -Knows -Reason $p.Reason -DeleteFiles $false' }
     @{ n = 'no availability';     p = '$row.Torrent -Reason $row.Reason' }
     @{ n = 'library duplicates';  p = 'T = $d.Owner; Knows = $true; Reason = $d.Reason' }

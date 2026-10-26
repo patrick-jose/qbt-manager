@@ -71,7 +71,7 @@ Check 'one row per eligible torrent'                     ($rows.Count -eq 1)
 $st = [pscustomobject]@{}
 $rows = @(Get-StalledWatch -Torrents @(T -Hash 'b' -LastActivity (Unix ($NOW.AddHours(-1))) -AddedOn (Unix ($NOW.AddDays(-30)))) -Stalled $st -Now $NOW)
 Check 'a torrent active an hour ago is not stalled'  (-not $rows[0].WillDelete)
-Check 'it is left with the whole 7 days'             ((Days $rows[0].Remaining) -eq 7.0)
+Check 'it is left with the configured full deadline' ((Days $rows[0].Remaining) -eq [double]$cfg.stalledDeleteDays)
 
 # -- 3. the table remembers, and a byte resets the clock --------------------
 
@@ -84,7 +84,7 @@ Check 'the byte count is what decides, not the clock' ((Days $rows[0].IdleDays) 
 
 $rows = @(Get-StalledWatch -Torrents @(T -Hash 'c' -Completed 2GB) -Stalled $st -Now $NOW)
 Check 'one extra byte resets the clock'               (-not $rows[0].WillDelete)
-Check 'after the reset it has the full 7 days back'   ((Days $rows[0].Remaining) -eq 7.0)
+Check 'after the reset it has the full deadline back' ((Days $rows[0].Remaining) -eq [double]$cfg.stalledDeleteDays)
 Check 'and the stored byte count moved with it'       ($st.c.bytes -eq [int64]2GB)
 
 # -- 4. states that must never be judged ------------------------------------
@@ -120,19 +120,19 @@ $early = T -Hash 'e' -LastActivity (Unix ($NOW.AddDays(-30))) -AddedOn (Unix ($N
 $rows = @(Get-StalledWatch -Torrents @($early) -Stalled $st -Now $NOW)
 Check 'last_activity before added_on is ignored'     ((Days $rows[0].IdleDays) -eq 2.0)
 Check 'a torrent added 2 days ago is not stalled yet' (-not $rows[0].WillDelete)
-Check 'and it keeps the remaining 5 days'            ((Days $rows[0].Remaining) -eq 5.0)
+Check 'and it keeps the remaining deadline'          ((Days $rows[0].Remaining) -eq ([double]$cfg.stalledDeleteDays - 2.0))
 
 # -- 7. the boundary is inclusive ------------------------------------------
 
 $st = [pscustomobject]@{}
-$exact = T -Hash 'x' -LastActivity (Unix ($NOW.AddDays(-7))) -AddedOn (Unix ($NOW.AddDays(-40)))
+$exact = T -Hash 'x' -LastActivity (Unix ($NOW.AddDays(-[double]$cfg.stalledDeleteDays))) -AddedOn (Unix ($NOW.AddDays(-40)))
 $rows = @(Get-StalledWatch -Torrents @($exact) -Stalled $st -Now $NOW)
-Check 'exactly 7.0 days is a deletion'               $rows[0].WillDelete
+Check 'exactly the configured deadline is a deletion' $rows[0].WillDelete
 
 $st = [pscustomobject]@{}
-$under = T -Hash 'y' -LastActivity (Unix ($NOW.AddDays(-6.9))) -AddedOn (Unix ($NOW.AddDays(-40)))
+$under = T -Hash 'y' -LastActivity (Unix ($NOW.AddDays(-([double]$cfg.stalledDeleteDays - 0.1)))) -AddedOn (Unix ($NOW.AddDays(-40)))
 $rows = @(Get-StalledWatch -Torrents @($under) -Stalled $st -Now $NOW)
-Check '6.9 days is still kept'                       (-not $rows[0].WillDelete)
+Check 'just under the configured deadline is kept'    (-not $rows[0].WillDelete)
 
 # -- 8. the table is pruned so it cannot grow forever ----------------------
 
@@ -161,6 +161,20 @@ $cfg.stalledDeleteDays = $saved
 $st = [pscustomobject]@{}
 $rows = @(Get-StalledWatch -Torrents @(T -Hash 'k' -Completed 10GB -Total 10GB -Progress 1 -State 'uploading' -LastActivity (Unix ($NOW.AddDays(-90))) -AddedOn (Unix ($NOW.AddDays(-90)))) -Stalled $st -Now $NOW)
 Check 'a seeding torrent is never judged stalled'    ($rows.Count -eq 0)
+
+# -- 11. an internet outage pauses, rather than consumes, inactivity time ----
+
+$pausedAt = $NOW.AddDays(-2)
+$st = [pscustomobject]@{ sample = [pscustomobject]@{
+    lastProgressAt = $NOW.AddDays(-4).ToString('o'); bytes = [int64]0
+} }
+$state = [pscustomobject]@{ stalled = $st }
+$paused = Update-StalledInternetPause -State $state -Now $pausedAt -InternetReachable $false
+Check 'offline marks stalled cleanup as paused' ($paused -and $state.stalledInternetDownSince -eq $pausedAt.ToString('o'))
+$paused = Update-StalledInternetPause -State $state -Now $NOW -InternetReachable $true
+$resumedAt = [datetime]::Parse($state.stalled.sample.lastProgressAt)
+Check 'recovery resumes cleanup without charging outage time' (-not $paused -and [math]::Abs(($NOW.AddDays(-2) - $resumedAt).TotalSeconds) -lt 1)
+Check 'recovery clears the outage marker' ($null -eq $state.PSObject.Properties['stalledInternetDownSince'])
 
 ''
 if ($script:fails -eq 0) { 'all stalled-rule tests passed' }

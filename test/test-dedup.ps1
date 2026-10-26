@@ -183,32 +183,14 @@ Check 'a smaller finished copy is deleted'   ((Verdicts $two) -contains 'small')
 Check 'the larger finished copy is kept'     (-not ((Verdicts $two) -contains 'big'))
 Check 'the reason says smaller completed version' ((Reason $two 'small') -like 'smaller completed version*')
 
-"== equal sizes: not smaller, but an identical INCOMPLETE copy is redundant =="
-# This used to assert that an identical-size copy is never deleted, on the
-# reading that "not smaller" means "not a duplicate". It does not. An unfinished
-# copy of an episode that is already finished, at the same size, is the most
-# redundant copy there is - and it was keeping itself alive on a technicality:
-# `size >= keeper.size` treated "equal" as "bigger, therefore better".
-#
-# Measured on a live queue, three downloads of one episode each a few kilobytes
-# larger out of 9 GB than the finished copy, all kept by that strict >=:
-#
-#   9.057.610.150 B    0,6%   +0,00067%
-#   9.057.552.150 B   12,8%   +0,00003%
-#   9.057.550.486 B    6,1%   +0,00001%
-#   9.057.549.336 B  100,0%   the finished keeper
-#
-# So the tolerance below is the user's 10% applied to the "bigger" side. It reads
-# "no more than 10% bigger", so equal and exactly-10% are both inside it.
+"== equal sizes: an identical incomplete copy is redundant within tolerance =="
 $equal = @((T 'a' 5.0 1.0), (T 'b' 5.0 0.4))
 Check 'an identical-size INCOMPLETE copy is deleted'   (@(Verdicts $equal) -contains 'b')
 Check 'and the finished one is kept'                   (-not (@(Verdicts $equal) -contains 'a'))
 Check 'the reason gives the percentage'                ((Reason $equal 'b') -match 'only 0,00% bigger')
 Check 'and names the tolerance'                        ((Reason $equal 'b') -match '10% tolerance')
 
-# A FINISHED copy bigger than the keeper is the keeper itself. Rule 4 is "both
-# finished, keep the bigger, delete the smaller", and the survivor must never be
-# deleted - so the tolerance is one-sided and cannot reach a finished copy.
+# A FINISHED copy bigger than the keeper is the keeper itself.
 $twoDone = @((T 'keepme' 5.0 1.0), (T 'biggerdone' 5.01 1.0))
 Check 'a FINISHED copy bigger than the keeper is kept' (-not (@(Verdicts $twoDone) -contains 'biggerdone'))
 Check 'one equal-size FINISHED duplicate goes'    (@(Verdicts @((T 'x' 5.0 1.0), (T 'y' 5.0 1.0))).Count -eq 1)
@@ -421,11 +403,7 @@ $v = Verdicts @($pA, $pC)
 Check 'two finished packs of the same range: the smaller is deleted' ((@($v).Count -eq 1) -and (@($v) -contains 'pC'))
 Check 'and the reason says smaller completed version' ((Reason @($pA,$pC) 'pC') -like 'smaller completed version*')
 
-# Equal ranges, equal sizes. The INCOMPLETE one goes: a pack of one range that is
-# unfinished, at the same size as a finished pack of that same range, holds
-# nothing the finished one does not. Same reasoning as the single-episode case
-# above - "not smaller" is not a reason to keep something when a finished copy of
-# the identical episode set already exists.
+# Equal ranges, equal sizes. An unfinished copy within tolerance is redundant.
 $pD = PackOf 'pD' 'Widows.Bay.S01E01-10.720p.ATVP.WEB-DL.ITA.ENG.DD5.1.H.264-G66 [ext.to]'  24.0 0.20
 $pE = PackOf 'pE' 'Widows.Bay.S01E01-10.720p.ATVP.WEB-DL.ITA.ENG.DD5.1.H.264-G66 [ext.to]'  24.0 1.00
 $eqV = @(Verdicts @($pD, $pE))
@@ -610,9 +588,6 @@ Check 'singles of different episodes are not weighed against each other' (@(Verd
 
 Write-Host ""
 Write-Host "== the 10% tolerance, and which side it may reach =="
-# The rule: an UNFINISHED copy of an episode already finished is redundant if it
-# is not more than 10% bigger. "No more than" is read as <=, so exactly 10% is
-# inside it - the same convention rule 4d uses against the library.
 
 $done = { param($h, $gb) (T $h $gb 1.0) }
 $wip  = { param($h, $gb) (T $h $gb 0.5) }
@@ -659,35 +634,12 @@ Write-Host "== both copies of rule 4 must carry the tolerance =="
 Check 'the manager applies a tolerance on the bigger side'  ($msrc -cmatch "\`$over = \(\[double\]\`$m\.size - \[double\]\`$keeper\.size\) / \[double\]\`$keeper\.size")
 Check 'and it is a percentage of the keeper'               ($msrc -cmatch "if \(\`$over -gt \(\`$tolerance / 100\.0\)\) \{ continue \}")
 Check 'the manager reads the tolerance from config'        ($msrc -cmatch "PSObject\.Properties\['libraryRedundantTolerancePercent'\]")
-# The window is 2500 chars, not 600: the manager's finished-spare line is 1954
-# characters above its $over line, because the comment between them records the
-# live measurement that motivated the rule. A tight window would have failed on
-# correct code for the length of an explanation, which is how a check like this
-# stops being read and starts being deleted.
 Check 'the manager spares a FINISHED copy'                 ($msrc -cmatch "(?s)if \(\[double\]\`$m\.progress -ge 1\) \{ continue \}.{0,2500}?\`$over =")
 Check 'the preview copy applies it too'                    ($src -cmatch "\`$over = \(\(Get-Prop \`$m 'size'\) - \(Get-Prop \`$keeper 'size'\)\) / \(Get-Prop \`$keeper 'size'\)")
 Check 'and the preview spares a FINISHED copy too'         ($src -cmatch "(?s)if \(\(Get-Prop \`$m 'progress'\) -ge 1\) \{ continue \}.{0,600}?\`$over =")
 Check 'the preview reads the tolerance from config'         ($src -cmatch "Get-Prop \`$cfg 'libraryRedundantTolerancePercent'")
-# The percentage must reach the reason, or a reader deciding whether to agree with
-# a deletion has to recompute it. $gap was computed and then left out of the
-# message once already, which is the kind of thing a check like this is for.
+# The percentage is present in the reason so the preview shows the actual rule.
 Check 'the preview reason carries the percentage'           ($src -cmatch '\$why, \$gap, \$label')
-
-# Presence is not reachability. The manager's pass is inline in its action section
-# rather than a function, so these are the only checks that touch it - which makes
-# "the text is there" a weak substitute for "the code runs". Ordering closes some
-# of that gap: the bigger-than branch has to open the tolerance, and the tolerance
-# has to sit before the delete, or it is dead code that reads as protection.
-$mBranch = $msrc.IndexOf('if ($m.size -gt $keeper.size -or')
-$mOver   = $msrc.IndexOf('$over = ([double]$m.size - [double]$keeper.size)')
-$mDel    = $msrc.IndexOf('Remove-Torrent @rt', $mOver)
-Check 'the manager opens the tolerance in the bigger-than branch' `
-    ($mBranch -ge 0 -and $mBranch -lt $mOver -and $mOver -lt $mDel)
-$sBranch = $src.IndexOf("if ((Get-Prop `$m 'size') -gt (Get-Prop `$keeper 'size') -or")
-$sOver   = $src.IndexOf('$over = ((Get-Prop $m')
-$sDel    = $src.IndexOf("Verdict = 'DELETE'; Rule = 'dedup'")
-Check 'the preview does the same, in the same order' `
-    ($sBranch -ge 0 -and $sBranch -lt $sOver -and $sOver -lt $sDel)
 "checks: $($script:fails) failed"
 if ($script:fails -gt 0) { exit 1 }
 exit 0

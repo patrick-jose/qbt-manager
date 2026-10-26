@@ -125,6 +125,10 @@ Write-Host '== every refusal returns no opinion, never a wildcard =='
 # Each of these must leave the caller holding the name it read. That direction
 # is the safe one: S<n>-ALL only ever meets S<n>-ALL, which is today's behaviour.
 Check 'a file with no episode token: no opinion'       ((Get-EpisodeSetFromFiles -Files @(F 'Show.S03.1080p.WEB-DL/readme.txt')) -eq '')
+Check 'season videos still resolve with an NFO sidecar' ((Get-EpisodeSetFromFiles -Files @(F 'Pack/Show.S04E01.mkv'; F 'Pack/Show.S04E02.mkv'; F 'Pack/Show.nfo')) -eq 'S4-E1-E2')
+Check 'season videos still resolve with text and HTML sidecars' ((Get-EpisodeSetFromFiles -Files @(F 'Pack/Show.S04E01.mkv'; F 'Pack/Show.S04E02.mkv'; F 'Pack/readme.txt'; F 'Pack/description.html')) -eq 'S4-E1-E2')
+$promoSet = @(); foreach($n in 1..10){ $promoSet += F ("Pack/Show.S04E{0:D2}.mkv" -f $n) }; $promoSet += [pscustomobject]@{name='Pack/FOX&ROPEX.mkv';size=19998004}; $promoSet += F 'Pack/list.pdf'
+Check 'a season pack with tiny promo clips and PDFs still resolves its episodes' ((Get-EpisodeSetFromFiles -Files $promoSet) -eq 'S4-E1-E10')
 Check 'one readable file among unreadable: no opinion' ((Get-EpisodeSetFromFiles -Files @(F 'A.S03E01.mkv'; F 'bonus-feature.mkv')) -eq '')
 Check 'a gap in the run is not a range'                ((Get-EpisodeSetFromFiles -Files @(F 'A.S03E01.mkv'; F 'A.S03E02.mkv'; F 'A.S03E04.mkv')) -eq '')
 Check 'spanning two seasons: no opinion'               ((Get-EpisodeSetFromFiles -Files @(F 'A.S01E01.mkv'; F 'A.S02E01.mkv')) -eq '')
@@ -163,6 +167,14 @@ Write-Host '== a pack never meets a single =='
 Check 'one episode keys S3-E4, a pack keys S3-E1-E8'  ((Get-EpisodeSetKey -Parts (Get-TitleParts -Name 'Show.S03E04.1080p.WEB-DL.mkv')) -eq 'S3-E4')
 Check 'and those keys are not equal'                  ((Get-EpisodeSetKey -Parts (Get-TitleParts -Name 'Show.S03E04.1080p.WEB-DL.mkv')) -ne $lFileKey)
 Check 'a pack file list naming one episode matches'   ((Get-EpisodeSetFromFiles -Files @(F 'A.S03E04.mkv')) -eq 'S3-E4')
+$wholeSeason = Get-TitleParts -Name 'FROM.S04.2160p.AMZN.WEB-DL.DDP5.1.H.265-FLUX'
+$rangePack = Get-TitleParts -Name 'Show.S03E01-E08.1080p.WEB-DL'
+Check 'a bare S04 season pack contains a single S04 episode' (Test-PackContainsEpisode -PackParts $wholeSeason -Episode 4)
+Check 'an explicit pack range contains an episode in-range' (Test-PackContainsEpisode -PackParts $rangePack -Episode 8)
+Check 'an explicit pack range does not contain an episode out-of-range' (-not (Test-PackContainsEpisode -PackParts $rangePack -Episode 9))
+Check 'a strictly larger pack episode beats the single torrent' (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 101 -SingleTotalBytes 100)
+Check 'an equal-size pack episode does not beat the single torrent' (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 100 -SingleTotalBytes 100))
+Check 'a smaller pack episode does not beat the single torrent' (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 99 -SingleTotalBytes 100))
 
 Write-Host ''
 Write-Host '== the family fold, driven through the preview =='
@@ -260,7 +272,7 @@ $pairList = New-Object System.Collections.ArrayList
 [void]$pairList.Add((Cluster @($office)))
 [void]$pairList.Add((Cluster @($bear)))
 $famPair = @(Get-ClusterFamilies -Clusters $pairList).Family
-Check "both land in family 'the', which is the documented limit" ($famPair[0] -eq 'the' -and $famPair[1] -eq 'the')
+Check "leading articles no longer collapse different shows into one family" ($famPair[0] -eq 'office' -and $famPair[1] -eq 'bear')
 
 $ted = T '7777cccc' 'Ted.Lasso.S04E08.2160p.Apple.TV.WEB-DL.H265.mkv' 2.0 1.0
 $sunny = T '6666dddd' 'Its.Always.Sunny.In.Philadelphia.S18E01.2160p.WEB-DL.H265.mkv' 2.0 1.0
