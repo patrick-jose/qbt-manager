@@ -196,8 +196,8 @@ Check 'the move passes the alias list'          ($moveLine -match '-Aliases \$cf
 # spells two ways would be cut into a folder of its own.
 $settleLine = ($src -split "`n" | Where-Object { $_ -match 'Get-LibraryTargetDir -T \$t -MoviesDir \$MoviesDir' } | Select-Object -First 1)
 Check 'and so does the settle rule'             (($null -ne $settleLine) -and ($settleLine -match '-Aliases \$Aliases'))
-$defLine = ($src -split "`n" | Where-Object { $_ -match 'Resolve-LibraryShowDir -SeriesDir \$SeriesDir -Title \$T\.parts\.Title' } | Select-Object -First 1)
-Check 'the target dir forwards it'              ($defLine -match '-Aliases \$Aliases')
+$defLine = ($src -split "`n" | Where-Object { $_ -match 'Resolve-LibraryShowDir -SeriesDir \$SeriesDir -Title \$showTitle' } | Select-Object -First 1)
+Check 'the target dir forwards it'              (($null -ne $defLine) -and ($defLine -match '-Aliases \$Aliases'))
 
 Write-Host ''
 Write-Host '== nothing folds by resemblance =='

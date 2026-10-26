@@ -44,7 +44,7 @@
   "titleAliases": {},
   "//yearScopedMovieAliases": "Optional explicit movie aliases scoped by source year. Key format: YYYY|parsed movie title; value: canonical parsed title, or {title, year} when an explicitly identified release also needs its identity year corrected. These aliases do not apply to series or other source years.",
   "yearScopedMovieAliases": {},
-  "//tmdbEnabled": "Use TMDB IDs as identity evidence when a local TMDB bearer token is configured. Only unique title+year matches are accepted; local aliases take precedence and ambiguous/no-match results retain existing behavior.",
+  "//tmdbEnabled": "Use TMDB IDs as identity evidence when a local TMDB bearer token is configured. Unique title matches (year when the release names one) are accepted; local aliases take precedence and ambiguous/wrong-year results retain existing behavior. A film the parser could not recognise as a series, but TMDB identifies as a one-season show, is filed as that show's season pack.",
   "tmdbEnabled": true,
   "tmdbMaxLookupsPerRun": 8,
   "tmdbMaxRequestsPerRun": 16,

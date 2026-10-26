@@ -3198,11 +3198,17 @@ function Get-TmdbIdentity {
         # existing movie keeps it a film. TV is asked next because that is the
         # only way a marker-less show can be recognised at all.
         [void]$plans.Add([pscustomobject]@{ Type = 'movie'; Exact = (-not $hasYear) })
-        [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $true })
+        # TV matching uses containment, not only equality: a release named
+        # 'South Park America (1997) S29E01' still contains 'South Park', and
+        # TMDB returned that show and nothing else, so it is the same work with
+        # extra words in the release name. Exact matching would leave it a film.
+        [void]$plans.Add([pscustomobject]@{ Type = 'tv'; Exact = $false })
     }
 
-    if ($null -eq $script:tmdbNewLookupCount) { $script:tmdbNewLookupCount = 0 }
-    if ($null -eq $script:tmdbRequestCount) { $script:tmdbRequestCount = 0 }
+    $lookupVar = Get-Variable -Name 'tmdbNewLookupCount' -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $lookupVar -or $null -eq $lookupVar.Value) { $script:tmdbNewLookupCount = 0 }
+    $requestVar = Get-Variable -Name 'tmdbRequestCount' -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $requestVar -or $null -eq $requestVar.Value) { $script:tmdbRequestCount = 0 }
     if (-not $Request) { $Request = { param($uri) Invoke-TmdbRequest -Uri $uri -BearerToken $BearerToken }.GetNewClosure() }
     $base = 'https://api.themoviedb.org/3'
     $last = $null
@@ -3387,10 +3393,36 @@ function Resolve-LibraryShowDir {
     return $found
 }
 
+function Get-ShowFolderTitle {
+    <#
+        The name a show's library folder should carry. Explicit local aliases
+        already replaced the parsed title when one matched, and in that case no
+        TMDB identity is attached, so TMDB never overrides an alias. Otherwise,
+        when TMDB uniquely identified the show, its canonical name is used so
+        that differently spelled or prefixed releases of the same work land in
+        one folder instead of several. Falls back to the parsed title.
+    #>
+    param($Parts)
+    if ($Parts) {
+        $tmdbName = [string](Get-PartValue -Parts $Parts -Name 'TmdbName')
+        if (-not [string]::IsNullOrWhiteSpace($tmdbName)) {
+            # Folder names must not carry punctuation that the parser already
+            # strips; otherwise 'Louis Theroux: Life on the Edge' and
+            # 'Louis Theroux Life on the Edge' would be two different folders.
+            $clean = [regex]::Replace($tmdbName, '[^\p{L}\p{Nd}\s]+', ' ')
+            $clean = [regex]::Replace($clean, '\s+', ' ').Trim()
+            if (-not [string]::IsNullOrWhiteSpace($clean)) { return $clean }
+        }
+    }
+    if ($Parts) { return [string]$Parts.Title }
+    return ''
+}
+
 # Where a completed torrent belongs. Series go into a per-show folder with a
 # per-season subfolder; movies go straight into the movies dir. The show name
-# comes from the parsed title, the season from the parsed parts. A season of 0
-# or $null means the season is unknown, so no season subfolder is created.
+# comes from the parsed title, or from TMDB when it uniquely identified the
+# show, and the season from the parsed parts. A season of 0 or $null means the
+# season is unknown, so no season subfolder is created.
 #
 # The show FOLDER is resolved through Resolve-LibraryShowDir, so it is always the
 # one already on disk rather than a freshly spelled, differently-cased path.
@@ -3405,7 +3437,8 @@ function Get-LibraryTargetDir {
     if (-not $T -or -not $T.parts) { return $MoviesDir }
     if (-not $T.parts.IsSeries) { return $MoviesDir }
 
-    $base = Resolve-LibraryShowDir -SeriesDir $SeriesDir -Title $T.parts.Title -Aliases $Aliases
+    $showTitle = Get-ShowFolderTitle -Parts $T.parts
+    $base = Resolve-LibraryShowDir -SeriesDir $SeriesDir -Title $showTitle -Aliases $Aliases
     if (-not $base) {
         # Unidentified show: fall back to the series root rather than inventing a
         # folder name from an empty title.
@@ -4025,7 +4058,7 @@ function Get-PhantomVerdicts {
         if ($null -eq $season -or $season -le 0) { continue }
         if ($null -eq $t.parts.Episode) { continue }
 
-        $show = $t.parts.Title
+        $show = Get-ShowFolderTitle -Parts $t.parts
         if ([string]::IsNullOrWhiteSpace($show)) { continue }
         # Through the resolver, so this finds the folder that is actually on disk
         # rather than a freshly spelled path that differs only in case.
@@ -4213,7 +4246,7 @@ function Get-LibraryRedundantVerdicts {
         $season = $t.parts.Season
         if ($null -eq $season -or $season -le 0) { continue }
         if ($null -eq $t.parts.Episode) { continue }
-        $show = $t.parts.Title
+        $show = Get-ShowFolderTitle -Parts $t.parts
         if ([string]::IsNullOrWhiteSpace($show)) { continue }
 
         $first = [int]$t.parts.Episode

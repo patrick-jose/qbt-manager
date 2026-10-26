@@ -88,9 +88,16 @@ For every command, see [COMMANDS.md](../COMMANDS.md).
     title-and-year match. IDs can join localized spellings of the same movie or
     series and keep different works apart; they never rewrite library filing
     titles. Explicit aliases take precedence. Ambiguous and wrong-year results
-    are not used. Results are cached in ignored `tmdb-cache.json`; lookup and
-    request budgets are bounded per run. Without a token, title-based safeguards
-    are unchanged. `status.ps1` uses cached identities only and never calls TMDB.
+    are not used. A release the parser called a film because it carries no
+    `SxxEyy` / `Season N` marker, but which TMDB uniquely identifies as a show
+    with exactly one season, is filed as that show's season pack (`S<n>-ALL`).
+    Multi-season results leave the release as parsed. When TMDB uniquely
+    identifies a show, its canonical name is also used for the library show
+    folder, so differently spelled releases of the same work share one folder;
+    punctuation is stripped so it cannot split an existing folder. Results are
+    cached in ignored `tmdb-cache.json`; lookup and request budgets are bounded
+    per run. Without a token, title-based safeguards are unchanged. `status.ps1`
+    uses cached identities only and never calls TMDB.
 7. **Library** â€” survivors that are complete are moved to `moviesDir` or
    `seriesDir`. The move is then **verified**, not assumed, and is refused while
    another torrent holds the folder (see [Moving to the library](#moving-to-the-library)).

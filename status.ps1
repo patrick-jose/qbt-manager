@@ -144,6 +144,8 @@ Invoke-Expression $src.Substring($sliceStart, $sliceEnd - $sliceStart)
 $script:settleJournalDir = Join-Path $PSScriptRoot 'pending-settle'
 $script:pendingSettleRecords = @(Get-PendingSettleRecords)
 $script:tmdbCache = Read-TmdbCache -Path (Join-Path $PSScriptRoot 'tmdb-cache.json')
+$script:tmdbNewLookupCount = 0
+$script:tmdbRequestCount = 0
 
 # ---- small helpers ---------------------------------------------------------
 

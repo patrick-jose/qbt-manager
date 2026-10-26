@@ -59,6 +59,9 @@ $request = {
             $air = if ($script:tmdbMode -eq 'tv-year') { '2020-01-01' } else { '2015-01-01' }
             return [pscustomobject]@{ results = @([pscustomobject]@{ id = 400; name = 'Some Documentary'; original_name = 'Some Documentary'; first_air_date = $air }) }
         }
+        if ($script:tmdbMode -eq 'tv-containment') {
+            return [pscustomobject]@{ results = @([pscustomobject]@{ id = 2190; name = 'South Park'; original_name = 'South Park'; first_air_date = '1997-08-13' }) }
+        }
         return [pscustomobject]@{ results = @([pscustomobject]@{ id = 77; name = 'Widows Bay'; original_name = 'Widows Bay'; first_air_date = '2025-01-01' }) }
     }
     throw "unexpected TMDB fixture URI: $uri"
@@ -141,6 +144,15 @@ $wrongShow = Get-TmdbIdentity -Parts $doc -Name 'Some Documentary 2020 1080p WEB
     -BearerToken 'test-token' -Cache @{} -Request $request -MaxLookups 8
 Check 'a TV result from a different year cannot re-type the release' ($wrongShow.status -eq 'notfound')
 
+$script:tmdbMode = 'tv-containment'
+Reset-TmdbBudget
+$sp = Get-TitleParts -Name 'South Park America (1997) S29E01 1080p WEB-DL'
+$spIdentity = Get-TmdbIdentity -Parts $sp -Name 'South Park America (1997) S29E01 1080p WEB-DL' `
+    -BearerToken 'test-token' -Cache @{} -Request $request -MaxLookups 8
+Check 'a release whose name contains the show still gets a TV identity' ($spIdentity.status -eq 'matched' -and $spIdentity.type -eq 'tv' -and $spIdentity.id -eq '2190')
+$spParts = Set-TmdbIdentity -Parts $sp -Identity $spIdentity
+Check 'the contained show carries the canonical TMDB folder name' ($spParts.TmdbName -eq 'South Park')
+
 $script:tmdbMode = 'movie-yearless'
 Reset-TmdbBudget
 $indie = Get-TitleParts -Name 'Some Indie Film 1080p WEB-DL'
@@ -188,6 +200,7 @@ try {
         $legacyIdentity = [pscustomobject]@{ status = 'matched'; id = '123'; type = 'movie'; name = 'Mars One' }
         $legacyParts = Set-TmdbIdentity -Parts (Get-TitleParts -Name 'Mars One (2022)') -Identity $legacyIdentity
         if (-not $legacyParts.TmdbId) { throw 'legacy identity was not attached' }
+        [void](Get-TmdbIdentity -Parts (Get-TitleParts -Name 'Mars One (2022)') -Name 'Mars One (2022)' -Cache @{} -CacheOnly)
     }
 } catch { $strictError = $_ }
 Check 'identity helpers tolerate missing TMDB fields under strict mode' ($null -eq $strictError)
