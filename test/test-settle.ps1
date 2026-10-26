@@ -99,7 +99,7 @@ function Lister {
     param([hashtable]$Map)
     return { param($h) if ($Map.ContainsKey($h)) { return @($Map[$h]) } return @() }.GetNewClosure()
 }
-function F { param([string]$Name, [double]$Gb) return [pscustomobject]@{ name = $Name; size = [int64]($Gb * $GB) } }
+function F { param([string]$Name, [double]$Gb, [int]$Priority = 1) return [pscustomobject]@{ name = $Name; size = [int64]($Gb * $GB); priority = $Priority } }
 
 $ALIASES = @{}
 
@@ -184,6 +184,22 @@ $other = Ep 'e' 'Some Show S03E07 1080p WEB-DL' 3.0 1.0
 $v = Get-SettleVerdicts -Torrents @($m, $other) -FileLister (Lister @{ a = @((F 'Show.S03E07.mkv' 9.0)) }) `
         -MoviesDir $MOVIES -SeriesDir $SERIES -Aliases $ALIASES
 Check 'another FINISHED copy does not block'     ($v.ContainsKey('a') -and $v['a'].Verdict -eq 'SETTLE')
+
+# Files explicitly marked Do Not Download no longer hold settlement hostage.
+# Their torrent can be removed once its wanted files have been flattened, while
+# the skipped duplicate itself is never included in the move plan.
+$m = Ep 'a' 'Some Show S03E07-E08 2160p WEB-DL' 18 1.0
+$skipped = Ep 'skip' 'Some Show S03E07 1080p WEB-DL' 5 0.0
+$skipped.state = 'stoppedDL'
+$skipFiles = @((F 'Show.S03E07.mkv' 5.0 0))
+$v = Get-SettleVerdicts -Torrents @($m, $skipped) -FileLister (Lister @{
+    a = @((F 'Show.S03E07.mkv' 9.0), (F 'Show.S03E08.mkv' 9.0 0)); skip = $skipFiles
+}) -MoviesDir $MOVIES -SeriesDir $SERIES -Aliases $ALIASES
+Check 'a skipped duplicate no longer blocks its finished keeper from settlement' ($v['a'].Verdict -eq 'SETTLE')
+Check 'priority-zero media is excluded from the flatten plan' `
+    ($v['a'].Files.Count -eq 1 -and $v['a'].Files[0].Name -eq 'Show.S03E07.mkv')
+Check 'the skipped episode is carried only as discard residue' `
+    ($v['a'].Discard.Count -eq 1 -and $v['a'].Discard[0] -eq 'C:\lib\Series\Show.S03E08.mkv')
 
 Write-Host ''
 Write-Host '== a pack: all or nothing, because a live entry re-fetches =='

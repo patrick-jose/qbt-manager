@@ -54,6 +54,8 @@
   "reapRoots": [
     "PUT-YOUR-PATH-HERE"
   ],
+  "//externalDuplicateRoots": "Optional additional narrowly-scoped roots. The manager also discovers direct Séries folders under mounted drives. Only recognized single episodes with a larger/equal keeper in the canonical library or a matching show/season folder on another series root are candidates; unknown files are untouched.",
+  "externalDuplicateRoots": [],
 
   "doviPatterns": [
     "\\bdovi\\b",

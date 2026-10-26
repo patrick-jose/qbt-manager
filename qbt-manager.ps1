@@ -2924,6 +2924,203 @@ function Get-PackEpisodeBytes {
     return $best
 }
 
+function Get-ContainedPackDuplicateVerdict {
+    param(
+        [object]$Candidate,
+        [object]$Keeper,
+        [hashtable]$SetKeyCache,
+        [hashtable]$FileSizeCache
+    )
+
+    if (-not $Candidate -or -not $Keeper -or -not $Candidate.parts -or -not $Keeper.parts) { return $null }
+    if (-not $Candidate.parts.IsSeries -or -not $Keeper.parts.IsSeries) { return $null }
+    if (-not (Test-SameMediaIdentity -A $Candidate.parts -B $Keeper.parts)) { return $null }
+    if ([double]$Keeper.progress -lt 1 -or [double]$Keeper.size -le 0 -or [double]$Candidate.size -le 0) { return $null }
+
+    $candidateKey = Resolve-TorrentSetKey -T $Candidate -Cache $SetKeyCache
+    $keeperKey = Resolve-TorrentSetKey -T $Keeper -Cache $SetKeyCache
+    $candidateSpan = Get-SetKeySpan -Key $candidateKey
+    $keeperSpan = Get-SetKeySpan -Key $keeperKey
+    if (-not $candidateSpan.Known -or -not $keeperSpan.Known -or $candidateSpan.IsFilm -or $keeperSpan.IsFilm) { return $null }
+    if ($candidateSpan.Season -ne $keeperSpan.Season -or
+        $candidateSpan.First -lt $keeperSpan.First -or $candidateSpan.Last -gt $keeperSpan.Last) { return $null }
+    # Exact-range copies are handled by the regular set comparison. This rule is
+    # only for a smaller pack wholly contained in a wider, finished pack.
+    if ($candidateSpan.First -eq $keeperSpan.First -and $candidateSpan.Last -eq $keeperSpan.Last) { return $null }
+
+    $comparisons = New-Object System.Collections.ArrayList
+    for ($episode = $candidateSpan.First; $episode -le $candidateSpan.Last; $episode++) {
+        $candidateBytes = Get-PackEpisodeBytes -Hash $Candidate.hash -Season $candidateSpan.Season `
+            -Episode $episode -Cache $FileSizeCache
+        $keeperBytes = Get-PackEpisodeBytes -Hash $Keeper.hash -Season $candidateSpan.Season `
+            -Episode $episode -Cache $FileSizeCache
+        if ($null -eq $candidateBytes -or $null -eq $keeperBytes -or $keeperBytes -lt $candidateBytes) { return $null }
+        [void]$comparisons.Add([pscustomobject]@{ Episode = $episode; CandidateBytes = $candidateBytes; KeeperBytes = $keeperBytes })
+    }
+
+    return [pscustomobject]@{
+        Candidate = $Candidate
+        Keeper = $Keeper
+        Season = $candidateSpan.Season
+        First = $candidateSpan.First
+        Last = $candidateSpan.Last
+        Comparisons = @($comparisons)
+    }
+}
+
+function Test-TorrentEpisodesAreSkipped {
+    param(
+        [object[]]$Files,
+        [int]$Season,
+        [int]$FirstEpisode,
+        [int]$LastEpisode
+    )
+
+    if ($Season -lt 0 -or $FirstEpisode -lt 1 -or $LastEpisode -lt $FirstEpisode) { return $false }
+    for ($episode = $FirstEpisode; $episode -le $LastEpisode; $episode++) {
+        $rx = '(?i)S0*' + $Season + 'E0*' + $episode + '(?!\d)'
+        $matching = @($Files | Where-Object {
+            (Test-SettleMedia -Name ([string]$_.name)) -and ([string]$_.name -match $rx)
+        })
+        if ($matching.Count -eq 0) { return $false }
+        foreach ($file in $matching) {
+            if ($null -eq $file.PSObject.Properties['priority']) { return $false }
+            $priority = 1
+            if (-not [int]::TryParse([string]$file.priority, [ref]$priority) -or $priority -ne 0) { return $false }
+        }
+    }
+    return $true
+}
+
+function Remove-RedundantPackPayloadFiles {
+    param(
+        [object]$Candidate,
+        [object]$Keeper,
+        [object]$Verdict,
+        [hashtable]$FileCache,
+        [object[]]$Torrents
+    )
+
+    if (-not $Candidate -or -not $Keeper -or -not $Verdict -or $DryRun) { return }
+    $remaining = @(Invoke-ApiGet -Endpoint ("torrents/info?hashes={0}" -f $Candidate.hash))
+    if ($remaining.Count -gt 0) {
+        Write-Log 'WARN' "left redundant pack payload in place: qBittorrent still has '$($Candidate.name)'"
+        return
+    }
+
+    $candidateKey = ([string]$Candidate.hash).ToLowerInvariant()
+    $keeperKey = ([string]$Keeper.hash).ToLowerInvariant()
+    $candidateFiles = @($FileCache[$candidateKey])
+    $keeperFiles = @($FileCache[$keeperKey])
+    if ($candidateFiles.Count -eq 0 -or $keeperFiles.Count -eq 0) {
+        Write-Log 'WARN' "left redundant pack payload in place: file listing unavailable for '$($Candidate.name)' or its keeper"
+        return
+    }
+
+    # qBittorrent's content_path may be a common parent claimed by both packs.
+    # Do not use that coarse folder claim to decide whether a *file* is shared:
+    # inspect every other live torrent's file list and compare resolved file paths.
+    $otherFilePaths = @{}
+    foreach ($torrent in @($Torrents)) {
+        if (-not $torrent -or $torrent.hash -eq $Candidate.hash -or (Test-AlreadyGone $torrent)) { continue }
+        $hash = ([string]$torrent.hash).ToLowerInvariant()
+        if (-not $FileCache.ContainsKey($hash)) {
+            try { $FileCache[$hash] = @(Invoke-ApiGet -Endpoint ("torrents/files?hash={0}" -f $torrent.hash)) }
+            catch {
+                Write-Log 'WARN' "left redundant pack payload in place: could not verify file ownership for '$($torrent.name)'"
+                return
+            }
+        }
+        foreach ($file in @($FileCache[$hash])) {
+            try {
+                $path = Resolve-TorrentFilePath -T $torrent -Name ([string]$file.name)
+                $otherFilePaths[$path.ToLowerInvariant()] = $true
+            }
+            catch {
+                Write-Log 'WARN' "left redundant pack payload in place: could not resolve a file owned by '$($torrent.name)'"
+                return
+            }
+        }
+    }
+
+    $removedDirs = @{}
+    for ($episode = [int]$Verdict.First; $episode -le [int]$Verdict.Last; $episode++) {
+        $rx = '(?i)S0*' + [int]$Verdict.Season + 'E0*' + $episode + '(?!\d)'
+        $candidateEpisodeFiles = @($candidateFiles | Where-Object {
+            (Test-SettleMedia -Name ([string]$_.name)) -and ([string]$_.name -match $rx)
+        })
+        $keeperEpisodeFiles = @($keeperFiles | Where-Object {
+            (Test-SettleMedia -Name ([string]$_.name)) -and ([string]$_.name -match $rx)
+        })
+        if ($candidateEpisodeFiles.Count -eq 0 -or $keeperEpisodeFiles.Count -eq 0) {
+            Write-Log 'WARN' "left episode payload in place: file listing no longer proves S$($Verdict.Season)E$episode for '$($Candidate.name)'"
+            continue
+        }
+
+        foreach ($file in $candidateEpisodeFiles) {
+            $candidatePath = $null
+            try { $candidatePath = Resolve-TorrentFilePath -T $Candidate -Name ([string]$file.name) }
+            catch { Write-Log 'WARN' "left unresolvable redundant pack file '$($file.name)'"; continue }
+            if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) { continue }
+            if ($otherFilePaths.ContainsKey($candidatePath.ToLowerInvariant())) {
+                Write-Log 'WARN' "left redundant pack file claimed by another torrent: $candidatePath"
+                continue
+            }
+
+            $candidateBytes = 0L
+            try { $candidateBytes = (Get-Item -LiteralPath $candidatePath -ErrorAction Stop).Length }
+            catch { continue }
+            if ($candidateBytes -ne [int64]$file.size) {
+                Write-Log 'WARN' "left redundant pack file whose on-disk size changed: $candidatePath"
+                continue
+            }
+
+            $hasVerifiedKeeper = $false
+            foreach ($keeperFile in $keeperEpisodeFiles) {
+                if ([int64]$keeperFile.size -lt $candidateBytes) { continue }
+                try {
+                    $keeperPath = Resolve-TorrentFilePath -T $Keeper -Name ([string]$keeperFile.name)
+                    if ($keeperPath.Equals($candidatePath, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                    if ((Test-Path -LiteralPath $keeperPath -PathType Leaf) -and
+                        (Get-Item -LiteralPath $keeperPath -ErrorAction Stop).Length -eq [int64]$keeperFile.size) {
+                        $hasVerifiedKeeper = $true
+                        break
+                    }
+                }
+                catch { continue }
+            }
+            if (-not $hasVerifiedKeeper) {
+                Write-Log 'WARN' "left redundant pack file: no distinct on-disk keeper was verified for S$($Verdict.Season)E$episode"
+                continue
+            }
+
+            try {
+                Remove-Item -LiteralPath $candidatePath -Force -ErrorAction Stop
+                [void]$script:actions.Add("DELETED REDUNDANT PACK FILE  $candidatePath")
+                Write-Log 'DELETE' "removed redundant pack file '$candidatePath' after verifying the larger finished keeper '$($Keeper.name)'"
+                $removedDirs[(Split-Path -Parent $candidatePath).ToLowerInvariant()] = (Split-Path -Parent $candidatePath)
+            }
+            catch { Write-Log 'WARN' "could not remove redundant pack file '$candidatePath': $($_.Exception.Message)" }
+        }
+    }
+
+    # Prune only empty directories containing files just removed. Stop at the
+    # shared save root; never recurse-delete a payload tree or an unrelated file.
+    $saveRoot = ''
+    try { $saveRoot = [IO.Path]::GetFullPath([string]$Candidate.save_path).TrimEnd('\', '/') } catch { return }
+    foreach ($startDir in @($removedDirs.Values)) {
+        $dir = $startDir
+        while ($dir -and $dir.TrimEnd('\', '/') -ine $saveRoot) {
+            if (-not $dir.StartsWith($saveRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { break }
+            if (-not (Test-Path -LiteralPath $dir -PathType Container)) { break }
+            if (@(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue).Count -ne 0) { break }
+            try { [IO.Directory]::Delete($dir, $false) }
+            catch { break }
+            $dir = Split-Path -Parent $dir
+        }
+    }
+}
+
 function ConvertTo-LibraryFolderName {
     <#
         The name a show's library folder should carry: every word capitalised.
@@ -4097,17 +4294,206 @@ function Get-LibraryEpisodeFiles {
                      Where-Object { $videoExt -contains $_.Extension.ToLowerInvariant() })) {
         $parts = $null
         try { $parts = Get-TitleParts -Name $f.Name } catch { $parts = $null }
-        if (-not $parts) { continue }
-        if (-not $parts.IsSeries) { continue }
-        if ($null -eq $parts.Episode) { continue }
-        if ($parts.IsMultiEpisode) { continue }
-        if ($parts.Episode -le 0) { continue }
+        $ep = $null
+        if ($parts -and $parts.IsSeries -and $null -ne $parts.Episode -and
+            -not $parts.IsMultiEpisode -and $parts.Episode -gt 0) {
+            $ep = [int]$parts.Episode
+        }
+        else {
+            # Some localized releases encode season+episode as Cap.103 (S01E03)
+            # instead of an SxxExx marker. Accept that notation only when its
+            # season prefix agrees with the already-established Season N folder;
+            # Cap.103 in Season 2, for example, is not reinterpreted as S02E03.
+            $cap = [regex]::Match($f.Name, '(?i)(?:^|[\s._\[\(])Cap[\s._-]*(?<s>\d{1,2})(?<e>\d{2})(?!\d)')
+            if (-not $cap.Success -or [int]$cap.Groups['s'].Value -ne $Season) { continue }
+            $ep = [int]$cap.Groups['e'].Value
+            if ($ep -le 0) { continue }
+        }
 
-        $ep = $parts.Episode
         if (-not $map.ContainsKey($ep)) { $map[$ep] = New-Object System.Collections.ArrayList }
         [void]$map[$ep].Add($f)
     }
     return $map
+}
+
+function Get-ExternalLibraryDuplicateVerdicts {
+    param(
+        [string[]]$Roots,
+        [string]$SeriesDir,
+        [object[]]$Torrents = @(),
+        [hashtable]$Gone = @{},
+        [object]$Aliases = $null
+    )
+
+    $out = New-Object System.Collections.ArrayList
+    if (-not $SeriesDir -or -not (Test-Path -LiteralPath $SeriesDir -PathType Container)) { return $out }
+    $seriesRoot = [IO.Path]::GetFullPath($SeriesDir).TrimEnd('\', '/')
+    $seriesFolderName = Split-Path -Leaf $seriesRoot
+    $normalizedRoots = @($Roots | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+        ForEach-Object { try { [IO.Path]::GetFullPath([string]$_).TrimEnd('\', '/') } catch { $null } } |
+        Where-Object { $_ } | Select-Object -Unique)
+    $activeTorrents = @($Torrents | Where-Object { -not $Gone.ContainsKey([string]$_.hash) })
+    $videoExt = @('.mkv', '.mp4', '.avi', '.m4v', '.ts')
+    $seen = @{}
+
+    foreach ($rootInput in @($Roots | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })) {
+        $root = ''
+        try { $root = [IO.Path]::GetFullPath([string]$rootInput).TrimEnd('\', '/') } catch { continue }
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        if ($root.Equals($seriesRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            $root.StartsWith($seriesRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        foreach ($file in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue |
+                            Where-Object { $videoExt -contains $_.Extension.ToLowerInvariant() -and
+                                          -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })) {
+            $full = [IO.Path]::GetFullPath($file.FullName)
+            $key = $full.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            if (Test-PendingSettlePath -Path $full) { continue }
+            # A path still claimed by any qBittorrent entry is not orphan cleanup,
+            # even if that entry is stopped or its coarse content_path overlaps.
+            if (Test-Claimed -Path $full -Torrents $activeTorrents) { continue }
+
+            $parts = $null
+            try { $parts = Get-TitleParts -Name $file.Name } catch { $parts = $null }
+            if (-not $parts -or -not $parts.IsSeries -or $null -eq $parts.Episode -or
+                $parts.Episode -le 0 -or $parts.IsMultiEpisode) { continue }
+            $parts = Resolve-PartsAlias -Parts $parts -Aliases $Aliases
+            if (-not $parts -or -not $parts.IsSeries) { continue }
+
+            $torrentShape = [pscustomobject]@{ parts = $parts }
+            $seasonDir = Get-LibraryTargetDir -T $torrentShape -SeriesDir $seriesRoot -Aliases $Aliases
+            if (-not $seasonDir) { continue }
+            if (-not $seasonDir.StartsWith($seriesRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+
+            $libraryEpisodes = Get-LibraryEpisodeFiles -SeasonDir $seasonDir -Season ([int]$parts.Season)
+            $episode = [int]$parts.Episode
+            $libraryCopies = @()
+            if ($libraryEpisodes.ContainsKey($episode)) { $libraryCopies = @($libraryEpisodes[$episode]) }
+            $keepers = @($libraryCopies | Where-Object {
+                -not $_.FullName.Equals($full, [StringComparison]::OrdinalIgnoreCase) -and
+                -not (Test-PendingSettlePath -Path $_.FullName)
+            } | Sort-Object -Property @{ Expression = { $_.Length }; Descending = $true }, FullName)
+
+            # Also compare like-for-like folders on other discovered series roots.
+            # This catches duplicates held only on secondary drives (and recognizes
+            # Season 2 and Season 02 as the same numbered season) without searching
+            # unrelated paths or relying on localized release-title strings.
+            if ((Split-Path -Leaf $root) -ieq $seriesFolderName) {
+                $relative = $full.Substring($root.Length).TrimStart('\', '/')
+                $segments = @($relative -split '[\\/]')
+                if ($segments.Count -ge 3 -and $segments[1] -match '(?i)^Season\s*0*(\d+)$' -and
+                    [int]$Matches[1] -eq [int]$parts.Season) {
+                    $showFolder = $segments[0]
+                    foreach ($peerRoot in $normalizedRoots) {
+                        if ((Split-Path -Leaf $peerRoot) -ine $seriesFolderName) { continue }
+                        $peerShow = Join-Path $peerRoot $showFolder
+                        if (-not (Test-Path -LiteralPath $peerShow -PathType Container)) { continue }
+                        foreach ($peerSeason in @(Get-ChildItem -LiteralPath $peerShow -Directory -Force -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Name -match '(?i)^Season\s*0*(\d+)$' -and [int]$Matches[1] -eq [int]$parts.Season })) {
+                            foreach ($peer in @(Get-ChildItem -LiteralPath $peerSeason.FullName -Recurse -File -Force -ErrorAction SilentlyContinue |
+                                Where-Object { $videoExt -contains $_.Extension.ToLowerInvariant() -and
+                                              -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })) {
+                                if ($peer.FullName.Equals($full, [StringComparison]::OrdinalIgnoreCase) -or
+                                    (Test-PendingSettlePath -Path $peer.FullName)) { continue }
+                                $peerParts = $null
+                                try { $peerParts = Get-TitleParts -Name $peer.Name } catch { $peerParts = $null }
+                                if ($peerParts -and $peerParts.IsSeries -and $null -ne $peerParts.Episode -and
+                                    -not $peerParts.IsMultiEpisode -and [int]$peerParts.Season -eq [int]$parts.Season -and
+                                    [int]$peerParts.Episode -eq $episode) {
+                                    $keepers += $peer
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            $keepers = @($keepers | Sort-Object -Property @{ Expression = { $_.Length }; Descending = $true }, FullName)
+            if ($keepers.Count -eq 0) { continue }
+
+            # Never delete the only/largest copy. Equal-size copies outside the
+            # library are duplicates too: the library copy wins the deterministic
+            # tie so the episode remains in its canonical season folder.
+            $largestBytes = [int64](($keepers | Measure-Object -Property Length -Maximum).Maximum)
+            $largestLibraryCopies = @($libraryCopies | Where-Object { [int64]$_.Length -eq $largestBytes } |
+                Sort-Object -Property FullName)
+            $largestCopies = @($keepers | Where-Object { [int64]$_.Length -eq $largestBytes } |
+                Sort-Object -Property FullName)
+            $keeperIsLibrary = $largestLibraryCopies.Count -gt 0
+            $keeper = if ($keeperIsLibrary) { $largestLibraryCopies[0] } else { $largestCopies[0] }
+            if ($file.Length -gt $keeper.Length) { continue }
+            # For equal-sized copies held only on secondary roots, retain exactly
+            # one deterministically (ordinal path order). A same-size canonical
+            # library keeper always wins the tie so external copies converge inward.
+            if (-not $keeperIsLibrary -and [int64]$file.Length -eq [int64]$keeper.Length -and
+                [StringComparer]::OrdinalIgnoreCase.Compare($full, $keeper.FullName) -le 0) { continue }
+            $keeperClaims = @($activeTorrents | Where-Object {
+                (Test-Claimed -Path $keeper.FullName -Torrents @($_)) -and
+                ([double]$_.progress -lt 1)
+            })
+            if ($keeperClaims.Count -gt 0) { continue }
+
+            [void]$out.Add([pscustomobject]@{
+                File = $full
+                Bytes = [int64]$file.Length
+                Keeper = $keeper.FullName
+                KeeperBytes = [int64]$keeper.Length
+                Season = [int]$parts.Season
+                Episode = $episode
+                ShowDir = (Split-Path -Parent (Split-Path -Parent $seasonDir))
+                Root = $root
+                Reason = ("unowned external duplicate S{0}E{1}: {2:N2} GB; retained library copy is {3:N2} GB" -f `
+                    $parts.Season, $episode, ($file.Length / 1GB), ($keeper.Length / 1GB))
+            })
+        }
+    }
+    return $out
+}
+
+function Get-ExternalDuplicateRoots {
+    param(
+        [string[]]$ConfiguredRoots = @(),
+        [string]$LibraryRoot,
+        [string]$SeriesFolderName = 'Séries',
+        [string[]]$DriveRoots = @()
+    )
+
+    $roots = New-Object System.Collections.ArrayList
+    $seen = @{}
+    foreach ($candidate in @($ConfiguredRoots)) {
+        if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
+        try {
+            $full = [IO.Path]::GetFullPath([string]$candidate).TrimEnd('\', '/')
+            if (Test-Path -LiteralPath $full -PathType Container) {
+                $key = $full.ToLowerInvariant()
+                if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; [void]$roots.Add($full) }
+            }
+        } catch { }
+    }
+
+    # Probe only the configured series-folder name directly beneath each mounted
+    # filesystem root. This discovers removable, fixed, and mapped drives without
+    # recursively crawling arbitrary user data across a volume.
+    if (@($DriveRoots).Count -eq 0) {
+        try { $DriveRoots = @(Get-PSDrive -PSProvider FileSystem | ForEach-Object { [string]$_.Root }) }
+        catch { $DriveRoots = @() }
+    }
+    foreach ($driveRoot in @($DriveRoots)) {
+        if ([string]::IsNullOrWhiteSpace([string]$driveRoot)) { continue }
+        $candidate = Join-Path ([string]$driveRoot) $SeriesFolderName
+        try {
+            if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
+            $full = [IO.Path]::GetFullPath($candidate).TrimEnd('\', '/')
+            if ($LibraryRoot) {
+                $libraryFull = [IO.Path]::GetFullPath($LibraryRoot).TrimEnd('\', '/')
+                if ($full.Equals($libraryFull, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            }
+            $key = $full.ToLowerInvariant()
+            if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; [void]$roots.Add($full) }
+        } catch { continue }
+    }
+    return @($roots.ToArray())
 }
 
 function Get-PhantomVerdicts {
@@ -4839,6 +5225,7 @@ function Get-SettleVerdicts {
     $out = @{}
 
     $live = @($Torrents | Where-Object { $null -ne $_ })
+    $setKeyCache = @{}
     $fileCache = @{}
 
     # Every set key in the run, resolved once. The blocking question is asked
@@ -4848,7 +5235,7 @@ function Get-SettleVerdicts {
     foreach ($t in $live) {
         if ($Gone.ContainsKey($t.hash)) { continue }
         $k = ''
-        try { $k = Resolve-TorrentSetKey -T $t -Cache $fileCache } catch { $k = '' }
+        try { $k = Resolve-TorrentSetKey -T $t -Cache $setKeyCache } catch { $k = '' }
         $keys[$t.hash] = $k
     }
 
@@ -4868,11 +5255,17 @@ function Get-SettleVerdicts {
             continue
         }
 
-        $files = @()
-        try { $files = @(& $FileLister $t.hash) } catch { $files = @() }
+        $fileKey = ([string]$t.hash).ToLowerInvariant()
+        if (-not $fileCache.ContainsKey($fileKey)) {
+            try { $fileCache[$fileKey] = @(& $FileLister $t.hash) } catch { $fileCache[$fileKey] = @() }
+        }
+        $files = @($fileCache[$fileKey])
         if ($files.Count -eq 0) { continue }
 
-        $media = @($files | Where-Object { Test-SettleMedia -Name ([string]$_.name) })
+        $media = @($files | Where-Object {
+            (Test-SettleMedia -Name ([string]$_.name)) -and
+            ($null -eq $_.PSObject.Properties['priority'] -or [int]$_.priority -gt 0)
+        })
         if ($media.Count -eq 0) { continue }
 
         # What is still out there that holds the same thing?
@@ -4905,6 +5298,21 @@ function Get-SettleVerdicts {
                 if ($us.IsFilm) { continue }
                 if (-not $u.parts -or -not (Test-SameMediaIdentity -A $t.parts -B $u.parts)) { continue }
                 if (-not (Test-SpanOverlap -A $span -B $us)) { continue }
+            }
+
+            # A skipped episode is no longer a possible replacement. This is
+            # especially important after duplicate cleanup: a retained pack may
+            # have one redundant episode at priority 0 while its wanted episodes
+            # are being settled out of the pack and its torrent entry is removed.
+            if (-not $us.IsFilm) {
+                $overlapFirst = [Math]::Max([int]$span.First, [int]$us.First)
+                $overlapLast = [Math]::Min([int]$span.Last, [int]$us.Last)
+                $uKey = ([string]$u.hash).ToLowerInvariant()
+                if (-not $fileCache.ContainsKey($uKey)) {
+                    try { $fileCache[$uKey] = @(& $FileLister $u.hash) } catch { $fileCache[$uKey] = @() }
+                }
+                if (Test-TorrentEpisodesAreSkipped -Files @($fileCache[$uKey]) -Season ([int]$span.Season) `
+                    -FirstEpisode $overlapFirst -LastEpisode $overlapLast) { continue }
             }
             $blockers += $u
         }
@@ -4955,7 +5363,8 @@ function Get-SettleVerdicts {
         foreach ($f in $files) {
             try { $path = Resolve-TorrentFilePath -T $t -Name ([string]$f.name) }
             catch { $pathError = $_.Exception.Message; break }
-            if (-not (Test-SettleMedia -Name ([string]$f.name))) { $discard += $path }
+            if (-not (Test-SettleMedia -Name ([string]$f.name)) -or
+                ($null -ne $f.PSObject.Properties['priority'] -and [int]$f.priority -eq 0)) { $discard += $path }
         }
         if ($pathError) {
             $out[$t.hash] = [pscustomobject]@{ Verdict = 'WAIT'; Torrent = $t; Files = @(); Reason = "cannot resolve torrent file paths: $pathError" }
@@ -6688,6 +7097,57 @@ foreach ($c in $setGroups) {
             break
         }
     }
+
+    # A smaller multi-episode pack can be safely removed when a FINISHED wider
+    # pack contains every one of its episodes and its measured file is no smaller
+    # for any episode. Comparing pack totals here would be invalid: the wider
+    # pack also contains episodes the candidate does not. This per-episode proof
+    # lets the wider pack proceed to settlement, where its files are flattened
+    # into the season folder and its torrent entry is removed.
+    $packCandidates = @($members | Where-Object {
+        -not (Test-AlreadyGone $_) -and $_.parts -and $_.parts.IsSeries -and
+        ($_.parts.IsMultiEpisode -or $_.parts.Episode -eq 0)
+    } | Sort-Object -Property @{ Expression = { [double]$_.size }; Descending = $false }, hash)
+    foreach ($candidate in $packCandidates) {
+        if (Test-AlreadyGone $candidate) { continue }
+        $keepers = @($members | Where-Object {
+            -not (Test-AlreadyGone $_) -and $_.hash -ne $candidate.hash -and
+            $_.parts -and $_.parts.IsSeries -and ($_.parts.IsMultiEpisode -or $_.parts.Episode -eq 0) -and
+            [double]$_.progress -ge 1
+        } | Sort-Object -Property @{ Expression = { [double]$_.size }; Descending = $true }, hash)
+
+        foreach ($keeper in $keepers) {
+            $verdict = Get-ContainedPackDuplicateVerdict -Candidate $candidate -Keeper $keeper `
+                -SetKeyCache $script:setKeyCache -FileSizeCache $fileSizeCache
+            if (-not $verdict) { continue }
+
+            $episodeProof = @($verdict.Comparisons | ForEach-Object {
+                ('S{0}E{1}: {2:N2} GB ≥ {3:N2} GB' -f $verdict.Season, $_.Episode,
+                    ($_.KeeperBytes / 1GB), ($_.CandidateBytes / 1GB))
+            }) -join '; '
+            $reason = ("all episodes in S{0}E{1}-E{2} are covered by finished wider pack '{3}' with no smaller episode files ({4}); removing the redundant pack entry and its unshared data" -f `
+                $verdict.Season, $verdict.First, $verdict.Last, $keeper.name, $episodeProof)
+            $rt = @{
+                T = $candidate
+                AllowErrored = $true
+                Knows = $true
+                AllowIncomingBetter = $true
+                DeleteFiles = $true
+                Reason = $reason
+            }
+            Remove-Torrent @rt
+            # Remove-Torrent's broad content_path guard is intentionally
+            # conservative: qBittorrent can report both packs as claiming a
+            # shared parent even when their episode files are distinct. Once the
+            # candidate entry is confirmed gone, remove only its listed episode
+            # files whose exact paths are unclaimed and whose larger keeper files
+            # are verified on disk. This avoids leaving duplicate release folders
+            # without weakening the central torrent-data deletion guard.
+            Remove-RedundantPackPayloadFiles -Candidate $candidate -Keeper $keeper `
+                -Verdict $verdict -FileCache $fileSizeCache -Torrents @($script:allTorrents)
+            break
+        }
+    }
 }
 
 # -- rule 4b: the same episode twice inside one show's own season folder -------
@@ -6830,6 +7290,66 @@ else {
                 Write-Log 'WARN' "could not delete duplicate file $($d.File): $($_.Exception.Message)"
             }
         }
+    }
+}
+
+# -- rule 4c2: clean verified duplicates left outside the library -------------
+#
+# The age-based orphan reaper is deliberately conservative for UNKNOWN files.
+# A file proven to be a smaller/equal copy of an episode already in the library
+# is not unknown and should not occupy staging/external storage for another day.
+# Scan the configured temp/external roots plus a same-named Séries folder directly
+# under each mounted filesystem root; never crawl a whole drive. The verdict requires a parsed single episode,
+# an on-disk library keeper at least as large, no live torrent claim, and no
+# pending-settle claim. The action repeats those checks immediately before unlink.
+$externalDuplicateRoots = @()
+if ($cfg.PSObject.Properties['reapRoots']) { $externalDuplicateRoots += @($cfg.reapRoots) }
+if ($cfg.PSObject.Properties['externalDuplicateRoots']) { $externalDuplicateRoots += @($cfg.externalDuplicateRoots) }
+$seriesFolderName = Split-Path -Leaf ([string]$cfg.seriesDir)
+$externalDuplicateRoots = @(Get-ExternalDuplicateRoots -ConfiguredRoots $externalDuplicateRoots `
+    -LibraryRoot ([string]$cfg.seriesDir) -SeriesFolderName $seriesFolderName)
+
+if (-not $SkipLibraryScan -and $libraryDupOn -and $externalDuplicateRoots.Count -gt 0) {
+    $externalDupes = @(Get-ExternalLibraryDuplicateVerdicts -Roots $externalDuplicateRoots `
+        -SeriesDir $cfg.seriesDir -Torrents @($all) -Gone $script:gone -Aliases $cfg.titleAliases)
+    $externalLive = @($all | Where-Object { -not $script:gone.ContainsKey([string]$_.hash) })
+    foreach ($d in $externalDupes) {
+        if ($DryRun) {
+            [void]$script:actions.Add("WOULD DELETE VERIFIED EXTERNAL DUPLICATE  $($d.File) - $($d.Reason)")
+            Write-Log 'DELETE' "[DRY-RUN] $($d.File) - $($d.Reason)"
+            continue
+        }
+        try {
+            if (-not (Test-Path -LiteralPath $d.File -PathType Leaf) -or
+                -not (Test-Path -LiteralPath $d.Keeper -PathType Leaf)) { continue }
+            if ((Get-Item -LiteralPath $d.File -ErrorAction Stop).Length -ne [int64]$d.Bytes -or
+                (Get-Item -LiteralPath $d.Keeper -ErrorAction Stop).Length -ne [int64]$d.KeeperBytes -or
+                [int64]$d.KeeperBytes -lt [int64]$d.Bytes) { continue }
+            if ((Test-PendingSettlePath -Path $d.File) -or (Test-Claimed -Path $d.File -Torrents $externalLive)) { continue }
+            if (Test-PendingSettlePath -Path $d.Keeper) { continue }
+            $keeperClaim = @($externalLive | Where-Object {
+                [double]$_.progress -lt 1 -and (Test-Claimed -Path $d.Keeper -Torrents @($_))
+            })
+            if ($keeperClaim.Count -gt 0) { continue }
+
+            Remove-Item -LiteralPath $d.File -Force -ErrorAction Stop
+            [void]$script:actions.Add("DELETED VERIFIED EXTERNAL DUPLICATE  $($d.File) - $($d.Reason)")
+            Write-Log 'DELETE' "$($d.File) - $($d.Reason) (verified library keeper; no torrent owner)"
+
+            $root = [IO.Path]::GetFullPath([string]$d.Root).TrimEnd('\', '/')
+            $dir = Split-Path -Parent $d.File
+            while ($dir -and $dir.TrimEnd('\', '/') -ine $root -and
+                   $dir.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                if (-not (Test-Path -LiteralPath $dir -PathType Container) -or
+                    (Test-PendingSettlePath -Path $dir) -or (Test-Claimed -Path $dir -Torrents $externalLive)) { break }
+                $item = Get-Item -LiteralPath $dir -Force -ErrorAction Stop
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { break }
+                if (@(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop).Count -ne 0) { break }
+                [IO.Directory]::Delete($dir, $false)
+                $dir = Split-Path -Parent $dir
+            }
+        }
+        catch { Write-Log 'WARN' "could not clean verified external duplicate '$($d.File)': $($_.Exception.Message)" }
     }
 }
 

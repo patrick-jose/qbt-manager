@@ -170,6 +170,110 @@ $found = @(@($d | Where-Object { (Split-Path -Leaf $_.File) -like 'e0*' }))
 Check 'and is still matched inside Season 18'        ($found.Count -eq 7)
 
 Write-Host ''
+Write-Host '== localized Cap.SSEE names are compared as episodes =='
+$capRoot = New-Tree -ShowName 'VisionQuest' -Season 1 -Layout (@{
+    "|VisionQuest [4K 2160p][Cap.103].mkv" = 4500
+    "|VisionQuest.S01E03.2160p.HDR.Master5.mkv" = 4475
+})
+$capRows = @(Judge $capRoot)
+$capDelete = @(Deletes $capRows)
+Check 'Cap.103 is interpreted as S01E03 from the Season 1 folder' `
+    (@($capRows | Where-Object { $_.Episode -eq '1-E3' -or $_.File -match 'Cap\.103' }).Count -ge 1)
+Check 'the smaller Master5 E03 is selected for removal' `
+    ($capDelete.Count -eq 1 -and (Split-Path -Leaf $capDelete[0].File) -eq 'VisionQuest.S01E03.2160p.HDR.Master5.mkv')
+$cap2Root = New-Tree -ShowName 'VisionQuest' -Season 2 -Layout (@{
+    "|VisionQuest [4K 2160p][Cap.103].mkv" = 4500
+    "|VisionQuest.S02E03.2160p.HDR.Master5.mkv" = 4475
+})
+Check 'Cap.103 is not reinterpreted as a Season 2 episode' `
+    (@(Judge $cap2Root | Where-Object { $_.File -match 'Cap\.103' }).Count -eq 0)
+
+Write-Host ''
+Write-Host '== verified duplicates outside the library are cleaned immediately =='
+$externalLibrary = New-Tree -ShowName 'VisionQuest' -Season 1 -Layout (@{
+    "|VisionQuest.S01E02.2160p.HDR.Master5.mkv" = 4000
+})
+$externalRoot = Join-Path ([IO.Path]::GetTempPath()) ('extdup-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$externalRelease = Join-Path $externalRoot 'VisionQuest.S01.2160p.WEB-DL'
+New-Item -ItemType Directory -Path $externalRelease -Force | Out-Null
+$externalFile = Join-Path $externalRelease 'VisionQuest.S01E02.2160p.HDR.Master5.mkv'
+$stream = [IO.File]::Create($externalFile); $stream.SetLength(3500KB); $stream.Close()
+$externalVerdicts = @(Get-ExternalLibraryDuplicateVerdicts -Roots @($externalRoot) `
+    -SeriesDir $externalLibrary -Torrents @() -Gone @{})
+Check 'a smaller unowned external episode is matched to its canonical library keeper' `
+    ($externalVerdicts.Count -eq 1 -and $externalVerdicts[0].File -eq $externalFile -and
+     $externalVerdicts[0].Keeper -like '*VisionQuest.S01E02.2160p.HDR.Master5.mkv')
+$stream = [IO.File]::OpenWrite($externalFile); $stream.SetLength(4500KB); $stream.Close()
+Check 'an external copy larger than the library keeper is preserved' `
+    (@(Get-ExternalLibraryDuplicateVerdicts -Roots @($externalRoot) `
+        -SeriesDir $externalLibrary -Torrents @() -Gone @{}).Count -eq 0)
+$stream = [IO.File]::OpenWrite($externalFile); $stream.SetLength(3500KB); $stream.Close()
+$externalOwner = [pscustomobject]@{ hash = 'external-owner'; name = 'active external torrent';
+    content_path = $externalFile; progress = 0.5 }
+Check 'a live torrent claim prevents external duplicate cleanup' `
+    (@(Get-ExternalLibraryDuplicateVerdicts -Roots @($externalRoot) `
+        -SeriesDir $externalLibrary -Torrents @($externalOwner) -Gone @{}).Count -eq 0)
+
+$driveA = Join-Path $externalRoot 'drive-a'
+$driveB = Join-Path $externalRoot 'drive-b'
+$driveMissing = Join-Path $externalRoot 'drive-missing'
+$seriesName = 'S' + [char]0xE9 + 'ries'
+$discoveredA = Join-Path $driveA $seriesName
+$discoveredB = Join-Path $driveB $seriesName
+New-Item -ItemType Directory -Path $discoveredA,$discoveredB -Force | Out-Null
+$unavailableConfigured = Join-Path (Join-Path $externalRoot 'offline-drive') $seriesName
+$discoveredRoots = @(Get-ExternalDuplicateRoots -ConfiguredRoots @($externalRoot,$unavailableConfigured) `
+    -LibraryRoot $externalLibrary -SeriesFolderName $seriesName `
+    -DriveRoots @($driveA,$driveB,$driveMissing,(Split-Path -Parent $externalLibrary)))
+Check 'all mounted roots with a direct Séries folder are discovered and deduplicated' `
+    ($discoveredRoots.Count -eq 3 -and @($discoveredRoots | Where-Object { $_ -eq $discoveredA }).Count -eq 1 -and
+     @($discoveredRoots | Where-Object { $_ -eq $discoveredB }).Count -eq 1)
+Check 'unavailable configured drives and the canonical library are ignored' `
+    (@($discoveredRoots | Where-Object { $_ -eq $unavailableConfigured -or $_ -eq $externalLibrary }).Count -eq 0)
+
+$castleLibrary = New-Tree -ShowName 'Castle Rock' -Season 2 -Layout @{
+    '|Castle.Rock.S02E01.720p.mkv' = 1000
+}
+$castleLibraryRoot = Join-Path (Join-Path $externalRoot 'library') $seriesName
+New-Item -ItemType Directory -Path $castleLibraryRoot -Force | Out-Null
+Move-Item -LiteralPath (Join-Path $castleLibrary 'Castle Rock') -Destination $castleLibraryRoot
+$peerA = Join-Path (Join-Path $externalRoot 'peer-a') $seriesName
+$peerB = Join-Path (Join-Path $externalRoot 'peer-b') $seriesName
+$peerFileA = Join-Path (Join-Path (Join-Path $peerA 'Castle Rock') 'Season 02') 'Castle.Rock.S02E09.720p.WEBRip.mkv'
+$peerFileB = Join-Path (Join-Path (Join-Path $peerB 'Castle Rock') 'Season 2') 'Castle Rock S02E09 HDTV Castellano.mkv'
+New-Item -ItemType Directory -Path (Split-Path -Parent $peerFileA),(Split-Path -Parent $peerFileB) -Force | Out-Null
+$stream = [IO.File]::Create($peerFileA); $stream.SetLength(800KB); $stream.Close()
+$stream = [IO.File]::Create($peerFileB); $stream.SetLength(1800KB); $stream.Close()
+$crossRootVerdicts = @(Get-ExternalLibraryDuplicateVerdicts -Roots @($peerA,$peerB) `
+    -SeriesDir $castleLibraryRoot -Torrents @() -Gone @{})
+Check 'a smaller copy is detected against a larger episode on another discovered series root' `
+    (@($crossRootVerdicts | Where-Object { $_.File -eq $peerFileA }).Count -eq 1 -and
+     @($crossRootVerdicts | Where-Object { $_.File -eq $peerFileB }).Count -eq 0)
+$castleSeason = Join-Path $castleLibraryRoot 'Castle Rock\Season 2'
+Remove-Item -LiteralPath (Join-Path $castleSeason 'Castle.Rock.S02E01.720p.mkv') -Force
+Remove-Item -LiteralPath $castleSeason -Force
+$crossRootWithoutLibrary = @(Get-ExternalLibraryDuplicateVerdicts -Roots @($peerA,$peerB) `
+    -SeriesDir $castleLibraryRoot -Torrents @() -Gone @{})
+Check 'secondary-root duplicates are found even when the canonical season folder is absent' `
+    (@($crossRootWithoutLibrary | Where-Object { $_.File -eq $peerFileA }).Count -eq 1 -and
+     @($crossRootWithoutLibrary | Where-Object { $_.File -eq $peerFileB }).Count -eq 0)
+$stream = [IO.File]::OpenWrite($peerFileB); $stream.SetLength(800KB); $stream.Close()
+$crossRootTie = @(Get-ExternalLibraryDuplicateVerdicts -Roots @($peerA,$peerB) `
+    -SeriesDir $castleLibraryRoot -Torrents @() -Gone @{})
+Check 'equal copies across secondary roots retain one deterministic keeper, not zero or two' `
+    ($crossRootTie.Count -eq 1 -and $crossRootTie[0].File -eq $peerFileB)
+$sameRootSmall = Join-Path (Split-Path -Parent $peerFileA) 'Castle.Rock.S02E10.480p.mkv'
+$sameRootLarge = Join-Path (Split-Path -Parent $peerFileA) 'Castle.Rock.S02E10.720p.mkv'
+$stream = [IO.File]::Create($sameRootSmall); $stream.SetLength(400KB); $stream.Close()
+$stream = [IO.File]::Create($sameRootLarge); $stream.SetLength(900KB); $stream.Close()
+$sameRootVerdicts = @(Get-ExternalLibraryDuplicateVerdicts -Roots @($peerA,$peerB) `
+    -SeriesDir $castleLibraryRoot -Torrents @() -Gone @{})
+Check 'duplicates inside one secondary series root are compared episode-by-episode too' `
+    (@($sameRootVerdicts | Where-Object { $_.File -eq $sameRootSmall }).Count -eq 1 -and
+     @($sameRootVerdicts | Where-Object { $_.File -eq $sameRootLarge }).Count -eq 0)
+Remove-Item -LiteralPath $externalRoot -Recurse -Force
+
+Write-Host ''
 Write-Host '== a tie keeps one deterministic finished copy =='
 $tieLayout = @{
     "$folderA|Its.Always.Sunny.in.Philadelphia.S18E01.1080p.WEB-DL.x264-A.mkv" = 1500
