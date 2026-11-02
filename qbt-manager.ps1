@@ -155,7 +155,7 @@ $cfg = Get-MergedConfig -ConfigPath $ConfigPath -Root $PSScriptRoot
 # placeholder is not a syntax error, and refusing to run over it would be worse
 # than running and saying nothing can match.
 $unconfigured = @()
-foreach ($k in 'moviesDir', 'seriesDir') {
+foreach ($k in 'moviesDir', 'seriesDir', 'stagingDir') {
     $v = [string]$cfg.$k
     if ($v -match 'PUT-YOUR-PATH-HERE' -or [string]::IsNullOrWhiteSpace($v)) { $unconfigured += $k }
 }
@@ -647,9 +647,13 @@ function Get-TitleParts {
     # philadelphia s18e01': wrong show, wrong season, and an episode set no
     # other release could ever share, so dedup could not weigh it against
     # anything.
-    $m = [regex]::Match($work, '(?i)(?<!\w)S(?<s>\d{1,3})[\s._-]*E(?<e1>\d{1,3})[\s._-]*E(?<e2>\d{1,3})(?!\w)')
+    # Underscore is a common release-name separator (Show_S01E05_Title), but
+    # .NET treats it as a word character. Do not let that hide the season marker
+    # from the parser; letters and digits are the characters that make a marker
+    # part of an ordinary word.
+    $m = [regex]::Match($work, '(?i)(?<![\p{L}\p{Nd}])S(?<s>\d{1,3})[\s._-]*E(?<e1>\d{1,3})[\s._-]*E(?<e2>\d{1,3})(?![\p{L}\p{Nd}])')
     if (-not $m.Success) {
-        $m = [regex]::Match($work, '(?i)(?<!\w)S(?<s>\d{1,3})[\s._-]*E(?<e1>\d{1,3})(?:\s*[-~]\s*E?(?<e2>\d{1,3}))?(?!\w)')
+        $m = [regex]::Match($work, '(?i)(?<![\p{L}\p{Nd}])S(?<s>\d{1,3})[\s._-]*E(?<e1>\d{1,3})(?:\s*[-~]\s*E?(?<e2>\d{1,3}))?(?![\p{L}\p{Nd}])')
     }
     if (-not $m.Success) {
         $m = [regex]::Match($work, '(?i)(?<![\w.])(?<s>\d{1,2})x(?<e1>\d{1,3})(?:\s*[-~]\s*(?:x)?(?<e2>\d{1,3}))?(?![\w])')
@@ -687,7 +691,10 @@ function Get-TitleParts {
     # be a real one, which is what stops a group tag like '-S0NNER' or a
     # trailing 'x264-S0' from being read as season zero.
     if (-not $m.Success) {
-        $m = [regex]::Match($work, '(?i)(?<!\w)(?:season|se)[\s._-]*(?<s>0*[1-9]\d{0,2})(?!\w)')
+        $m = [regex]::Match($work, '(?i)(?<![\p{L}\p{Nd}])(?:season|sezon|saison|s[eé]rie|series|se)[\s._:-]*(?<s>0*[1-9]\d{0,2})(?![\p{L}\p{Nd}])')
+        if (-not $m.Success) {
+            $m = [regex]::Match($work, '(?i)(?<![\p{L}\p{Nd}])(?<s>0*[1-9]\d?)(?:\s*\.\s*|\s+(?:st|nd|rd|th)\s+)(?:season|sezon|saison|s[eé]rie|series)(?![\p{L}\p{Nd}])')
+        }
         if ($m.Success) { $episode = 0 }
     }
     if (-not $m.Success) {
@@ -695,8 +702,29 @@ function Get-TitleParts {
         # time this runs there is no 'E' anywhere near - an 'S01E01' release was
         # taken by the first pattern and a bare 'E01' by the third. What is left
         # is a season number standing on its own.
-        $m = [regex]::Match($work, '(?i)(?<!\w)S(?<s>0*[1-9]\d{0,2})(?!\w)')
-        if ($m.Success) { $episode = 0 }
+        #
+        # But not every 'S<number>' is a season. A release group can be glued to
+        # the audio or video tag with a hyphen:
+        #
+        #   Substancja / The Substance (2024) [DD5.1-S56]
+        #   Show 1080p x264-S56
+        #
+        # S56 there is the group name, not season 56. Treating it as a season
+        # made a film a whole-season pack, so its movie identity was never
+        # consulted and it could never meet its own other releases. A season
+        # marker only counts when it stands on its own, or follows a plain
+        # separator - not when the hyphen attaches it to a codec token.
+        $bare = [regex]::Match($work, '(?i)(?<![\p{L}\p{Nd}])S(?<s>0*[1-9]\d{0,2})(?![\p{L}\p{Nd}])')
+        if ($bare.Success) {
+            $before = $work.Substring(0, $bare.Index)
+            $tag = [regex]::Match($before, '(?i)([^\s\-\[\]\(\)]+)-$')
+            $codec = $tag.Success -and ($tag.Groups[1].Value -match `
+                '(?i)(?:x26[45]|h26[45]|hevc|avc|xvid|divx|av1|vp9|ddp?|eac-?3|ac-?3|dts|aac|flac|opus|pcm|mp3|lpcm|truehd|atmos|blu-?ray|bdrip|brrip|remux|hdtv|dvdrip|web-?dl|web-?rip|dl|\d{3,4}[pi]|\d\.\d)')
+            if (-not $codec) {
+                $m = $bare
+                $episode = 0
+            }
+        }
     }
     if ($m.Success) {
         $isSeries = $true
@@ -998,6 +1026,11 @@ function Get-EpisodeSetKey {
     if (-not $Parts.IsSeries) { return "film" }
     if ($null -eq $Parts.Episode) { return "" }
 
+    # A matched TV identity with no episode marker is a whole show/season pack.
+    # Preserve the unknown season rather than inventing S1; show-family grouping
+    # still constrains this key to the uniquely identified TMDB series.
+    if ($Parts.Episode -eq 0 -and $null -eq $Parts.Season) { return 'SHOW-ALL' }
+
     $s = "S$($Parts.Season)"
     if ($Parts.Episode -eq 0) { return "$s-ALL" }
 
@@ -1022,8 +1055,12 @@ function Test-PackContainsEpisode {
 }
 
 function Test-PackEpisodeOutweighsSingle {
-    param([long]$PackEpisodeBytes, [long]$SingleTotalBytes)
-    return ($PackEpisodeBytes -gt $SingleTotalBytes)
+    param([long]$PackEpisodeBytes, [long]$SingleEpisodeBytes)
+    # Episode identity is established by the parsed show/season/episode and the
+    # files' episode markers. Once the keeper is finished, an equal-or-larger
+    # copy of that same episode makes an unfinished single redundant. Do not
+    # inspect or compare release filenames beyond the episode coordinate.
+    return ($PackEpisodeBytes -ge $SingleEpisodeBytes)
 }
 
 # The episode set a release REALLY holds, read from its own file list. Returns
@@ -1081,6 +1118,19 @@ function Get-EpisodeSetFromFiles {
         $leaf = $path
         $cut = $path.LastIndexOfAny([char[]]@('/', '\'))
         if ($cut -ge 0) { $leaf = $path.Substring($cut + 1) }
+
+        # Some complete-season releases number episodes as 1x01 instead of
+        # S01E01 (for example, an XviD season pack). Normalize that common
+        # notation before the shared range parser below; otherwise an ordinary
+        # .avi episode makes the entire pack unknown and keeps it out of dedup.
+        $leaf = [regex]::Replace($leaf,
+            '(?i)(?<!\d)(\d{1,2})x(\d{1,2})(?:-(?:E)?(\d{1,2}))?(?!\d)',
+            [System.Text.RegularExpressions.MatchEvaluator]{
+                param($match)
+                $normalized = 'S{0}E{1}' -f $match.Groups[1].Value, $match.Groups[2].Value
+                if ($match.Groups[3].Success) { $normalized += '-{0}' -f $match.Groups[3].Value }
+                return $normalized
+            })
 
         $extension = [IO.Path]::GetExtension($leaf).ToLowerInvariant()
         if ($extension -in $sidecarExtensions) { continue }
@@ -1247,9 +1297,59 @@ function Get-CommonRun {
     return ($run -join ' ')
 }
 
+function Get-TmdbGroupIdentity {
+    <#
+        The single TMDB work identity shared by every identity-bearing member of
+        a group, as 'type:id', or '' when there is no such identity.
+
+        Members without an identity are ignored rather than vetoing the answer,
+        because an unidentified magnet is not evidence that the identified
+        release is something else. Two DIFFERENT identities do disqualify the
+        group: a mixed group must never borrow one work's name.
+    #>
+    param($Parts)
+
+    $identities = @{}
+    foreach ($p in @($Parts | Where-Object { $_ })) {
+        $id = [string](Get-PartValue -Parts $p -Name 'TmdbId')
+        if (-not $id) { continue }
+        $identities[('{0}:{1}' -f [string](Get-PartValue -Parts $p -Name 'TmdbType'), $id)] = $true
+    }
+    if ($identities.Count -ne 1) { return '' }
+    return [string]@($identities.Keys)[0]
+}
+
+function Get-TmdbGroupName {
+    <#
+        The canonical TMDB name for one group, or '' when the group has no single
+        authoritative identity.
+
+        Release filenames are never reliable evidence of a work's name: the same
+        film arrives as 'The Substance', 'Substancja / The Substance' and
+        'A Subst&acirc;ncia', and the parsed title differs with every release.
+        A group label must therefore come from TMDB when TMDB has identified the
+        work, not from whichever filename happened to sort first.
+    #>
+    param($Parts)
+
+    $list = @($Parts | Where-Object { $_ })
+    if ($list.Count -eq 0) { return '' }
+    if (-not (Get-TmdbGroupIdentity -Parts $list)) { return '' }
+
+    foreach ($p in $list) {
+        $name = [string](Get-PartValue -Parts $p -Name 'TmdbName')
+        if ($name) { return $name }
+    }
+    return ''
+}
+
 function Get-ShowLabel {
     <#
         The show part of a group header, shared by the manager and status.ps1.
+
+        The name is TMDB's canonical title whenever the group has one identity,
+        because release filenames are not a stable name for a work. Only an
+        unidentified group falls back to the parsed title.
 
         The year is printed only when EVERY member of the group states the same
         one.
@@ -1267,7 +1367,8 @@ function Get-ShowLabel {
     $list = @($Parts)
     if ($list.Count -eq 0) { return '' }
 
-    $show = $list[0].Title
+    $show = Get-TmdbGroupName -Parts $list
+    if (-not $show) { $show = $list[0].Title }
     $years = @($list | ForEach-Object { $_.Year } | Where-Object { $_ } | Sort-Object -Unique)
     $unstated = @($list | Where-Object { -not $_.Year }).Count
     if ($years.Count -eq 1 -and $unstated -eq 0) { $show += ' (' + $years[0] + ')' }
@@ -1437,13 +1538,17 @@ function Get-ClusterFamilies {
     for ($i = 0; $i -lt $count; $i++) {
         $parts = $Clusters[$i][0].parts
         if (-not $parts -or -not $parts.IsSeries) { continue }
-        if ($null -eq $parts.Season -or $null -eq $parts.Episode) { continue }
         $tmdbId = [string](Get-PartValue -Parts $parts -Name 'TmdbId')
         $tmdbNameKey = [string](Get-PartValue -Parts $parts -Name 'TmdbNameKey')
         if ((Get-PartValue -Parts $parts -Name 'TmdbType') -eq 'tv' -and $tmdbId -and $tmdbNameKey) {
             $show[$i] = $tmdbNameKey
             continue
         }
+        # Unknown coordinates must stay unknown for episode-level decisions, but
+        # they do not erase the show's identity. Keep a uniquely matched TMDB TV
+        # torrent in its show family so its file-derived episode-set key can be
+        # compared with season packs whose title does carry coordinates.
+        if ($null -eq $parts.Season -or $null -eq $parts.Episode) { continue }
 
         # One element per title, each element being that title's whole word
         # list. Written as an explicit loop rather than a pipeline, because a
@@ -1924,6 +2029,116 @@ function Update-StalledInternetPause {
         $State.PSObject.Properties.Remove('stalledInternetDownSince')
     }
 
+    return $false
+}
+
+function Get-StalledDiskSpaceStatus {
+    param(
+        [object[]]$Torrents,
+        [double]$MinimumFreeSpaceGB = 5,
+        [scriptblock]$FreeSpaceProbe,
+        [bool]$CheckAllDrives = $true
+    )
+
+    if (-not $FreeSpaceProbe) {
+        $FreeSpaceProbe = {
+            param([string]$Path)
+            try {
+                $root = [System.IO.Path]::GetPathRoot($Path)
+                if ([string]::IsNullOrWhiteSpace($root)) { return $null }
+                $drive = New-Object System.IO.DriveInfo($root)
+                if (-not $drive.IsReady) { return $null }
+                return [int64]$drive.AvailableFreeSpace
+            } catch { return $null }
+        }
+    }
+
+    $minimumBytes = [int64][Math]::Max(0.0, ([double]$MinimumFreeSpaceGB * 1GB))
+    if ($CheckAllDrives -and $minimumBytes -gt 0) {
+        foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+            try {
+                if ($drive.DriveType -ne [System.IO.DriveType]::Fixed -or -not $drive.IsReady) { continue }
+                $freeBytes = [int64]$drive.AvailableFreeSpace
+                if ($freeBytes -lt $minimumBytes) {
+                    return [pscustomobject]@{
+                        Path = $drive.RootDirectory.FullName
+                        FreeBytes = $freeBytes
+                        RemainingBytes = [int64]0
+                        MinimumBytes = $minimumBytes
+                    }
+                }
+            } catch { }
+        }
+    }
+
+    $checked = @{}
+    foreach ($t in $Torrents) {
+        if ($null -eq $t -or [double]$t.progress -ge 1 -or [int64]$t.amount_left -le 0) { continue }
+        $path = [string]$t.save_path
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        $root = [System.IO.Path]::GetPathRoot($path)
+        if (-not $root) { continue }
+        $key = $root.ToLowerInvariant()
+        if (-not $checked.ContainsKey($key)) {
+            $free = $null
+            try { $free = & $FreeSpaceProbe $path } catch { }
+            if ($null -ne $free) { $checked[$key] = [int64]$free }
+        }
+        if (-not $checked.ContainsKey($key)) { continue }
+
+        $freeBytes = [int64]$checked[$key]
+        $remainingBytes = [int64]$t.amount_left
+        if (($minimumBytes -gt 0 -and $freeBytes -lt $minimumBytes) -or $freeBytes -lt $remainingBytes) {
+            return [pscustomobject]@{
+                Path = $path
+                FreeBytes = $freeBytes
+                RemainingBytes = $remainingBytes
+                MinimumBytes = $minimumBytes
+            }
+        }
+    }
+    return $null
+}
+
+function Update-StalledRemovalPause {
+    param(
+        [object]$State,
+        [datetime]$Now,
+        [string[]]$PauseReasons
+    )
+
+    if ($null -eq $State) { return $false }
+    if (-not $State.PSObject.Properties['stalled']) {
+        $State | Add-Member -NotePropertyName 'stalled' -NotePropertyValue ([pscustomobject]@{})
+    }
+    $pauseProp = $State.PSObject.Properties['stalledRemovalPausedSince']
+    if (@($PauseReasons | Where-Object { $_ }).Count -gt 0) {
+        if ($null -eq $pauseProp -or -not $pauseProp.Value) {
+            $State | Add-Member -NotePropertyName 'stalledRemovalPausedSince' -NotePropertyValue $Now.ToString('o') -Force
+        }
+        $State | Add-Member -NotePropertyName 'stalledRemovalPauseReasons' -NotePropertyValue (@($PauseReasons | Where-Object { $_ } | Select-Object -Unique)) -Force
+        return $true
+    }
+
+    if ($null -ne $pauseProp -and $pauseProp.Value) {
+        $pausedSince = $null
+        try { $pausedSince = [datetime]::Parse([string]$pauseProp.Value) } catch { }
+        if ($null -ne $pausedSince) {
+            $pausedFor = $Now - $pausedSince
+            if ($pausedFor.TotalSeconds -gt 0) {
+                foreach ($entry in @($State.stalled.PSObject.Properties)) {
+                    try {
+                        $last = [datetime]::Parse([string]$entry.Value.lastProgressAt)
+                        $entry.Value.lastProgressAt = $last.Add($pausedFor).ToString('o')
+                    } catch { }
+                }
+            }
+        }
+        $State.PSObject.Properties.Remove('stalledRemovalPausedSince')
+        if ($State.PSObject.Properties['stalledRemovalPauseReasons']) {
+            $State.PSObject.Properties.Remove('stalledRemovalPauseReasons')
+        }
+    }
     return $false
 }
 
@@ -2906,7 +3121,15 @@ function Resolve-TorrentSetKey {
     )
 
     $nameKey = Get-EpisodeSetKey -Parts $T.parts
-    if ($nameKey -notmatch '^S\d+-ALL$') { return $nameKey }
+    # Most series releases carry an explicit season/episode key in their name.
+    # A TMDB-confirmed TV torrent with unknown season coordinates is different:
+    # it still needs its own file list checked. This is common for localized
+    # full-season releases whose title has no season marker, but whose files are
+    # named S01E01...S01E10. Returning the empty name key here silently excluded
+    # those packs from comparisons against a completed season copy.
+    $needsFileResolution = ($nameKey -match '^S\d+-ALL$') -or
+        ($T.parts.IsSeries -and [string]::IsNullOrWhiteSpace($nameKey))
+    if (-not $needsFileResolution) { return $nameKey }
     if ([string]::IsNullOrWhiteSpace($T.hash)) { return $nameKey }
 
     $key = $T.hash.ToLowerInvariant()
@@ -2921,7 +3144,7 @@ function Resolve-TorrentSetKey {
     return $fromFiles
 }
 
-function Get-PackEpisodeBytes {
+function Get-PackEpisodeFile {
     param(
         [string]$Hash,
         [int]$Season,
@@ -2946,17 +3169,30 @@ function Get-PackEpisodeBytes {
     # pattern; the only thing that varies is zero padding in the file name.
     $rx = '(?i)S0*' + $Season + 'E0*' + $Episode + '(?!\d)'
 
-    $best = 0
+    $best = $null
     foreach ($f in $files) {
         $name = [string]$f.name
         if ([string]::IsNullOrWhiteSpace($name)) { continue }
         if ($name -notmatch $rx) { continue }
+        if ([IO.Path]::GetExtension($name).ToLowerInvariant() -notin @('.mkv', '.mp4', '.m4v', '.mov', '.ts', '.m2ts', '.avi', '.webm', '.mpg', '.mpeg')) { continue }
         $sz = [int64]$f.size
-        if ($sz -gt $best) { $best = $sz }
+        if ($sz -le 0) { continue }
+        if ($null -eq $best -or $sz -gt [int64]$best.size) { $best = $f }
     }
 
-    if ($best -le 0) { return $null }
     return $best
+}
+
+function Get-PackEpisodeBytes {
+    param(
+        [string]$Hash,
+        [int]$Season,
+        [int]$Episode,
+        [hashtable]$Cache
+    )
+    $file = Get-PackEpisodeFile -Hash $Hash -Season $Season -Episode $Episode -Cache $Cache
+    if ($null -eq $file) { return $null }
+    return [int64]$file.size
 }
 
 function Get-ContainedPackDuplicateVerdict {
@@ -3434,7 +3670,7 @@ function Test-TmdbTitleName {
 function Get-TmdbSearchVariants {
     param([string]$Name, [string]$ParsedTitle)
     $out = New-Object System.Collections.ArrayList
-    foreach ($piece in @($Name -split '(?i)\baka\b|[/|]')) {
+    foreach ($piece in @($Name -split '(?i)\baka\b|[/|]|\s+\+\s+')) {
         try { $p = Get-TitleParts -Name $piece; $title = [string]$p.Title } catch { $title = '' }
         $title = Get-TmdbTitleKey $title
         if ($title -and @($title -split ' ').Count -ge 2 -and -not $out.Contains($title)) { [void]$out.Add($title) }
@@ -3583,10 +3819,10 @@ function Get-TmdbIdentity {
         Resolves a unique work identity. For releases the parser called films, a
         failed movie lookup is retried against TV: a name with no SxxEyy marker
         ('BBC Louis Theroux: Life on the Edge') is also exactly what a show pack
-        looks like. Only a unique exact-title TV result may change the parsed
-        type, and only when TMDB reports a single season that can be represented
-        as a season pack. Ambiguous, missing, wrong-year and failed lookups never
-        become guesses. Inject Request in tests to keep the suite offline.
+        looks like. A unique TV result establishes series identity regardless of
+        season count; season details only help represent a marker-less one-season
+        pack. Ambiguous, missing, wrong-year and failed lookups never become
+        guesses. Inject Request in tests to keep the suite offline.
     #>
     param(
         [object]$Parts,
@@ -3652,6 +3888,31 @@ function Get-TmdbIdentity {
         $type = [string]$plan.Type
         $planYear = [string]$plan.Year
         $cacheKey = '{0}|{1}|{2}' -f $type, $planYear, $variantKey
+        # A multilingual release may have several names separated by '/'. Its
+        # combined cache key is different from the canonical title's key, even
+        # when one component is already a confirmed TMDB identity. Reuse those
+        # independent, fresh identities instead of letting a cached not-found for
+        # the whole phrase hide a known show. Conflicting matches stay ambiguous.
+        $componentMatches = @()
+        foreach ($variant in @($variants | Sort-Object -Unique)) {
+            $componentKey = '{0}|{1}|{2}' -f $type, $planYear, $variant
+            if (-not $Cache -or -not $Cache.ContainsKey($componentKey)) { continue }
+            $component = $Cache[$componentKey]
+            $componentAge = 9999.0
+            try { $componentAge = ((Get-Date) - [datetime]$component.checkedAt).TotalDays } catch { }
+            $componentMaxAge = if ([string]$component.status -eq 'ambiguous') { 7 } else { 30 }
+            if ($componentAge -le $componentMaxAge -and [string]$component.status -eq 'matched' -and
+                [string]$component.type -eq $type -and [string]$component.id) {
+                $componentMatches += $component
+            }
+        }
+        $componentIds = @($componentMatches | ForEach-Object { [string]$_.id } | Sort-Object -Unique)
+        if ($componentIds.Count -eq 1) {
+            return @($componentMatches | Where-Object { [string]$_.id -eq $componentIds[0] } | Select-Object -First 1)[0]
+        }
+        if ($componentIds.Count -gt 1) {
+            return [pscustomobject]@{ status='ambiguous'; type=$type; id=''; name=''; year=$planYear; resolverVersion=3 }
+        }
         if ($null -ne $Cache -and $Cache.ContainsKey($cacheKey)) {
             $entry = $Cache[$cacheKey]
             $age = 9999.0
@@ -3684,9 +3945,9 @@ function Get-TmdbIdentity {
             checkedAt = (Get-Date).ToString('o')
         }
         if ($result.status -eq 'matched' -and $type -eq 'tv' -and -not $Parts.IsSeries) {
-            # The single season is what makes the correction representable. More
-            # than one season means the name would have to invent which season
-            # this pack holds, so it stays a film.
+            # Details may establish the season for a marker-less one-season
+            # release. A multi-season match remains a TV identity; Set-TmdbIdentity
+            # classifies it as series without inventing a season number.
             $seasons = 0
             if ($script:tmdbRequestCount -lt $MaxRequests) {
                 try {
@@ -3711,7 +3972,7 @@ function Get-TmdbIdentity {
 function Set-TmdbIdentity {
     <#
         Attaches a matched identity to parsed parts and, when TMDB established
-        that a marker-less "film" is a one-season show, turns it into a season
+        that a marker-less "film" is a show, turns it into a whole-show pack
         pack. Episode 0 is the manager's existing whole-season representation,
         so the corrected release takes part in dedup and settling as S<n>-ALL
         instead of pretending to be a film. The parsed title is never rewritten:
@@ -3727,15 +3988,38 @@ function Set-TmdbIdentity {
     $Parts | Add-Member -NotePropertyName TmdbName -NotePropertyValue ([string](Get-PartValue -Parts $Identity -Name 'name')) -Force
     $Parts | Add-Member -NotePropertyName TmdbNameKey -NotePropertyValue (Get-TmdbTitleKey ([string](Get-PartValue -Parts $Identity -Name 'name'))) -Force
 
-    $corrected = [bool](Get-PartValue -Parts $Identity -Name 'corrected')
+    # TMDB's media type is authoritative: a matched TV result is always a
+    # series, even when the release parser missed a localized season marker or
+    # TMDB reports multiple seasons. No episode marker means whole show/season;
+    # unknown season coordinates remain null.
+    if ([string](Get-PartValue -Parts $Identity -Name 'type') -ne 'tv') { return $Parts }
+
     $season = [int](Get-PartValue -Parts $Identity -Name 'season')
-    if (-not $corrected -or $Parts.IsSeries -or $season -le 0) { return $Parts }
+    if ($season -le 0) { $season = [int](Get-PartValue -Parts $Parts -Name 'Season') }
+    if ($season -le 0) { $season = $null } # unknown season; never guess season 1
 
     $out = [ordered]@{}
     foreach ($property in $Parts.PSObject.Properties) { $out[$property.Name] = $property.Value }
     $out['IsSeries'] = $true
     $out['Season'] = $season
-    $out['Episode'] = 0
+    if ($null -eq $Parts.Episode) { $out['Episode'] = 0 }
+    $out['EpisodeLast'] = $null
+    $out['IsMultiEpisode'] = $false
+    return [pscustomobject]$out
+}
+
+function Set-TmdbSeriesClassification {
+    # A TV search can establish the media type without uniquely identifying one
+    # show (for example, a multilingual pack containing several series). Mark it
+    # as series for category/routing, but clear episode coordinates so it cannot
+    # participate in duplicate deletion as if it were one known show/season.
+    param($Parts)
+    if (-not $Parts) { return $Parts }
+    $out = [ordered]@{}
+    foreach ($property in $Parts.PSObject.Properties) { $out[$property.Name] = $property.Value }
+    $out['IsSeries'] = $true
+    $out['Season'] = $null
+    $out['Episode'] = $null
     $out['EpisodeLast'] = $null
     $out['IsMultiEpisode'] = $false
     return [pscustomobject]$out
@@ -4403,6 +4687,7 @@ function Get-ExternalLibraryDuplicateVerdicts {
     $activeTorrents = @($Torrents | Where-Object { -not $Gone.ContainsKey([string]$_.hash) })
     $videoExt = @('.mkv', '.mp4', '.avi', '.m4v', '.ts')
     $seen = @{}
+    $reported = @{}
 
     foreach ($rootInput in @($Roots | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })) {
         $root = ''
@@ -4490,7 +4775,37 @@ function Get-ExternalLibraryDuplicateVerdicts {
                 Sort-Object -Property FullName)
             $keeperIsLibrary = $largestLibraryCopies.Count -gt 0
             $keeper = if ($keeperIsLibrary) { $largestLibraryCopies[0] } else { $largestCopies[0] }
-            if ($file.Length -gt $keeper.Length) { continue }
+            if ($file.Length -gt $keeper.Length) {
+                # The external file is the best finished copy. The old rule
+                # preserved it but stopped there, leaving a smaller file in the
+                # canonical library forever: this scan only visited external
+                # paths, so the library copy was never considered as the loser.
+                # Return that library file as the candidate instead. The action
+                # rechecks both sizes and torrent ownership immediately before
+                # unlinking, just as it does for an external loser.
+                foreach ($libraryCopy in @($libraryCopies | Where-Object {
+                    [int64]$_.Length -lt [int64]$file.Length -and
+                    -not (Test-PendingSettlePath -Path $_.FullName) -and
+                    -not (Test-Claimed -Path $_.FullName -Torrents $activeTorrents)
+                })) {
+                    $candidateKey = [string]$libraryCopy.FullName
+                    if ($reported.ContainsKey($candidateKey.ToLowerInvariant())) { continue }
+                    $reported[$candidateKey.ToLowerInvariant()] = $true
+                    [void]$out.Add([pscustomobject]@{
+                        File = $libraryCopy.FullName
+                        Bytes = [int64]$libraryCopy.Length
+                        Keeper = $full
+                        KeeperBytes = [int64]$file.Length
+                        Season = [int]$parts.Season
+                        Episode = $episode
+                        ShowDir = (Split-Path -Parent (Split-Path -Parent $seasonDir))
+                        Root = $seriesRoot
+                        Reason = ("smaller canonical library duplicate S{0}E{1}: {2:N2} GB; larger verified copy is {3:N2} GB at '{4}'" -f `
+                            $parts.Season, $episode, ($libraryCopy.Length / 1GB), ($file.Length / 1GB), $full)
+                    })
+                }
+                continue
+            }
             # For equal-sized copies held only on secondary roots, retain exactly
             # one deterministically (ordinal path order). A same-size canonical
             # library keeper always wins the tie so external copies converge inward.
@@ -5954,10 +6269,37 @@ function Invoke-SettlePlan {
             if ($targets.ContainsKey($dst)) { throw "two media files have the same destination: $dst" }
             $targets[$dst] = $true
             $landed = ($Record.EntryRemoved -and $f.MoveStarted -and -not (Test-Path -LiteralPath $src) -and (Test-Path -LiteralPath $dst -PathType Leaf))
-            if (-not $landed) {
-                if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "source media is unavailable: $src" }
-                if ([int64](Get-Item -LiteralPath $src).Length -ne [int64]$f.Bytes) { throw "source media size does not match the file listing: $src" }
+            # Another completed torrent may already have placed a better copy at
+            # this exact library filename. If this torrent's source has since
+            # disappeared, that is not a reason to hold the other episodes in a
+            # completed pack hostage. Accept only a parseable same-media file at
+            # the planned target, and only when its size is at least the planned
+            # copy's size (the manager's existing quality proxy). Never use this
+            # to overwrite or discard a source that is still present.
+            $alreadyRetained = $false
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf) -and
+                (Test-Path -LiteralPath $dst -PathType Leaf)) {
+                try {
+                    $existing = Get-Item -LiteralPath $dst -Force -ErrorAction Stop
+                    $fileParts = Get-TitleParts -Name ([string]$f.Leaf)
+                    $torrentParts = $t.parts
+                    $sameMedia = ($fileParts -and $torrentParts -and
+                        (Test-SameMediaIdentity -A $fileParts -B $torrentParts))
+                    if ($sameMedia -and [int64]$existing.Length -ge [int64]$f.Bytes -and
+                        -not ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                        $alreadyRetained = $true
+                        $f | Add-Member -NotePropertyName AlreadyRetained -NotePropertyValue $true -Force
+                    }
+                }
+                catch { $alreadyRetained = $false }
             }
+            if (-not $landed) {
+                if (-not $alreadyRetained) {
+                    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "source media is unavailable and no equal-or-better library copy is present: $src" }
+                    if ([int64](Get-Item -LiteralPath $src).Length -ne [int64]$f.Bytes) { throw "source media size does not match the file listing: $src" }
+                }
+            }
+            if ($alreadyRetained) { continue }
             if (Test-Claimed -Path $src -Torrents $others) { throw "another torrent claims source media: $src" }
             if (Test-Claimed -Path $dst -Torrents $others) { throw "another torrent claims destination media: $dst" }
             if (-not $landed -and $src -ine $dst -and (Test-Path -LiteralPath $dst)) { throw "destination already in the library; refusing to overwrite: $dst" }
@@ -5978,6 +6320,22 @@ function Invoke-SettlePlan {
         }
         foreach ($f in @($Plan.Files)) {
             $src = [string]$f.Path; $dst = [string]$f.Target
+            if ($f.AlreadyRetained) { continue }
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf) -and
+                (Test-Path -LiteralPath $dst -PathType Leaf)) {
+                try {
+                    $existing = Get-Item -LiteralPath $dst -Force -ErrorAction Stop
+                    $fileParts = Get-TitleParts -Name ([string]$f.Leaf)
+                    if ($fileParts -and $t.parts -and
+                        (Test-SameMediaIdentity -A $fileParts -B $t.parts) -and
+                        [int64]$existing.Length -ge [int64]$f.Bytes -and
+                        -not ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                        Write-Log 'INFO' "settle kept existing equal-or-better library copy for '$($f.Leaf)'"
+                        continue
+                    }
+                }
+                catch { }
+            }
             if ($src -ine $dst -and (Test-Path -LiteralPath $src)) {
                 $parent = Split-Path -Parent $dst
                 if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
@@ -5996,8 +6354,14 @@ function Invoke-SettlePlan {
     }
 
     foreach ($f in @($Plan.Files)) {
-        Write-Log 'MOVE' "$($f.Path) -> $($f.Target) (size verified; torrent entry removed without data)"
-        [void]$script:actions.Add("SETTLED  $($f.Target)")
+        if ($f.AlreadyRetained) {
+            Write-Log 'INFO' "kept existing equal-or-better library copy '$($f.Target)' (torrent entry removed without data)"
+            [void]$script:actions.Add("KEPT LIBRARY COPY  $($f.Target)")
+        }
+        else {
+            Write-Log 'MOVE' "$($f.Path) -> $($f.Target) (size verified; torrent entry removed without data)"
+            [void]$script:actions.Add("SETTLED  $($f.Target)")
+        }
     }
     # Delete only API-listed non-media, not an arbitrary recursive directory.
     $cleanupPending = $false
@@ -6176,9 +6540,33 @@ function Remove-OrphanPath {
 
 function Ensure-Category {
     param(
-        [string]$Name, [string]$SavePath)
+        [string]$Name,
+        [string]$SavePath,
+        [string]$LegacySavePath = ''
+    )
     $existing = Invoke-ApiGet -Endpoint 'torrents/categories'
-    if ($existing.PSObject.Properties.Name -contains $Name) { return }
+    $categoryProperty = $existing.PSObject.Properties[$Name]
+    if ($categoryProperty) {
+        $currentPath = [string](Get-PartValue -Parts $categoryProperty.Value -Name 'savePath')
+        $normalCurrent = $currentPath.TrimEnd('\', '/').Replace('/', '\')
+        $normalLegacy = $LegacySavePath.TrimEnd('\', '/').Replace('/', '\')
+        $normalTarget = $SavePath.TrimEnd('\', '/').Replace('/', '\')
+
+        # Categories created by older manager versions pointed directly into the
+        # library root. Move only that known default to staging; any other path
+        # is user-owned and left alone. Editing a category changes its default
+        # for future additions, not the location of existing torrents.
+        if ($LegacySavePath -and $normalCurrent -ieq $normalLegacy -and
+            $normalTarget -and $normalCurrent -ine $normalTarget) {
+            if ($DryRun) {
+                Write-Log 'ACTION' "[DRY-RUN] would move category '$Name' default from '$currentPath' to '$SavePath'"
+                return
+            }
+            Invoke-ApiPost -Endpoint 'torrents/editCategory' -Fields @{ category = $Name; savePath = $SavePath }
+            Write-Log 'ACTION' "updated category '$Name' default savePath from '$currentPath' to '$SavePath'"
+        }
+        return
+    }
     if ($DryRun) {
         Write-Log 'ACTION' "[DRY-RUN] would create category '$Name' (savePath: $SavePath)"
         return
@@ -6193,11 +6581,23 @@ function Ensure-Category {
 function Set-Category {
     param([object]$T, [string]$Category)
     if ($T.category -eq $Category) { return }
-    # Categories are user-editable in qBittorrent. Treat every existing value as
-    # an intentional choice, not something to repair from the parsed title.
+    # A confident TMDB media-type match corrects a category the manager previously
+    # assigned from a bad parse (e.g. a TV show placed in Movies). Do not rewrite
+    # arbitrary custom categories: only repair a conflict between the two standard
+    # manager categories.
     if (-not [string]::IsNullOrWhiteSpace([string]$T.category)) {
-        Write-Log 'INFO' "category for '$($T.name)' remains '$($T.category)' (existing category is user-owned)"
-        return
+        $tmdbType = [string](Get-PartValue -Parts $T.parts -Name 'TmdbType')
+        $standardCategories = @([string]$cfg.moviesCategory, [string]$cfg.seriesCategory)
+        $tmdbExpected = if ($tmdbType -eq 'tv') { [string]$cfg.seriesCategory } elseif ($tmdbType -eq 'movie') { [string]$cfg.moviesCategory } else { '' }
+        $repairTmdbClassification = $tmdbExpected -and
+            $standardCategories -contains [string]$T.category -and
+            [string]$T.category -ne $tmdbExpected -and
+            $Category -eq $tmdbExpected
+        if (-not $repairTmdbClassification) {
+            Write-Log 'INFO' "category for '$($T.name)' remains '$($T.category)' (existing category is user-owned)"
+            return
+        }
+        Write-Log 'INFO' "TMDB $tmdbType identity corrects category for '$($T.name)' from '$($T.category)' to '$Category'"
     }
     if ($DryRun) {
         Write-Log 'ACTION' "[DRY-RUN] empty category '$($T.name)' -> '$Category'"
@@ -6256,13 +6656,31 @@ if ($script:tmdbEnabled -and [string]::IsNullOrWhiteSpace($script:tmdbBearerToke
 
 foreach ($t in $all) {
     $parts = $null
-try   { $parts = Get-TitleParts -Name $t.name }
+      try   { $parts = Get-TitleParts -Name $t.name }
       catch { Write-Log 'WARN' "title parse failed for '$($t.name)': $($_.Exception.Message)" }
 
       # Identity, settled here rather than at folder-naming time. An alias says
       # "this release IS that show", and a group key still reading the raw
       # spelling would put the release in a show of its own - see
       # Resolve-PartsAlias for the live queue this came from.
+      $compositeSeriesRelease = $false
+      if ($parts -and [regex]::Matches([string]$t.name, '\s+\+\s+').Count -ge 2 -and
+          [regex]::IsMatch([string]$t.name, '(?i)(?:S\d{1,3}\s*E\d{1,3}|(?:season|sezon|saison|s[eé]rie|series)\s*[:._-]*\d|\d{1,2}\s*\.\s*s[eé]rie)')) {
+          # A title spelling several works joined by '+' is not one show-season,
+          # even if the parser finds a season marker in its last component.
+          # Keep the full string for TMDB component search, but don't let one
+          # component's season/date become the coordinates for the entire pack.
+          $compositeSeriesRelease = $true
+          $compositeParts = [ordered]@{}
+          foreach ($property in $parts.PSObject.Properties) { $compositeParts[$property.Name] = $property.Value }
+          $compositeParts['Year'] = $null
+          $compositeParts['IsSeries'] = $true
+          $compositeParts['Season'] = $null
+          $compositeParts['Episode'] = $null
+          $compositeParts['EpisodeLast'] = $null
+          $compositeParts['IsMultiEpisode'] = $false
+          $parts = [pscustomobject]$compositeParts
+      }
       if ($parts) {
           $rawParts = $parts
           $hasExplicitAlias = $false
@@ -6293,13 +6711,24 @@ try   { $parts = Get-TitleParts -Name $t.name }
                   -MaxLookups $tmdbMaxLookups -MaxRequests $tmdbMaxRequests
               if ($identity -and $identity.status -eq 'matched') {
                   $wasSeries = $parts.IsSeries
-                  $parts = Set-TmdbIdentity -Parts $parts -Identity $identity
+                  if ($compositeSeriesRelease -and $identity.type -eq 'tv') {
+                      $parts = Set-TmdbSeriesClassification -Parts $parts
+                      $parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue 'tv' -Force
+                      $parts | Add-Member -NotePropertyName TmdbStatus -NotePropertyValue 'multi-title' -Force
+                  } else {
+                      $parts = Set-TmdbIdentity -Parts $parts -Identity $identity
+                  }
                   Write-Log 'INFO' ("TMDB {0} identity: '{1}' ({2}) -> '{3}' [id {4}]" -f $identity.type, $rawParts.Title, $rawParts.Year, $identity.name, $identity.id)
                   if ($parts.IsSeries -and -not $wasSeries) {
                       Write-Log 'INFO' ("TMDB identifies '{0}' as a one-season show; filing it as a Season {1} pack" -f $rawParts.Title, $parts.Season)
                   }
               } elseif ($identity -and $identity.status -eq 'ambiguous') {
                   $parts | Add-Member -NotePropertyName TmdbStatus -NotePropertyValue 'ambiguous' -Force
+                  if ($identity.type -eq 'tv') {
+                      $parts = Set-TmdbSeriesClassification -Parts $parts
+                      $parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue 'tv' -Force
+                      $parts | Add-Member -NotePropertyName TmdbStatus -NotePropertyValue 'ambiguous' -Force
+                  }
                   Write-Log 'WARN' ("TMDB result ambiguous for '{0}' ({1}); no external identity applied" -f $rawParts.Title, $rawParts.Year)
               }
           }
@@ -6596,7 +7025,7 @@ else {
 # Measured live when this was written: 206 torrents, 195 magnets, dl_info_speed 0,
 # up_info_speed 1,4 MB/s, positions 4-20 all metaDL at dlspeed 0.
 
-$stallOn = $true
+$stallOn = $false
 if ($cfg.PSObject.Properties['stallCleanupEnabled']) { $stallOn = [bool]$cfg.stallCleanupEnabled }
 
 $stallConfirm = 60.0
@@ -6677,12 +7106,23 @@ if ($cfg.PSObject.Properties['stalledDeleteDays'] -and [double]$cfg.stalledDelet
     $stalledProbeUrl = 'https://www.cloudflare.com/cdn-cgi/trace'
     if ($cfg.PSObject.Properties['stallInternetProbeUrl']) { $stalledProbeUrl = [string]$cfg.stallInternetProbeUrl }
     $stalledInternetUp = Test-InternetReachable -Url $stalledProbeUrl
-    $stalledInternetPaused = Update-StalledInternetPause -State $state -Now $now -InternetReachable $stalledInternetUp
+    $stalledPauseReasons = @()
+    if (-not $stalledInternetUp) { $stalledPauseReasons += 'internet unavailable' }
+    $minimumFreeSpaceGB = 5.0
+    if ($cfg.PSObject.Properties['stalledMinimumFreeSpaceGB']) {
+        $minimumFreeSpaceGB = [Math]::Max(0, [double]$cfg.stalledMinimumFreeSpaceGB)
+    }
+    $diskSpaceStatus = Get-StalledDiskSpaceStatus -Torrents $live -MinimumFreeSpaceGB $minimumFreeSpaceGB
+    if ($diskSpaceStatus) {
+        $stalledPauseReasons += ('insufficient free disk space at {0} ({1:N2} GB free; torrent needs {2:N2} GB remaining; reserve {3:N2} GB)' -f `
+            $diskSpaceStatus.Path, ($diskSpaceStatus.FreeBytes / 1GB), ($diskSpaceStatus.RemainingBytes / 1GB), $minimumFreeSpaceGB)
+    }
+    $stalledRemovalPaused = Update-StalledRemovalPause -State $state -Now $now -PauseReasons $stalledPauseReasons
 
     Write-Host ''
     Write-Host "Stalled check (no new data for $([int]$cfg.stalledDeleteDays) day(s))"
-    if ($stalledInternetPaused) {
-        Write-Host '  internet unavailable; inactive-torrent removals are on hold and their clocks are paused' -ForegroundColor Yellow
+    if ($stalledRemovalPaused) {
+        Write-Host ('  {0}; inactive-torrent removals are on hold and their clocks are paused' -f ($stalledPauseReasons -join '; ')) -ForegroundColor Yellow
     }
     $stalledRows = @(Get-StalledWatch -Torrents $live -Stalled $state.stalled -Now $now)
 
@@ -6692,7 +7132,7 @@ if ($cfg.PSObject.Properties['stalledDeleteDays'] -and [double]$cfg.stalledDelet
 
     foreach ($r in $stalledRows) {
         $short = $r.Name.Substring(0, [Math]::Min(46, $r.Name.Length))
-        if ($r.WillDelete -and -not $stalledInternetPaused) {
+        if ($r.WillDelete -and -not $stalledRemovalPaused) {
             # Partial data from a torrent that has not moved in a week is dead
             # weight on the disk, so this rule removes the files too. That is the
             # same orphan growth that filled Downloads\temp before, and leaving
@@ -6702,7 +7142,7 @@ if ($cfg.PSObject.Properties['stalledDeleteDays'] -and [double]$cfg.stalledDelet
                 $r.IdleDays, ($r.Completed / 1GB), ($r.Total / 1GB), $r.State)
         }
         elseif ($r.WillDelete) {
-            Write-Host ("  HOLD     {0,-46}  {1,6:N2}/{2,6:N2} GB  internet unavailable" -f `
+            Write-Host ("  HOLD     {0,-46}  {1,6:N2}/{2,6:N2} GB  removal paused" -f `
                 $short, ($r.Completed / 1GB), ($r.Total / 1GB)) -ForegroundColor Yellow
         }
         else {
@@ -6744,11 +7184,31 @@ $clusters = Merge-SeriesClusters -Clusters $clusters
 if ($cfg.assignCategories) {
     Write-Host ''
     Write-Host 'Categories'
-    Ensure-Category -Name $cfg.moviesCategory -SavePath $cfg.moviesDir
-    Ensure-Category -Name $cfg.seriesCategory -SavePath $cfg.seriesDir
+    $stagingDir = [string]$cfg.stagingDir
+    if ($stagingDir -and $stagingDir -notmatch 'PUT-YOUR-PATH-HERE') {
+        Ensure-Category -Name $cfg.moviesCategory -SavePath $stagingDir -LegacySavePath $cfg.moviesDir
+        Ensure-Category -Name $cfg.seriesCategory -SavePath $stagingDir -LegacySavePath $cfg.seriesDir
+    }
+    else {
+        Write-Log 'WARN' 'stagingDir is not configured; category save paths were left unchanged'
+    }
     foreach ($c in $clusters) {
-        $cat = if ($c[0].parts.IsSeries) { $cfg.seriesCategory } else { $cfg.moviesCategory }
-        foreach ($m in $c) { Set-Category -T $m -Category $cat }
+        # Clusters are for comparing equivalent titles, not deciding media type:
+        # TMDB can identify a TV show even when another member's parser/category
+        # metadata is stale or incomplete. Pick the category from each torrent's
+        # own resolved parts so a correctly identified TV member is never given
+        # Movies merely because the cluster's first item was parsed as a film.
+        foreach ($m in $c) {
+            $tmdbType = [string](Get-PartValue -Parts $m.parts -Name 'TmdbType')
+            if ($tmdbType -eq 'tv') {
+                $cat = $cfg.seriesCategory
+            } elseif ($tmdbType -eq 'movie') {
+                $cat = $cfg.moviesCategory
+            } else {
+                $cat = if ($m.parts.IsSeries) { $cfg.seriesCategory } else { $cfg.moviesCategory }
+            }
+            Set-Category -T $m -Category $cat
+        }
     }
 }
 
@@ -7121,10 +7581,9 @@ foreach ($c in $setGroups) {
                     $pack.parts.Season, $single.parts.Episode, $pack.name, $single.name))
                 continue
             }
-            if ($single.size -le 0) { continue }
-
             # The PACK IS NEVER THE ONE DELETED. Only the single can be, and only
-            # when the pack's own copy of this episode is the larger one.
+            # when the pack's own copy is larger or is an equal-size, same-named
+            # release file.
             #
             # It was otherwise, and it cost a 12,54 GB pack of E01-E08 on
             # 2026-10-05: the single's S18E01 was 46 MB bigger than the pack's
@@ -7132,11 +7591,22 @@ foreach ($c in $setGroups) {
             # other copy anywhere - were left on disk belonging to no torrent.
             # A 46 MB difference between two encodes of one episode says nothing
             # about the seven other episodes.
-            if (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes $epFileBytes -SingleTotalBytes $single.size)) {
-                # The pack's copy is not strictly bigger, so this rule does not
-                # establish that the single is redundant. Keep the single on an
-                # equal-size comparison; only a strictly larger pack episode
-                # qualifies it for deletion.
+            $packEpisodeFile = Get-PackEpisodeFile -Hash $pack.hash -Season $pack.parts.Season `
+                -Episode $single.parts.Episode -Cache $fileSizeCache
+            $singleEpisodeFile = Get-PackEpisodeFile -Hash $single.hash -Season $single.parts.Season `
+                -Episode $single.parts.Episode -Cache $fileSizeCache
+            if ($null -eq $singleEpisodeFile -or [int64]$singleEpisodeFile.size -le 0) {
+                [void]$script:notes.Add(("cannot measure the S{0}E{1} file in '{2}', so it is not weighed against the finished pack '{3}'" -f `
+                    $single.parts.Season, $single.parts.Episode, $single.name, $pack.name))
+                continue
+            }
+            # Compare media file bytes, not qBittorrent's torrent total: single
+            # releases may include tiny NFO/tracker sidecars that make the total
+            # a few bytes larger than the exact same episode inside the pack.
+            $singleEpisodeBytes = [int64]$singleEpisodeFile.size
+            if (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes $epFileBytes -SingleEpisodeBytes $singleEpisodeBytes)) {
+                # The finished pack's episode is smaller than the single's media
+                # file, so it is not a sufficient keeper for this comparison.
                 continue
             }
 
@@ -7147,9 +7617,10 @@ foreach ($c in $setGroups) {
             }
 
             $singleState = if ($single.progress -ge 1) { 'finished' } else { 'unfinished' }
-            $reason = ("duplicate of '{0}': pack is finished and its S{1}E{2} file ({3:N2} GB) is larger than the {4} single's total size ({5:N2} GB); the pack holds other episodes this single cannot replace, so the single goes" `
+            $comparison = if ($epFileBytes -gt $singleEpisodeBytes) { 'larger than' } else { 'the same size as' }
+            $reason = ("duplicate of '{0}': pack is finished and its S{1}E{2} file ({3:N2} GB) is {4} the {5} single episode file ({6:N2} GB); the pack holds other episodes this single cannot replace, so the single goes" `
                 -f $pack.name, $pack.parts.Season, $single.parts.Episode,
-                   ($epFileBytes / 1GB), $singleState, ($single.size / 1GB))
+                   ($epFileBytes / 1GB), $comparison, $singleState, ($singleEpisodeBytes / 1GB))
             # -Knows. It SEES its keeper: $pack is a real torrent, both are
             # complete, and $epFileBytes is that pack's own file for this episode -
             # measured, not inferred. The single is one episode and the pack holds

@@ -78,6 +78,14 @@ foreach ($n in $series) { Dump $n }
 Check 'classified as SERIES'                ((Parts $series[0]).IsSeries)
 Check 'S01E01 releases match despite US vs non-US noise' (Same $series[0] $series[1])
 Check 'S01E02 kept separate from S01E01'    (-not (Same $series[0] $series[2]))
+$underscore = Parts 'VisionQuest_S01E05_Firewall.mkv'
+Check 'underscore-delimited season markers are parsed' `
+    ($underscore.IsSeries -and $underscore.Title -eq 'visionquest' -and $underscore.Season -eq 1 -and $underscore.Episode -eq 5)
+Check 'underscore-delimited files still identify the same show episode' `
+    (Same 'VisionQuest_S01E05_Firewall.mkv' 'VisionQuest S01E05 WEB-DL 1080p.mkv')
+$ordinalSeason = Parts 'Dexter Resurrection 1. série (CZ/EN) 1080p'
+Check 'ordinal localized season labels identify the season pack' `
+    ($ordinalSeason.IsSeries -and $ordinalSeason.Title -eq 'dexter resurrection' -and $ordinalSeason.Season -eq 1 -and $ordinalSeason.Episode -eq 0)
 
 Write-Host ''
 Write-Host '=== FALSE-POSITIVE GUARDS: these must never match ==='
@@ -342,6 +350,10 @@ Check 'a season stated as a word is taken from earlier too' `
 
 Check 'a group tag is not a season to inherit' ((Get-TitleParts -Name 'Show S0NNER.1080p.WEB.x264').IsSeries -eq $false)
 Check 'a trailing S0 is not a season either'   ((Get-TitleParts -Name 'Show 1080p x264-S0').IsSeries -eq $false)
+Check 'a codec-tagged group number is not a season either' `
+    ((Get-TitleParts -Name 'Substancja / The Substance (2024) [1080p] [WEB-DL] [H264] [DD5.1-S56] [Lektor PL] [ext.to]').IsSeries -eq $false)
+Check 'and the film title survives that suffix' `
+    ((Get-TitleParts -Name 'Substancja / The Substance (2024) [1080p] [WEB-DL] [H264] [DD5.1-S56] [Lektor PL] [ext.to]').Title -eq 'substancja the substance')
 Check 'a dotted number before a bare E is not a season' `
     ((Get-TitleParts -Name 'Ocean.s.8.2018.1080p.BluRay.x264').IsSeries -eq $false)
 
@@ -377,6 +389,47 @@ Check 'no year anywhere, so none is printed'         ((Get-ShowLabel -Parts @($n
 Check 'two different years, so none is printed'      ((Get-ShowLabel -Parts @($withY, $oldY)) -eq 'show name')
 Check 'the show name is still there when the year is not' ((Get-ShowLabel -Parts @($noY)).StartsWith('show name'))
 Check 'no parts at all gives no label'               ((Get-ShowLabel -Parts @()) -eq '')
+
+'== the label is the work name, not a release filename =='
+# Release filenames are never a stable name for a work: the same film arrives as
+# 'The Substance', 'Substancja / The Substance' and 'A Subst&acirc;ncia'. Once
+# TMDB has identified the work, the group header must use that identity instead
+# of whichever filename happened to sort first.
+$identified = Get-TitleParts -Name 'Substancja / The Substance (2024) [1080p] [Lektor PL]'
+$identified | Add-Member -NotePropertyName TmdbId -NotePropertyValue '933260' -Force
+$identified | Add-Member -NotePropertyName TmdbType -NotePropertyValue 'movie' -Force
+$identified | Add-Member -NotePropertyName TmdbName -NotePropertyValue 'The Substance' -Force
+Check 'an identified group is labelled with its TMDB name' `
+    ((Get-ShowLabel -Parts @($identified)) -eq 'The Substance (2024)')
+Check 'the TMDB name beats the parsed filename title' `
+    ((Get-ShowLabel -Parts @($identified)) -notlike '*substancja*')
+
+$otherIdentity = Get-TitleParts -Name 'La sustancia (2024) [1080p]'
+$otherIdentity | Add-Member -NotePropertyName TmdbId -NotePropertyValue '933260' -Force
+$otherIdentity | Add-Member -NotePropertyName TmdbType -NotePropertyValue 'movie' -Force
+$otherIdentity | Add-Member -NotePropertyName TmdbName -NotePropertyValue 'The Substance' -Force
+Check 'two localized filenames with one identity share that label' `
+    ((Get-ShowLabel -Parts @($identified, $otherIdentity)) -eq 'The Substance (2024)')
+
+$unidentified = Get-TitleParts -Name 'A Subst&acirc;ncia 2024 The Substance 1080p'
+Check 'a member without an identity does not veto the TMDB name' `
+    ((Get-ShowLabel -Parts @($identified, $unidentified)) -eq 'The Substance (2024)')
+Check 'and an unidentified group still falls back to its parsed title' `
+    ((Get-ShowLabel -Parts @($unidentified)) -eq 'a subst acirc ncia (2024)')
+
+$conflicting = Get-TitleParts -Name 'Hail Satan 2024 1080p'
+$conflicting | Add-Member -NotePropertyName TmdbId -NotePropertyValue '565719' -Force
+$conflicting | Add-Member -NotePropertyName TmdbType -NotePropertyValue 'movie' -Force
+$conflicting | Add-Member -NotePropertyName TmdbName -NotePropertyValue 'Hail Satan?' -Force
+Check 'two different identities do not borrow one name' `
+    ((Get-ShowLabel -Parts @($identified, $conflicting)) -eq 'substancja the substance (2024)')
+
+Check 'the group identity is the shared TMDB work' `
+    ((Get-TmdbGroupIdentity -Parts @($identified, $otherIdentity)) -eq 'movie:933260')
+Check 'an identity-less member does not change it' `
+    ((Get-TmdbGroupIdentity -Parts @($identified, $unidentified)) -eq 'movie:933260')
+Check 'two identities yield no group identity' `
+    ((Get-TmdbGroupIdentity -Parts @($identified, $conflicting)) -eq '')
 
 '== the label is the whole of what a header adds to the show name =='
 # A printed header is the show name plus this and nothing else, so a header

@@ -78,6 +78,72 @@ function Invoke-ApiGet {
     return @()
 }
 
+# An exact episode can be equal in media bytes while the single torrent's total
+# includes tiny NFO/tracker sidecars. Compare the measured media files and require
+# matching normalized filenames before equality is allowed to delete the single.
+$script:fileLists['equal-size-pack'] = @(
+    [pscustomobject]@{ name = 'Pack/Show.S01E01.Movie.1080p.REMUX-Group.mkv'; size = 1000 }
+)
+$script:fileLists['equal-size-single'] = @(
+    [pscustomobject]@{ name = 'Single/Show S01E01 Movie 1080p REMUX Group.mkv'; size = 1000 }
+    [pscustomobject]@{ name = 'Single/Show S01E01 Movie 1080p REMUX Group.mkv.nfo'; size = 2000 }
+)
+$equalPackFile = Get-PackEpisodeFile -Hash 'equal-size-pack' -Season 1 -Episode 1 -Cache @{}
+$equalSingleFile = Get-PackEpisodeFile -Hash 'equal-size-single' -Season 1 -Episode 1 -Cache @{}
+Check 'episode file lookup ignores larger sidecars when measuring the single' `
+    ($equalPackFile.size -eq 1000 -and $equalSingleFile.size -eq 1000)
+Check 'equal-size media files qualify regardless of release filename' `
+    (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes $equalPackFile.size -SingleEpisodeBytes $equalSingleFile.size)
+
+# A TMDB-classified TV release can have unknown season coordinates in its title
+# while its files prove that it is a complete, contiguous season pack. It must
+# still enter the exact set comparison against other season copies.
+$unknownSeasonFiles = @()
+foreach ($episode in 1..10) {
+    $unknownSeasonFiles += [pscustomobject]@{ name = ('Localized.Name/Show.S01E{0:D2}.mkv' -f $episode); size = 1GB }
+}
+$script:fileLists['unknown-season-pack'] = $unknownSeasonFiles
+$unknownSeasonParts = [pscustomobject]@{
+    IsSeries = $true; Season = $null; Episode = $null; IsMultiEpisode = $false
+    EpisodeLast = $null; Title = 'localized show'; TmdbId = '259909'; TmdbType = 'tv'
+}
+$unknownSeasonTorrent = [pscustomobject]@{ hash = 'unknown-season-pack'; name = 'Localized / Show (2025)'; parts = $unknownSeasonParts }
+Check 'unknown-season TV parts resolve a full range from their own files' `
+    ((Resolve-TorrentSetKey -T $unknownSeasonTorrent -Cache @{}) -eq 'S1-E1-E10')
+
+# Regression for a live duplicate that previously escaped automatic cleanup:
+# this Pir8 season pack uses 1x01..1x10 filenames and has matching S01E01..E10
+# files in a completed pack. Exercise the same resolver that the dedupe pass uses.
+$pir8Files = @()
+foreach ($episode in 1..10) {
+    $pir8Files += [pscustomobject]@{
+        name = ('Dexter.Resurrection.S01.ITA.ENG/Dexter.Resurrection.1x{0:D2}.Episode.avi' -f $episode)
+        size = 500MB
+    }
+    $pir8Files += [pscustomobject]@{ name = ('Dexter.Resurrection.S01.ITA.ENG/Dexter.Resurrection.1x{0:D2}.en.srt' -f $episode); size = 100KB }
+}
+$amznFiles = @()
+foreach ($episode in 1..10) {
+    $amznFiles += [pscustomobject]@{
+        name = ('Dexter.Resurrection.S01/Dexter.Resurrection.S01E{0:D2}.Episode.mkv' -f $episode)
+        size = 4GB
+    }
+}
+$script:fileLists['pir8-season-pack'] = $pir8Files
+$script:fileLists['amzn-completed-pack'] = $amznFiles
+$pir8Torrent = [pscustomobject]@{
+    hash = 'pir8-season-pack'; name = 'Dexter: Resurrection - Season 01 (2025)[COMPLETE] SD XviD'
+    parts = (Get-TitleParts -Name 'Dexter: Resurrection - Season 01 (2025)[COMPLETE] SD XviD')
+}
+$amznTorrent = [pscustomobject]@{
+    hash = 'amzn-completed-pack'; name = 'Dexter.Resurrection.S01.1080p.AMZN.WEB-DL'
+    parts = (Get-TitleParts -Name 'Dexter.Resurrection.S01.1080p.AMZN.WEB-DL')
+}
+$pir8SetKey = Resolve-TorrentSetKey -T $pir8Torrent -Cache @{}
+$amznSetKey = Resolve-TorrentSetKey -T $amznTorrent -Cache @{}
+Check 'the 1x01..1x10 season pack resolves to S1-E1-E10 in the dedup resolver' ($pir8SetKey -eq 'S1-E1-E10')
+Check 'the completed S01E01..E10 pack resolves to the exact same dedup set' ($amznSetKey -eq 'S1-E1-E10' -and $pir8SetKey -eq $amznSetKey)
+
 # ---------------------------------------------------------------------------
 # a real folder tree, and real torrents pointing into it
 # ---------------------------------------------------------------------------

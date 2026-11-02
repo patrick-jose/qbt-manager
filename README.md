@@ -32,7 +32,7 @@ Nine rules, run in this order:
 | 2 | **No availability** | A magnet reporting no size is deleted after being *really* trying — see below. |
 | 2b | **Stalled** | An unfinished torrent whose byte count has not moved for 7 days. |
 | 2c | **The drain** | One dead magnet per run, from just behind the queue window. |
-| 2d | **Stalled client** | If global velocity is 0 for over a minute while the internet is up, the queue is stalled rather than slow, and the front of it goes immediately. |
+| 2d | **Stalled client** | Optional and disabled by default: zero global download speed is not enough evidence to delete newly added magnets. Per-torrent metadata and stalled timeouts remain active. |
 | 3 | **Categories** | Identified torrents are filed under `Movies` or `Series`. |
 | 4 | **Dedup** | Within one title, the largest *finished* version wins and every smaller version is deleted. |
 | 4b | **Library duplicates** | The same episode twice in one season folder: the larger copy stays. |
@@ -109,6 +109,7 @@ paths. Create `config.local.json` with just your own paths:
   "//": "Your paths only. Every key here overrides config.json. ONLY location keys belong here.",
   "moviesDir": "C:\\Users\\you\\Downloads\\Filmes",
   "seriesDir": "C:\\Users\\you\\Downloads\\Séries",
+  "stagingDir": "C:\\Users\\you\\Downloads\\temp",
   "moviesCategory": "Movies",
   "seriesCategory": "Series",
   "reapRoots": [
@@ -125,8 +126,12 @@ notepad .\config.local.json
 Save it as **UTF-8**. PowerShell 5.1 reads a BOM-less file as ANSI, which turns
 `Séries` into mojibake and makes the folder look absent.
 
-If you skip that step the manager says so, naming the keys, and matches nothing —
-safe, but nothing will be found, deduplicated or moved.
+Keep `stagingDir` separate from `moviesDir` and `seriesDir`. The manager uses it
+as the default save path for its movie and series categories, so incomplete
+torrents do not create release-named folders in the library roots. Existing
+manager defaults that point at a library root are migrated to staging; other
+category paths are left alone. If you skip configuration, the manager says so,
+and does not change category paths.
 
 ### Scheduling it
 

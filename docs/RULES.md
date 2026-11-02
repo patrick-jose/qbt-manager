@@ -94,10 +94,14 @@ For every command, see [COMMANDS.md](../COMMANDS.md).
     Multi-season results leave the release as parsed. When TMDB uniquely
     identifies a show, its canonical name is also used for the library show
     folder, so differently spelled releases of the same work share one folder;
-    punctuation is stripped so it cannot split an existing folder. Results are
-    cached in ignored `tmdb-cache.json`; lookup and request budgets are bounded
-    per run. Without a token, title-based safeguards are unchanged. `status.ps1`
-    uses cached identities only and never calls TMDB.
+    punctuation is stripped so it cannot split an existing folder. The same
+    canonical name labels that work's row in `status.ps1`'s GROUPS section, and
+    the row is keyed by the TMDB identity rather than by any release filename, so
+    renamed or localized releases cannot split a work into several rows; a year
+    is printed only when every torrent of that work states the same one. Results
+    are cached in ignored `tmdb-cache.json`; lookup and request budgets are
+    bounded per run. Without a token, title-based safeguards are unchanged.
+    `status.ps1` uses cached identities only and never calls TMDB.
 7. **Library** â€” survivors that are complete are moved to `moviesDir` or
    `seriesDir`. The move is then **verified**, not assumed, and is refused while
    another torrent holds the folder (see [Moving to the library](#moving-to-the-library)).
@@ -253,6 +257,11 @@ It is a pure function so it can be tested without an API or a disk, and
 on.
 
 ### The stalled client
+
+> **Disabled by default.** Zero client-wide download speed does not prove that
+> newly added magnets are unavailable. The per-torrent metadata timeout and
+> no-progress rules remain enabled; do not opt into this global deletion rule
+> unless you explicitly accept that risk.
 
 Rule 2 asks **how long a magnet has been trying**. That question is unanswerable
 while the client is idle â€” there is no evidence of trying, only of waiting. Rule
@@ -974,11 +983,12 @@ Edit `config.json`. Useful changes:
 - `stallCleanupEnabled` - whether rule 4b runs. `false` leaves a stalled client
   and its queue entirely alone.
 - `stallConfirmSeconds` - how long global download velocity must read 0 before the
-  client counts as stalled. `60`. `0` disables the rule, because a single sample
-  cannot distinguish a stall from a lull.
+  client counts as stalled. `3600` (one hour). `0` disables the rule, because a
+  single sample cannot distinguish a stall from a lull. The global rule is disabled
+  by default independently of this threshold.
 - `stallMaxWaitSeconds` - ceiling on the in-run wait used to prove the stall. `75`,
-  above the confirm window so one run can finish the job. Kept under the 15-minute
-  schedule so a run can never overlap the next.
+  so a run waits at most 75 seconds before persisting the clock and checking again
+  on a later pass. This keeps long confirmation windows from blocking a manager run.
 - `stallMaxDeletions` - most magnets removed in one stalled-client sweep. `10`. The
   cap is what stops a 195-magnet queue being emptied.
 - `stallInternetProbeUrl` - the URL used to prove the internet is up.

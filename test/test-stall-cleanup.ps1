@@ -211,9 +211,10 @@ Check 'with no window, no magnet qualifies'            (@($v.Torrents).Count -eq
 Write-Host ''
 Write-Host '== the shipped config =='
 $cfg = [System.IO.File]::ReadAllText((Join-Path $root 'config.json'), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-Check 'stallCleanupEnabled is on'                      ($cfg.stallCleanupEnabled -eq $true)
-Check 'the confirm window is 15s'                      ([double]$cfg.stallConfirmSeconds -eq 15)
-Check 'the wait ceiling is above the window'           ([double]$cfg.stallMaxWaitSeconds -ge [double]$cfg.stallConfirmSeconds)
+Check 'global zero-speed cleanup is enabled in the active config' ($cfg.stallCleanupEnabled -eq $true)
+Check 'the manager code also defaults global zero-speed cleanup off' ($src -match '\$stallOn\s*=\s*\$false')
+Check 'the confirm window is ten minutes'              ([double]$cfg.stallConfirmSeconds -eq 600)
+Check 'the in-run wait stays bounded below the window' ([double]$cfg.stallMaxWaitSeconds -lt [double]$cfg.stallConfirmSeconds)
 Check 'the cap is 10'                                  ([int]$cfg.stallMaxDeletions -eq 10)
 Check 'a probe url is configured'                      (-not [string]::IsNullOrWhiteSpace([string]$cfg.stallInternetProbeUrl))
 

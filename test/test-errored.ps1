@@ -516,7 +516,9 @@ Check 'the preview defines Test-Errored'             ($st -cmatch 'function Test
 # ABSENCE of the old guard: a presence-check cannot tell "removed on purpose"
 # from "never written", and this guard used to be here.
 Check 'the DoVi / disc-rip exclusion does NOT skip'  (-not ($st -cmatch '(?s)function Get-ExclusionVerdict.{0,300}?if \(Test-Errored \$T\)'))
-Check 'the pack-vs-single pass still respects it'    ($st -cmatch 'if \(Test-Errored \$single\) \{ continue \}')
+Check 'the pack-vs-single preview matches manager errored-duplicate handling' `
+    (-not ($st -cmatch 'if \(Test-Errored \$single\) \{ continue \}') -and
+     $st -cmatch 'Test-PackEpisodeOutweighsSingle')
 # The set-level dedup must NOT skip errored members - that is the exception.
 # Asserted as the ABSENCE of the old guard, since a presence-check cannot tell
 # "removed on purpose" from "never written".

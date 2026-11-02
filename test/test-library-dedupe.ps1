@@ -181,6 +181,19 @@ Check 'Cap.103 is interpreted as S01E03 from the Season 1 folder' `
     (@($capRows | Where-Object { $_.Episode -eq '1-E3' -or $_.File -match 'Cap\.103' }).Count -ge 1)
 Check 'the smaller Master5 E03 is selected for removal' `
     ($capDelete.Count -eq 1 -and (Split-Path -Leaf $capDelete[0].File) -eq 'VisionQuest.S01E03.2160p.HDR.Master5.mkv')
+$underscoreRoot = New-Tree -ShowName 'VisionQuest' -Season 1 -Layout (@{
+    '|VisionQuest S01E05 WEB-DL 1080p x264.mkv' = 1956
+    '|VisionQuest_S01E05_Firewall.mkv' = 2043
+    '|VisionQuest S01E06 WEB-DL 1080p x264.mkv' = 2548
+    '|VisionQuest_S01E06_Mrtvy_bod.mkv' = 2651
+})
+$underscoreRows = @(Judge $underscoreRoot)
+$underscoreDelete = @(Deletes $underscoreRows)
+Check 'underscore-delimited filenames are grouped into duplicate episodes' `
+    ($underscoreDelete.Count -eq 2 -and $underscoreRows.Count -eq 2)
+Check 'the smaller underscore-file copies lose to the larger episode copies' `
+    (@(Names $underscoreDelete) -contains 'VisionQuest S01E05 WEB-DL 1080p x264.mkv' -and
+     @(Names $underscoreDelete) -contains 'VisionQuest S01E06 WEB-DL 1080p x264.mkv')
 $cap2Root = New-Tree -ShowName 'VisionQuest' -Season 2 -Layout (@{
     "|VisionQuest [4K 2160p][Cap.103].mkv" = 4500
     "|VisionQuest.S02E03.2160p.HDR.Master5.mkv" = 4475
@@ -197,6 +210,7 @@ $externalRoot = Join-Path ([IO.Path]::GetTempPath()) ('extdup-' + [guid]::NewGui
 $externalRelease = Join-Path $externalRoot 'VisionQuest.S01.2160p.WEB-DL'
 New-Item -ItemType Directory -Path $externalRelease -Force | Out-Null
 $externalFile = Join-Path $externalRelease 'VisionQuest.S01E02.2160p.HDR.Master5.mkv'
+$externalLibraryFile = Join-Path (Join-Path (Join-Path $externalLibrary 'VisionQuest') 'Season 1') 'VisionQuest.S01E02.2160p.HDR.Master5.mkv'
 $stream = [IO.File]::Create($externalFile); $stream.SetLength(3500KB); $stream.Close()
 $externalVerdicts = @(Get-ExternalLibraryDuplicateVerdicts -Roots @($externalRoot) `
     -SeriesDir $externalLibrary -Torrents @() -Gone @{})
@@ -204,9 +218,11 @@ Check 'a smaller unowned external episode is matched to its canonical library ke
     ($externalVerdicts.Count -eq 1 -and $externalVerdicts[0].File -eq $externalFile -and
      $externalVerdicts[0].Keeper -like '*VisionQuest.S01E02.2160p.HDR.Master5.mkv')
 $stream = [IO.File]::OpenWrite($externalFile); $stream.SetLength(4500KB); $stream.Close()
-Check 'an external copy larger than the library keeper is preserved' `
-    (@(Get-ExternalLibraryDuplicateVerdicts -Roots @($externalRoot) `
-        -SeriesDir $externalLibrary -Torrents @() -Gone @{}).Count -eq 0)
+$largerExternalVerdicts = @(Get-ExternalLibraryDuplicateVerdicts -Roots @($externalRoot) `
+    -SeriesDir $externalLibrary -Torrents @() -Gone @{})
+Check 'a larger external copy makes the smaller canonical library copy the loser' `
+    ($largerExternalVerdicts.Count -eq 1 -and $largerExternalVerdicts[0].File -eq $externalLibraryFile -and
+     $largerExternalVerdicts[0].Keeper -eq $externalFile)
 $stream = [IO.File]::OpenWrite($externalFile); $stream.SetLength(3500KB); $stream.Close()
 $externalOwner = [pscustomobject]@{ hash = 'external-owner'; name = 'active external torrent';
     content_path = $externalFile; progress = 0.5 }

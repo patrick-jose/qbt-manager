@@ -401,10 +401,32 @@ function Get-ClusterLabel {
 # enter that pass, and a family whose members share no leading word has none.
 function Get-FamilyLabel {
     param($Members)
+    $parts = @($Members | ForEach-Object { $_.parts })
+    # A group label is the work's name, not a release filename. When TMDB has
+    # identified the work, its canonical name is the only stable label: the same
+    # film may arrive as 'The Substance', 'Substancja / The Substance' or
+    # 'A Subst&acirc;ncia', and choosing among those filenames is the bug this
+    # replaces.
+    if (Get-TmdbGroupName -Parts $parts) { return (Get-ShowLabel -Parts $parts) }
     foreach ($m in $Members) {
         if ($m.PSObject.Properties['showLabel'] -and $m.showLabel) { return $m.showLabel }
     }
     return (Get-ClusterLabel -Members $Members)
+}
+
+# The label a grouped row is printed under.
+#
+# An identified work is printed exactly once, under TMDB's own name. The year is
+# added only when every torrent in that work states the same one, so a season
+# pack that mentions (2024) cannot split the show into a second row beside
+# singles that do not.
+function Get-GroupDisplayLabel {
+    param($Bucket)
+    if (-not $Bucket.Canonical) { return $Bucket.Fallback }
+    if ($Bucket.YearMembers -eq $Bucket.Total -and $Bucket.Years.Count -eq 1) {
+        return ('{0} ({1})' -f $Bucket.Canonical, [string]@($Bucket.Years.Keys)[0])
+    }
+    return $Bucket.Canonical
 }
 
 # The episode-set key a torrent is judged under, correcting a name that claims a
@@ -415,15 +437,18 @@ function Get-FamilyLabel {
 # manager's detection region like every other helper here - only the fetch has to
 # be written twice, because the two scripts talk to qBittorrent differently.
 #
-# Only a name-derived S<n>-ALL is corrected. It is the one key that makes a claim
-# the name cannot support and the one that silently disables dedup, because no
-# range key can equal it. A magnet has no file list yet and keeps the name's key.
+# A name-derived S<n>-ALL may be corrected from its files. So may a TMDB-known TV
+# release whose season/episode coordinates are unknown in the title: its own file
+# list can still prove a complete contiguous range. A magnet has no files yet and
+# keeps the name's key.
 function Resolve-SetKey {
     param($T, $Cache)
 
     $parts = Get-Prop $T 'parts'
     $nameKey = Get-EpisodeSetKey -Parts $parts
-    if ($nameKey -notmatch '^S\d+-ALL$') { return $nameKey }
+    $needsFileResolution = ($nameKey -match '^S\d+-ALL$') -or
+        ($parts.IsSeries -and [string]::IsNullOrWhiteSpace($nameKey))
+    if (-not $needsFileResolution) { return $nameKey }
     $hash = [string](Get-Prop $T 'hash')
     if (-not $hash) { return $nameKey }
 
@@ -555,15 +580,15 @@ function Get-DedupVerdicts {
         }
 
         # Pack vs single-episode contained in it, same rule as the manager:
-        # a completed pack and a completed single of that pack are two torrents
-        # holding the same episode, so the smaller copy of THAT episode goes.
+        # a completed season/range pack proves whether a single's episode is
+        # already present, even when that single is unfinished or stalled.
         # $fileSizeCache holds one file listing per pack for the whole preview.
         $fileSizeCache = @{}
         foreach ($pack in $members) {
             if ($Gone.ContainsKey($pack.hash)) { continue }
             if (-not $pack.parts) { continue }
-            if (-not $pack.parts.IsMultiEpisode) { continue }
-            if (-not $pack.parts.EpisodeLast) { continue }
+            if (-not $pack.parts.IsMultiEpisode -and $pack.parts.Episode -ne 0) { continue }
+            if ($pack.parts.IsMultiEpisode -and -not $pack.parts.EpisodeLast) { continue }
             if ((Get-Prop $pack 'progress') -lt 1) { continue }
             foreach ($single in $members) {
                 if ($Gone.ContainsKey($single.hash)) { continue }
@@ -573,9 +598,7 @@ function Get-DedupVerdicts {
                 if ($single.parts.Title -ne $pack.parts.Title) { continue }
                 if ($single.parts.Season -ne $pack.parts.Season) { continue }
                 if ($null -eq $single.parts.Episode) { continue }
-                if ($single.parts.Episode -lt $pack.parts.Episode) { continue }
-                if ($single.parts.Episode -gt $pack.parts.EpisodeLast) { continue }
-                if ((Get-Prop $single 'progress') -lt 1) { continue }
+                if (-not (Test-PackContainsEpisode -PackParts $pack.parts -Episode $single.parts.Episode)) { continue }
 
                 # The one episode they share, measured on both sides - the
                 # same helper the manager calls, so the preview cannot report a
@@ -586,8 +609,12 @@ function Get-DedupVerdicts {
                 $epFileBytes = Get-PackEpisodeBytes -Hash $pack.hash -Season $pack.parts.Season `
                                                     -Episode $single.parts.Episode -Cache $fileSizeCache
                 if ($null -eq $epFileBytes) { continue }
-                if ((Get-Prop $single 'size') -le 0) { continue }
-                if (Test-Errored $single) { continue }
+                $packEpisodeFile = Get-PackEpisodeFile -Hash $pack.hash -Season $pack.parts.Season `
+                    -Episode $single.parts.Episode -Cache $fileSizeCache
+                $singleEpisodeFile = Get-PackEpisodeFile -Hash $single.hash -Season $single.parts.Season `
+                    -Episode $single.parts.Episode -Cache $fileSizeCache
+                if ($null -eq $singleEpisodeFile -or [int64]$singleEpisodeFile.size -le 0) { continue }
+                $singleEpisodeBytes = [int64]$singleEpisodeFile.size
 
                 # ONLY THE SINGLE IS EVER DELETED HERE, and the manager's copy of
                 # this pass is narrowed the same way. Both used to pick a winner
@@ -598,15 +625,16 @@ function Get-DedupVerdicts {
                 # no other copy anywhere. A pack is the only record qBittorrent
                 # has of what it holds, so it is never the thing this pass
                 # removes - only a single is, and only when the pack's own file
-                # for that episode is the larger one.
-                if ($epFileBytes -lt (Get-Prop $single 'size')) { continue }
+                # for that episode is equal in size or larger.
+                if (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes $epFileBytes `
+                        -SingleEpisodeBytes $singleEpisodeBytes)) { continue }
                 if ($verdicts.ContainsKey($single.hash)) { continue }
 
                 $verdicts[$single.hash] = [pscustomobject]@{
                     Verdict = 'DELETE'; Rule = 'dedup-pack-single'
-                    Reason  = ("holds S{0}E{1} that '{2}' already carries inside its pack; the single is {3:N2} GB and the pack's own file for that episode is {4:N2} GB, and the pack holds other episodes this single cannot replace" -f `
+                    Reason  = ("holds S{0}E{1} that '{2}' already carries inside its pack; the single episode file is {3:N2} GB and the pack's own file for that episode is {4:N2} GB, and the pack holds other episodes this single cannot replace" -f `
                                $pack.parts.Season, $single.parts.Episode, $pack.name,
-                               ((Get-Prop $single 'size') / $GB), ($epFileBytes / $GB))
+                               ($singleEpisodeBytes / $GB), ($epFileBytes / $GB))
                 }
             }
         }
@@ -1310,8 +1338,16 @@ function Show-Snapshot {
             if ($members.Count -eq 0) { continue }
             $grouped += $members.Count
 
+            $parts = @($members | ForEach-Object { $_.parts })
+            $identity = Get-TmdbGroupIdentity -Parts $parts
+            $canonical = if ($identity) { Get-TmdbGroupName -Parts $parts } else { '' }
+
+            # A work is grouped by what TMDB says it is, never by a filename. The
+            # identity is the key, so every episode set of one show lands in one
+            # row; only an unidentified work falls back to the family label.
             $label = Get-FamilyLabel -Members $members
             if (-not $label) { $label = '(unnamed)' }
+            $groupKey = if ($identity) { 'tmdb:' + $identity } else { 'label:' + $label.ToLowerInvariant() }
 
             # One cluster is exactly one episode set, so this key is exact - it is
             # the set the whole cluster was weighed under.
@@ -1323,17 +1359,24 @@ function Show-Snapshot {
             elseif ($setKey -match '^S\d+-E\d+-E\d+$') { $kind = 'packs' }
             elseif ($setKey -match '^S\d+-E\d+$') { $kind = 'singles' }
 
-            if (-not $byShow.ContainsKey($label)) {
-                $byShow[$label] = @{
-                    Lower   = $label.ToLowerInvariant()
-                    Singles = [pscustomobject]@{ Count = 0; Done = 0; Sets = @{} }
-                    Packs   = [pscustomobject]@{ Count = 0; Done = 0; Sets = @{} }
-                    Films   = [pscustomobject]@{ Count = 0; Done = 0; Sets = @{} }
+            if (-not $byShow.ContainsKey($groupKey)) {
+                $byShow[$groupKey] = @{
+                    Lower       = $(if ($canonical) { $canonical.ToLowerInvariant() } else { $label.ToLowerInvariant() })
+                    Canonical   = $canonical
+                    Fallback    = $label
+                    Total       = 0
+                    YearMembers = 0
+                    Years       = @{}
+                    Singles     = [pscustomobject]@{ Count = 0; Done = 0; Sets = @{} }
+                    Packs       = [pscustomobject]@{ Count = 0; Done = 0; Sets = @{} }
+                    Films       = [pscustomobject]@{ Count = 0; Done = 0; Sets = @{} }
                 }
             }
-            $bucket = $byShow[$label][$kind]
+            $show = $byShow[$groupKey]
+            $bucket = $show[$kind]
             if ($null -eq $bucket) { continue }
 
+            $show.Total += $members.Count
             $bucket.Count += $members.Count
             # One entry per distinct set, not per cluster: a set that appears in
             # three clusters is still one set of episodes, and saying otherwise
@@ -1344,6 +1387,8 @@ function Show-Snapshot {
 
             foreach ($m in $members) {
                 if ((Get-Prop $m 'progress' 0) -ge 1) { $bucket.Done++ }
+                $year = [string]$m.parts.Year
+                if ($year) { $show.YearMembers++; $show.Years[$year] = $true }
             }
             if ($kindsSeen.ContainsKey($kind)) { $kindsSeen[$kind]++ }
         }
@@ -1366,12 +1411,13 @@ function Show-Snapshot {
             $cap = if ($Full) { $shows.Count } else { [Math]::Min($shows.Count, 12) }
             $shown = 0
 
-            foreach ($label in $shows) {
+            foreach ($groupKey in $shows) {
                 if ($shown -ge $cap) { break }
                 $shown++
-                $b = $byShow[$label]
+                $b = $byShow[$groupKey]
+                $display = Get-GroupDisplayLabel -Bucket $b
 
-                Write-Host ("  {0}" -f (Fit $label ([Math]::Max(20, $W - 2)))) -ForegroundColor White
+                Write-Host ("  {0}" -f (Fit $display ([Math]::Max(20, $W - 2)))) -ForegroundColor White
 
                 foreach ($kind in @('singles', 'packs', 'films')) {
                     $k = $b[$kind]
@@ -1391,8 +1437,8 @@ function Show-Snapshot {
             Write-Truncated -Shown $shown -Total $shows.Count -How 'run with -Full'
 
             $totS = 0; $totP = 0; $totF = 0
-            foreach ($label in $shows) {
-                $b = $byShow[$label]
+            foreach ($groupKey in $shows) {
+                $b = $byShow[$groupKey]
                 $totS += $b.Singles.Count; $totP += $b.Packs.Count; $totF += $b.Films.Count
             }
             Write-Host ("  {0} group(s): {1} single-episode, {2} in packs, {3} film(s) - {4} torrent(s) total" -f `

@@ -58,7 +58,7 @@ Invoke-Expression (Get-Slice -Text $msrc -From '$script:boundaryPattern' -To 'fu
 function P {
     param([string]$Hash, [string]$Name, [double]$SizeGb, [double]$Progress)
     $size = [int64]($SizeGb * $GB)
-    return [pscustomobject]@{
+    $t = [pscustomobject]@{
         hash       = $Hash
         name       = $Name
         size       = $size
@@ -66,13 +66,23 @@ function P {
         progress   = $Progress
         parts      = (Get-TitleParts -Name $Name)
     }
+    # A real single-episode torrent has its own file list, and the rule compares
+    # that episode file rather than the torrent total (which may include small
+    # sidecars). Register it here so each single fixture supplies the media file
+    # a live listing would supply; pack fixtures override this explicitly below.
+    if ($t.parts -and -not $t.parts.IsMultiEpisode -and $null -ne $t.parts.Episode -and [int]$t.parts.Season -gt 0) {
+        Set-PackFiles -Hash $Hash -Entries @(
+            (File ('Episode S{0:D2}E{1:D2}.mkv' -f [int]$t.parts.Season, [int]$t.parts.Episode) $SizeGb)
+        )
+    }
+    return $t
 }
 
-# Get-PackEpisodeBytes reads the pack's own file list, so it is the piece that
-# makes the pack-vs-single comparison a measurement instead of an average. It
-# lives in the manager, and the preview calls it too, so both sides use the one
-# implementation.
-Invoke-Expression (Get-Slice -Text $msrc -From 'function Get-PackEpisodeBytes' -To '# Where a completed torrent belongs')
+# Get-PackEpisodeFile and Get-PackEpisodeBytes read the pack's own file list, so
+# they are the pieces that make the pack-vs-single comparison a measurement
+# instead of an average. They live in the manager, and the preview calls them
+# too, so both sides use the one implementation.
+Invoke-Expression (Get-Slice -Text $msrc -From 'function Get-PackEpisodeFile' -To '# Where a completed torrent belongs')
 
 # The one thing that cannot be sliced is the API call itself. Stubbed here so the
 # tests can state each pack's real per-episode sizes - which is the whole point
@@ -483,6 +493,7 @@ Check 'two different seasons never share a key' ((Get-EpisodeSetKey -Parts (Get-
 Check 'a group tag is not a season' ((Get-TitleParts -Name 'Show S0NNER 1080p WEB x264').IsSeries -eq $false)
 Check 'a trailing S0 is not a season' ((Get-TitleParts -Name 'Show 1080p x264-S0').IsSeries -eq $false)
 Check 'a group tag after a channel is not a season' ((Get-TitleParts -Name 'Show WEB-DL 5.1 1080p x264-S0NNER').IsSeries -eq $false)
+Check 'a codec-tagged group number is not a season' ((Get-TitleParts -Name 'Substancja / The Substance (2024) [1080p] [WEB-DL] [H264] [DD5.1-S56] [Lektor PL] [ext.to]').IsSeries -eq $false)
 #
 # Films are untouched by the new branch.
 Check 'a dotted numeric title is still a film' ((Get-EpisodeSetKey -Parts (Get-TitleParts -Name 'Ocean.s.8.2018 1080p BluRay x264')) -eq 'film')

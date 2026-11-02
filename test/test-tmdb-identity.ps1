@@ -181,7 +181,26 @@ $multi = Get-TmdbIdentity -Parts $planet -Name 'BBC Planet Earth 1080p BluRay' `
     -BearerToken 'test-token' -Cache @{} -Request $request -MaxLookups 8
 Check 'a multi-season match never invents a season' ($multi.status -eq 'matched' -and $multi.type -eq 'tv' -and -not $multi.corrected -and $multi.seasons -eq 3)
 $planetParts = Set-TmdbIdentity -Parts $planet -Identity $multi
-Check 'a multi-season result leaves the release a film' (-not $planetParts.IsSeries -and $planetParts.TmdbId -eq '200')
+Check 'a matched multi-season show is a whole-show pack without inventing its season' `
+    ($planetParts.IsSeries -and $null -eq $planetParts.Season -and $planetParts.Episode -eq 0 -and $planetParts.TmdbId -eq '200')
+Check 'the whole-show key records no guessed season' ((Get-EpisodeSetKey -Parts $planetParts) -eq 'SHOW-ALL')
+
+$dexterSeasonPack = Get-TitleParts -Name 'Dexter: Resurrection / Season: 1 / Episodes: 1-10 of 10 (2025) WEB-DL'
+Check 'localized Season: 1 pack markers parse as a season pack' `
+    ($dexterSeasonPack.IsSeries -and $dexterSeasonPack.Season -eq 1 -and $dexterSeasonPack.Episode -eq 0)
+$componentCache = @{
+    'tv||dexter resurrection' = [pscustomobject]@{ status='matched'; id='259909'; type='tv'; name='Dexter: Resurrection'; year=''; seasons=2; season=0; corrected=$false; checkedAt=(Get-Date).ToString('o') }
+    'tv||localized dexter resurrection' = [pscustomobject]@{ status='notfound'; id=''; type='tv'; name=''; year=''; seasons=0; season=0; corrected=$false; checkedAt=(Get-Date).ToString('o') }
+}
+$localizedPack = Get-TitleParts -Name 'Localized Dexter / Dexter Resurrection 1. serie'
+$componentIdentity = Get-TmdbIdentity -Parts $localizedPack -Name 'Localized Dexter / Dexter Resurrection 1. serie' -Cache $componentCache -CacheOnly
+Check 'a cached canonical title identity wins over a compound localized-title cache miss' `
+    ($componentIdentity.status -eq 'matched' -and $componentIdentity.id -eq '259909' -and $componentIdentity.type -eq 'tv')
+$dexterLocalized = Get-TitleParts -Name 'Dexter: Zmartwychwstanie / Dexter Resurrection [Sezon01] [1080p]'
+$dexterIdentity = [pscustomobject]@{ status='matched'; id='259909'; type='tv'; name='Dexter: Resurrection'; corrected=$false; season=0 }
+$dexterSeries = Set-TmdbIdentity -Parts $dexterLocalized -Identity $dexterIdentity
+Check 'a TMDB TV identity overrides a film-shaped localized release' `
+    ($dexterSeries.IsSeries -and $dexterSeries.Season -eq 1 -and $dexterSeries.TmdbId -eq '259909')
 
 $script:tmdbMode = 'tv-ambiguous'
 Reset-TmdbBudget
@@ -239,6 +258,20 @@ foreach ($show in @($showA, $showB)) {
 }
 $fam = Get-ClusterFamilies -Clusters @(@($showA), @($showB))
 Check 'localized series variants share the TMDB family ID' ($fam.Family[0] -eq 'tmdb:77' -and $fam.Family[1] -eq 'tmdb:77')
+$unknownShow = Get-TitleParts -Name 'Localized Dexter / Dexter Resurrection (2025)'
+$unknownShow = Set-TmdbIdentity -Parts $unknownShow -Identity ([pscustomobject]@{
+    status='matched'; id='259909'; type='tv'; name='Dexter: Resurrection'; season=$null
+})
+$unknownShow | Add-Member TmdbNameKey 'dexter resurrection' -Force
+$unknownMember = [pscustomobject]@{ parts = $unknownShow }
+$knownMember = [pscustomobject]@{ parts = (Get-TitleParts -Name 'Dexter Resurrection S01E01') }
+$knownMember.parts | Add-Member TmdbId '259909' -Force
+$knownMember.parts | Add-Member TmdbType 'tv' -Force
+$knownMember.parts | Add-Member TmdbNameKey 'dexter resurrection' -Force
+$unknownFamily = Get-ClusterFamilies -Clusters @(@($unknownMember), @($knownMember))
+Check 'TMDB TV identity keeps unknown-coordinate releases in the show family' `
+    ($null -eq $unknownShow.Season -and $unknownShow.Episode -eq 0 -and
+     $unknownFamily.Family[0] -eq 'tmdb:259909' -and $unknownFamily.Family[1] -eq 'tmdb:259909')
 $groups = New-Object Collections.ArrayList
 foreach ($show in @($showA, $showB)) { $group = New-Object Collections.ArrayList; [void]$group.Add($show); [void]$groups.Add($group) }
 $merged = Merge-SeriesClusters -Clusters $groups

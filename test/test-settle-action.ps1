@@ -27,7 +27,10 @@ function Remove-Torrent {
     $journal = Join-Path $script:settleJournalDir ($T.hash + '.json')
     if (-not (Test-Path -LiteralPath $journal)) { throw 'entry removal happened before durable journal write' }
     foreach ($f in $script:activePlan.Files) {
-        if (-not (Test-Path -LiteralPath $f.Path) -or (Get-Item -LiteralPath $f.Path).Length -ne $f.Bytes) {
+        $sourceValid = (Test-Path -LiteralPath $f.Path) -and (Get-Item -LiteralPath $f.Path).Length -eq $f.Bytes
+        $retainedValid = (Test-Path -LiteralPath $f.Target -PathType Leaf) -and
+            (Get-Item -LiteralPath $f.Target).Length -ge $f.Bytes
+        if (-not $sourceValid -and -not $retainedValid) {
             throw 'media was moved before entry removal or source was not validated'
         }
     }
@@ -132,6 +135,18 @@ try {
     $f.Plan.Files[0].Path = $f.Plan.Files[0].Target
     $ok = Run $f
     Check 'already-flat media verifies and removes only the entry' ($ok -and $script:removed -and (Test-Path -LiteralPath $f.Plan.Files[0].Target))
+
+    Reset; $f = Fixture 'missing-pack-member' -Pack
+    $missing = $f.Plan.Files[0]
+    Remove-Item -LiteralPath $missing.Path -Force
+    New-Item -ItemType Directory -Path $f.Plan.Dir -Force | Out-Null
+    [IO.File]::WriteAllText($missing.Target, 'a verified larger library copy')
+    $keptBytes = (Get-Item -LiteralPath $missing.Target).Length
+    $ok = Run $f
+    Check 'missing pack member is satisfied by the larger same-show library copy' `
+        ($ok -and $script:removed -and (Get-Item -LiteralPath $missing.Target).Length -eq $keptBytes)
+    Check 'other finished pack episodes still settle into the library' `
+        ($ok -and (Test-Path -LiteralPath $f.Plan.Files[1].Target))
 
     $nested = [pscustomobject]@{ content_path = (Join-Path $f.Plan.Dir 'Release\media.mkv'); save_path = $f.Save }
     Check 'move verification accepts content nested under the target folder' (Test-MoveSettled -T $nested -TargetDir $f.Plan.Dir)

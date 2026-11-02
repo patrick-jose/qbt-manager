@@ -116,6 +116,10 @@ Check 'so the correction makes them comparable'        ($kFileKey -eq $lNameKey)
 Write-Host ''
 Write-Host '== a range in the file name is expanded =='
 Check 'S03E01-08 in one file name becomes 1 to 8'      ((Get-EpisodeSetFromFiles -Files @(F 'Show.S03E01-08.720p.mkv')) -eq 'S3-E1-E8')
+Check '1x01 episode filenames in a complete pack resolve to the season range' `
+    ((Get-EpisodeSetFromFiles -Files @(F 'Show.1x01.avi'; F 'Show.1x02.avi'; F 'Show.1x03.avi')) -eq 'S1-E1-E3')
+Check '1x01-03 range notation resolves to the same episode set' `
+    ((Get-EpisodeSetFromFiles -Files @(F 'Show.1x01-03.avi')) -eq 'S1-E1-E3')
 Check 'S03E01.E08 likewise'                            ((Get-EpisodeSetFromFiles -Files @(F 'Show.S03E01.E08.mkv')) -eq 'S3-E1-E8')
 Check 'a single file naming one episode is that one'   ((Get-EpisodeSetFromFiles -Files @(F 'Show.S03E04.Kitty.mkv')) -eq 'S3-E4')
 Check 'and several such files union into a range'      ((Get-EpisodeSetFromFiles -Files @(F 'A.S03E01.mkv'; F 'A.S03E02.mkv'; F 'A.S03E03.mkv')) -eq 'S3-E1-E3')
@@ -172,9 +176,10 @@ $rangePack = Get-TitleParts -Name 'Show.S03E01-E08.1080p.WEB-DL'
 Check 'a bare S04 season pack contains a single S04 episode' (Test-PackContainsEpisode -PackParts $wholeSeason -Episode 4)
 Check 'an explicit pack range contains an episode in-range' (Test-PackContainsEpisode -PackParts $rangePack -Episode 8)
 Check 'an explicit pack range does not contain an episode out-of-range' (-not (Test-PackContainsEpisode -PackParts $rangePack -Episode 9))
-Check 'a strictly larger pack episode beats the single torrent' (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 101 -SingleTotalBytes 100)
-Check 'an equal-size pack episode does not beat the single torrent' (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 100 -SingleTotalBytes 100))
-Check 'a smaller pack episode does not beat the single torrent' (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 99 -SingleTotalBytes 100))
+Check 'a strictly larger pack episode beats the single torrent' (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 101 -SingleEpisodeBytes 100)
+Check 'an equal-size finished pack episode beats an unfinished single' (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 100 -SingleEpisodeBytes 100)
+Check 'a smaller finished pack episode does not beat the single torrent' (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 99 -SingleEpisodeBytes 100))
+Check 'a smaller pack episode does not beat the single torrent' (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes 99 -SingleEpisodeBytes 100))
 
 Write-Host ''
 Write-Host '== the family fold, driven through the preview =='
@@ -296,12 +301,14 @@ Write-Host '== the set key is only corrected for S<n>-ALL =='
 #
 # Both failures were the test being wrong about correct code, which is the worst
 # kind: it would have been deleted or 'fixed' to match a typo.
-$resolverLine = ($msrc -split "`n" | Where-Object { $_ -match '\$nameKey -notmatch' } | Select-Object -First 1)
+$resolverLine = ($msrc -split "`n" | Where-Object { $_ -match '\$needsFileResolution\s*=' } | Select-Object -First 1)
 $resolverPattern = if ($resolverLine -match "-notmatch\s+'([^']+)'") { $Matches[1] } else { '' }
 Write-Host ("  the resolver's own pattern: '" + $resolverPattern + "'")
-Check 'the resolver only corrects an S<n>-ALL key'      ($resolverPattern -and ('S3-ALL' -match $resolverPattern) -and -not ('S3-E1-E8' -match $resolverPattern))
-Check 'and it leaves a plain range key alone'           ($resolverPattern -and -not ('S3-E1-E8' -match $resolverPattern))
-$m = ($msrc -cmatch '(?s)function Resolve-TorrentSetKey.*?\$nameKey\s+-notmatch')
+Check 'explicit S<n>-ALL packs still trigger file resolution' ($msrc -cmatch '\$nameKey -match ''\^S\\d\+-ALL\$''')
+Check 'unknown-coordinate TV series also trigger file resolution' ($msrc -cmatch '\$T\.parts\.IsSeries -and \[string\]::IsNullOrWhiteSpace\(\$nameKey\)')
+Check 'equal-size pack duplicates do not require filename matching' `
+    ($msrc -cmatch '(?s)function Test-PackEpisodeOutweighsSingle.*?return \(\$PackEpisodeBytes -ge \$SingleEpisodeBytes\)')
+$m = ($msrc -cmatch '(?s)function Resolve-TorrentSetKey.*?\$needsFileResolution')
 Check 'and only then reads the files'                  ($msrc -cmatch '(?s)function Resolve-TorrentSetKey.*?torrents/files\?hash=')
 Check 'a magnet with no files keeps the name key'      ((Get-EpisodeSetFromFiles -Files @()) -eq 'S3-ALL' -or (Get-EpisodeSetFromFiles -Files @()) -eq '')
 
@@ -312,7 +319,11 @@ Write-Host '== the two scripts agree =='
 # with the run, which is worse than having no preview.
 Check 'status.ps1 has its own resolver'                 ($ssrc -cmatch 'function Resolve-SetKey')
 Check 'named for what it is'                            ($ssrc -cmatch 'function Resolve-SetKey \{\s*\r?\n\s*param\(\$T, \$Cache\)')
-Check 'which also only corrects S<n>-ALL'               ($ssrc -cmatch '\$nameKey\s+-notmatch ''\^S\\d\+-ALL\$''')
+Check 'which also resolves unknown-coordinate TV series' ($ssrc -cmatch '\$parts\.IsSeries\s+-and\s+\[string\]::IsNullOrWhiteSpace\(\$nameKey\)')
+Check 'preview checks whole-season packs against singles too' `
+    ($ssrc -cmatch '\$pack\.parts\.Episode\s+-ne\s+0' -and $ssrc -cmatch 'Test-PackContainsEpisode')
+Check 'preview uses the same episode-size rule as the manager' `
+    ($ssrc -cmatch 'Test-PackEpisodeOutweighsSingle' -and $ssrc -cmatch 'Get-PackEpisodeFile')
 Check 'both fold clusters by family'                    (
     ($msrc -cmatch '\$setGroups = @\(\)\r?\n\$famInfo = Get-ClusterFamilies') -and
     ($ssrc -cmatch '\$setGroups = @\(\)\s*\r?\n\s*\$famInfo = Get-ClusterFamilies'))

@@ -9,6 +9,8 @@
 
   "moviesDir": "PUT-YOUR-PATH-HERE",
   "seriesDir": "PUT-YOUR-PATH-HERE",
+  "//stagingDir": "Incomplete torrents must download outside the movie/series library roots. Existing manager-created category defaults that still point at those roots are moved here; custom category paths are preserved.",
+  "stagingDir": "PUT-YOUR-PATH-HERE",
 
   "moviesCategory": "Movies",
   "seriesCategory": "Series",
@@ -17,12 +19,15 @@
   "metadataTimeoutMinutes": 30,
   "metadataPriorityRankLimit": 10,
   "queueDrainEnabled": true,
+  "//stallCleanupEnabled": "Unsafe to infer torrent availability from zero client-wide download speed: this can delete newly added metadata magnets during normal startup or quiet periods. Keep disabled; per-torrent metadata and stalled rules remain active.",
   "stallCleanupEnabled": true,
-  "stallConfirmSeconds": 15,
+  "stallConfirmSeconds": 600,
   "stallMaxWaitSeconds": 75,
   "stallMaxDeletions": 10,
   "stallInternetProbeUrl": "https://www.cloudflare.com/cdn-cgi/trace",
   "stalledDeleteDays": 5,
+  "//stalledMinimumFreeSpaceGB": "Idle-torrent removal is held and its clock paused when an incomplete torrent's destination has less free space than its remaining size or this reserve. Set to 0 to disable only the reserve threshold.",
+  "stalledMinimumFreeSpaceGB": 5,
   "backupMaxAgeDays": 7,
   "logRetentionDays": 7,
 

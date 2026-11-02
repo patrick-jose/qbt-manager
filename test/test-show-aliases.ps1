@@ -304,7 +304,7 @@ Write-Host '== both files must resolve identity, or the preview lies =='
 $mgrSrc = [System.IO.File]::ReadAllText((Join-Path $projectRoot 'qbt-manager.ps1'), [System.Text.Encoding]::UTF8)
 $preSrc = [System.IO.File]::ReadAllText((Join-Path $projectRoot 'status.ps1'), [System.Text.Encoding]::UTF8)
 Check 'the manager resolves the alias where parts are attached' `
-    ($mgrSrc -cmatch '(?s)Get-TitleParts -Name \$t\.name.{0,900}?Resolve-PartsAlias -Parts \$parts')
+    ($mgrSrc -cmatch '(?s)Get-TitleParts -Name \$t\.name.{0,2600}?Resolve-PartsAlias -Parts \$parts')
 Check 'the preview does the same' `
     ($preSrc -cmatch '(?s)Get-TitleParts -Name \(Get-Prop \$t ''name''\).{0,900}?Resolve-PartsAlias -Parts \$parts')
 # Resolve-ShowAlias had a single call site, inside folder naming, and that is why

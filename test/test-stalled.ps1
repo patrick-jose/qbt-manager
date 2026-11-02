@@ -176,6 +176,26 @@ $resumedAt = [datetime]::Parse($state.stalled.sample.lastProgressAt)
 Check 'recovery resumes cleanup without charging outage time' (-not $paused -and [math]::Abs(($NOW.AddDays(-2) - $resumedAt).TotalSeconds) -lt 1)
 Check 'recovery clears the outage marker' ($null -eq $state.PSObject.Properties['stalledInternetDownSince'])
 
+# -- 12. low destination space holds removal and pauses inactivity time -------
+
+$diskTorrent = T -Hash 'disk-low' -Completed 2GB -Total 10GB -LastActivity (Unix ($NOW.AddDays(-10))) -AddedOn (Unix ($NOW.AddDays(-20)))
+$diskTorrent | Add-Member -NotePropertyName save_path -NotePropertyValue 'D:\Downloads\'
+$diskLow = Get-StalledDiskSpaceStatus -Torrents @($diskTorrent) -MinimumFreeSpaceGB 5 -FreeSpaceProbe { param($Path) [int64]3GB } -CheckAllDrives $false
+Check 'insufficient free space for the remaining download is detected' ($null -ne $diskLow -and $diskLow.FreeBytes -eq [int64]3GB)
+$diskOk = Get-StalledDiskSpaceStatus -Torrents @($diskTorrent) -MinimumFreeSpaceGB 1 -FreeSpaceProbe { param($Path) [int64]12GB } -CheckAllDrives $false
+Check 'sufficient free space does not pause stalled removal' ($null -eq $diskOk)
+
+$state = [pscustomobject]@{ stalled = [pscustomobject]@{ sample = [pscustomobject]@{
+    lastProgressAt = $NOW.AddDays(-4).ToString('o'); bytes = [int64]0
+} } }
+$pauseStart = $NOW.AddDays(-2)
+$paused = Update-StalledRemovalPause -State $state -Now $pauseStart -PauseReasons @('insufficient free disk space')
+Check 'low disk space pauses stalled-torrent removal' ($paused -and $state.stalledRemovalPausedSince -eq $pauseStart.ToString('o'))
+$paused = Update-StalledRemovalPause -State $state -Now $NOW -PauseReasons @()
+$resumedAt = [datetime]::Parse($state.stalled.sample.lastProgressAt)
+Check 'low-space duration is excluded from inactivity clocks' (-not $paused -and [math]::Abs(($NOW.AddDays(-2) - $resumedAt).TotalSeconds) -lt 1)
+Check 'low-space pause state clears after recovery' ($null -eq $state.PSObject.Properties['stalledRemovalPausedSince'])
+
 ''
 if ($script:fails -eq 0) { 'all stalled-rule tests passed' }
 else { "$($script:fails) test(s) FAILED"; exit 1 }
