@@ -141,7 +141,23 @@ Check 'and releases the lock on the way out' (-not (Test-Path -LiteralPath (Join
 Write-Host ''
 Write-Host '=== 6. the live machine is unaffected by all of this ==='
 Check 'the real state file was not touched' (-not (Test-Path -LiteralPath (Join-Path $sandbox 'state.json')))
-Check 'no stray lock in the real directory' (-not (Test-Path -LiteralPath (Join-Path $projectRoot 'manager.lock')))
+$realLock = Join-Path $projectRoot 'manager.lock'
+if (-not (Test-Path -LiteralPath $realLock)) {
+    Check 'no stray lock in the real directory' $true
+}
+else {
+    $lockOwner = 0
+    $lockText = [System.IO.File]::ReadAllText($realLock)
+    $lockIsLive = $lockText -match '^\s*(\d+)\s+' -and
+        [int]::TryParse($Matches[1], [ref]$lockOwner) -and
+        $null -ne (Get-Process -Id $lockOwner -ErrorAction SilentlyContinue)
+    if ($lockIsLive) {
+        Write-Host '  [SKIP] a live manager owns the real-directory lock'
+    }
+    else {
+        Check 'no stale lock in the real directory' $false 'found a lock without a live owner'
+    }
+}
 
 Remove-Item $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 
