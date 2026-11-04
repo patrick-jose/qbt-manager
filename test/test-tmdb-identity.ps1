@@ -137,6 +137,95 @@ $localizedIdentity = Get-TmdbIdentity -Parts $repairedParts -Name $mojibakeName 
 Check 'the repaired title reaches the existing localized-title TMDB cache entry' `
     ($localizedIdentity.status -eq 'matched' -and $localizedIdentity.id -eq '3558')
 
+$yearlessTvCache = @{
+    'tv||dark matter' = [pscustomobject]@{
+        status='matched'; id='196322'; type='tv'; name='Dark Matter'; year=''
+        seasons=1; season=0; corrected=$false; checkedAt=(Get-Date).ToString('o')
+    }
+}
+$yearTaggedTv = Get-TitleParts -Name 'Dark Matter 2026 S01E01 1080p WEB-DL'
+$yearlessTvIdentity = Get-TmdbIdentity -Parts $yearTaggedTv -Name 'Dark Matter 2026 S01E01 1080p WEB-DL' `
+    -Cache $yearlessTvCache -CacheOnly
+Check 'a cache-only year fallback checks later TMDB plans after an earlier cache miss' `
+    ($yearlessTvIdentity.status -eq 'matched' -and $yearlessTvIdentity.id -eq '196322')
+
+$localizedTvName = 'Mroczna Materia Dark Matter 2026 S01E01 1080p WEB-DL'
+$localizedTvParts = Get-TitleParts -Name $localizedTvName
+$localizedTvCache = @{}
+$localizedTvEntry = [pscustomobject]@{
+    status='matched'; id='196322'; type='tv'; name='Dark Matter'; year='2024'
+    seasons=1; season=0; corrected=$false; checkedAt=(Get-Date).ToString('o')
+}
+foreach ($variant in (Get-TmdbSearchVariants -Name $localizedTvName -ParsedTitle $localizedTvParts.Title)) {
+    $localizedTvCache["tv|2024|$variant"] = $localizedTvEntry
+}
+$localizedTvIdentity = Get-TmdbIdentity -Parts $localizedTvParts -Name $localizedTvName `
+    -Cache $localizedTvCache -CacheOnly
+Check 'an exact localized TV title reuses its unique cached match across release years' `
+    ($localizedTvIdentity.status -eq 'matched' -and $localizedTvIdentity.id -eq '196322')
+
+$specificTvCache = @{
+    'tv|2024|mroczna materia dark matter' = $localizedTvEntry
+    'tv|2015|dark matter' = [pscustomobject]@{
+        status='matched'; id='62425'; type='tv'; name='Dark Matter'; year='2015'
+        seasons=3; season=0; corrected=$false; checkedAt=(Get-Date).ToString('o')
+    }
+    'tv|2024|dark matter' = $localizedTvEntry
+}
+$specificTvIdentity = Get-TmdbIdentity -Parts $localizedTvParts -Name $localizedTvName `
+    -Cache $specificTvCache -CacheOnly
+Check 'a specific localized cached title outranks a short ambiguous title across years' `
+    ($specificTvIdentity.status -eq 'matched' -and $specificTvIdentity.id -eq '196322')
+
+$prefixedTvName = '[ONLY POLISH AUDIO] Mroczna materia / Dark Matter (2026) (S02E01-02) 1080p WEB-DL'
+$prefixedTvParts = Get-TitleParts -Name $prefixedTvName
+$prefixedTvIdentity = Get-TmdbIdentity -Parts $prefixedTvParts -Name $prefixedTvName `
+    -Cache $specificTvCache -CacheOnly
+Check 'a longer release title reuses its specific contained localized TV cache match' `
+    ($prefixedTvIdentity.status -eq 'matched' -and $prefixedTvIdentity.id -eq '196322')
+
+$sameNameTvCache = @{
+    'tv|2015|dark matter' = [pscustomobject]@{
+        status='matched'; id='62425'; type='tv'; name='Dark Matter'; year='2015'
+        seasons=3; season=0; corrected=$false; checkedAt=(Get-Date).ToString('o')
+    }
+    'tv|2024|dark matter' = $localizedTvEntry
+}
+$sameNameTvIdentity = Get-TmdbIdentity -Parts $yearTaggedTv -Name 'Dark Matter 2026 S01E01 1080p WEB-DL' `
+    -Cache $sameNameTvCache -CacheOnly
+Check 'same-name TV shows with different IDs remain ambiguous across release years' `
+    ($sameNameTvIdentity.status -eq 'ambiguous' -and -not $sameNameTvIdentity.id)
+Check 'ambiguous same-name TMDB records retain their shared display title' `
+    ($sameNameTvIdentity.name -eq 'Dark Matter')
+$displayOnlyParts = Get-TitleParts -Name 'Dark Matter S01E01'
+$displayOnlyParts | Add-Member TmdbDisplayName $sameNameTvIdentity.name -Force
+Check 'a display title does not manufacture an authoritative TMDB identity' `
+    (-not (Get-TmdbGroupIdentity -Parts @($displayOnlyParts)) -and
+     (Get-TmdbGroupName -Parts @($displayOnlyParts)) -eq 'Dark Matter')
+$conflictingDisplay = Get-TitleParts -Name 'Dark Matter S01E01'
+$conflictingDisplay | Add-Member TmdbDisplayName 'Dark Matter' -Force
+$otherDisplay = Get-TitleParts -Name 'Dark Matter S01E01'
+$otherDisplay | Add-Member TmdbDisplayName 'The Dark Matter of Love' -Force
+Check 'conflicting display-only title hints are not combined' `
+    (-not (Get-TmdbGroupName -Parts @($conflictingDisplay, $otherDisplay)))
+$darkMatter2015Parts = Get-TitleParts -Name 'Dark Matter S02E01'
+$darkMatter2015Parts | Add-Member TmdbId '62425' -Force
+$darkMatter2015Parts | Add-Member TmdbType 'tv' -Force
+$darkMatter2015Parts | Add-Member TmdbName 'Dark Matter' -Force
+$darkMatter2024Parts = Get-TitleParts -Name 'Dark Matter S02E01'
+$darkMatter2024Parts | Add-Member TmdbId '196322' -Force
+$darkMatter2024Parts | Add-Member TmdbType 'tv' -Force
+$darkMatter2024Parts | Add-Member TmdbName 'Dark Matter' -Force
+Check 'distinct show IDs do not suppress a unanimous TMDB display name' `
+    (-not (Get-TmdbGroupIdentity -Parts @($darkMatter2015Parts, $darkMatter2024Parts)) -and
+     (Get-TmdbGroupName -Parts @($darkMatter2015Parts, $darkMatter2024Parts)) -eq 'Dark Matter')
+$otherTvParts = Get-TitleParts -Name 'Other Show S02E01'
+$otherTvParts | Add-Member TmdbId '300' -Force
+$otherTvParts | Add-Member TmdbType 'tv' -Force
+$otherTvParts | Add-Member TmdbName 'Other Show' -Force
+Check 'different TMDB IDs with different names do not share a display label' `
+    (-not (Get-TmdbGroupName -Parts @($darkMatter2015Parts, $otherTvParts)))
+
 $script:tmdbMode = 'wrong-year'
 Reset-TmdbBudget
 $old = Get-TitleParts -Name 'Mars One (2022)'

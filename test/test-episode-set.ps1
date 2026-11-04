@@ -67,6 +67,17 @@ Invoke-Expression (Get-Slice -Text $msrc -From '$script:boundaryPattern' -To 'fu
 # And the preview's own dedup, which is the same rule in function form.
 Invoke-Expression (Get-Slice -Text $ssrc -From 'function Get-Prop' -To 'function Get-MetadataWatch')
 
+Write-Host ''
+Write-Host '== GROUPS display buckets use the canonical TMDB name =='
+$darkMatter2024 = Get-GroupKey -Canonical 'Dark Matter' -Fallback 'dark matter (2024)' -MediaType 'tv'
+$darkMatter2015 = Get-GroupKey -Canonical 'Dark Matter' -Fallback 'Dark Matter' -MediaType 'tv'
+$darkMatterUnresolved = Get-GroupKey -Canonical '' -Fallback 'dark matter' -MediaType 'tv'
+Check 'same TMDB name is one display group even when IDs differ' ($darkMatter2024 -eq $darkMatter2015)
+Check 'an unresolved exact title joins its canonical-name display group' ($darkMatter2024 -eq $darkMatterUnresolved)
+Check 'a same-named film stays separate from a TV show' `
+    ($darkMatter2024 -ne (Get-GroupKey -Canonical 'Dark Matter' -Fallback 'Dark Matter' -MediaType 'movie'))
+Check 'GROUPS calls the display-key helper' ($ssrc -match '\$groupKey\s*=\s*Get-GroupKey')
+
 # A file entry as qBittorrent reports it. Only 'name' is read.
 function F { param([string]$Name) return [pscustomobject]@{ name = $Name } }
 

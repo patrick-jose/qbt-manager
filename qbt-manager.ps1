@@ -1304,8 +1304,8 @@ function Get-TmdbGroupIdentity {
 
         Members without an identity are ignored rather than vetoing the answer,
         because an unidentified magnet is not evidence that the identified
-        release is something else. Two DIFFERENT identities do disqualify the
-        group: a mixed group must never borrow one work's name.
+        release is something else. Two DIFFERENT identities disqualify identity
+        comparisons, even when their canonical display names happen to match.
     #>
     param($Parts)
 
@@ -1321,8 +1321,9 @@ function Get-TmdbGroupIdentity {
 
 function Get-TmdbGroupName {
     <#
-        The canonical TMDB name for one group, or '' when the group has no single
-        authoritative identity.
+        The canonical TMDB display name for one group, or '' when there is no
+        single agreed name. Different work IDs may share one display title; this
+        does not establish an identity for comparisons or deduplication.
 
         Release filenames are never reliable evidence of a work's name: the same
         film arrives as 'The Substance', 'Substancja / The Substance' and
@@ -1334,11 +1335,38 @@ function Get-TmdbGroupName {
 
     $list = @($Parts | Where-Object { $_ })
     if ($list.Count -eq 0) { return '' }
-    if (-not (Get-TmdbGroupIdentity -Parts $list)) { return '' }
+    $identities = @{}
+    $identityNames = @{}
+    foreach ($p in $list) {
+        $id = [string](Get-PartValue -Parts $p -Name 'TmdbId')
+        if (-not $id) { continue }
+        $identity = '{0}:{1}' -f [string](Get-PartValue -Parts $p -Name 'TmdbType'), $id
+        $identities[$identity] = $true
+        $name = [string](Get-PartValue -Parts $p -Name 'TmdbName')
+        if ($name) { $identityNames[$identity] = $name }
+    }
+    if ($identities.Count -gt 1) {
+        if ($identityNames.Count -ne $identities.Count) { return '' }
+        $nameKeys = @($identityNames.Values | ForEach-Object { Get-TmdbTitleKey ([string]$_) } | Sort-Object -Unique)
+        if ($nameKeys.Count -ne 1) { return '' }
+        return [string]@($identityNames.Values)[0]
+    }
 
     foreach ($p in $list) {
         $name = [string](Get-PartValue -Parts $p -Name 'TmdbName')
         if ($name) { return $name }
+    }
+
+    # An ambiguous lookup can establish a shared display title without
+    # establishing which TMDB record it is. This hint is display-only and is
+    # accepted only when no member has an identity and every hint agrees.
+    if ($identities.Count -eq 0) {
+        $displayNames = @{}
+        foreach ($p in $list) {
+            $name = [string](Get-PartValue -Parts $p -Name 'TmdbDisplayName')
+            if ($name) { $displayNames[(Get-TmdbTitleKey $name)] = $name }
+        }
+        if ($displayNames.Count -eq 1) { return [string]@($displayNames.Values)[0] }
     }
     return ''
 }
@@ -3906,12 +3934,61 @@ function Get-TmdbIdentity {
                 $componentMatches += $component
             }
         }
+        # A TV title's embedded year is often the release/season year, not the
+        # show's premiere year. If this plan has no year-specific match, exact
+        # title matches from other TV years are still useful: prefer the most
+        # specific title evidence and require a unique ID at that specificity.
+        if ($type -eq 'tv' -and $componentMatches.Count -eq 0) {
+            $variantSet = @{}
+            foreach ($variant in @($variants | Sort-Object -Unique)) { $variantSet[$variant] = $true }
+            $knownMatches = @{}
+            foreach ($knownKey in $Cache.Keys) {
+                $keyParts = @(([string]$knownKey -split '\|', 3))
+                if ($keyParts.Count -ne 3 -or $keyParts[0] -ne 'tv' -or -not $keyParts[1]) { continue }
+                $score = 0
+                foreach ($variant in $variantSet.Keys) {
+                    if ($variant -eq $keyParts[2]) {
+                        $score = [Math]::Max($score, $keyParts[2].Length)
+                    } elseif (@($keyParts[2] -split ' ').Count -ge 2 -and
+                              (' ' + $variant + ' ').Contains(' ' + $keyParts[2] + ' ')) {
+                        $score = [Math]::Max($score, $keyParts[2].Length)
+                    }
+                }
+                if ($score -eq 0) { continue }
+                $known = $Cache[$knownKey]
+                $knownAge = 9999.0
+                try { $knownAge = ((Get-Date) - [datetime]$known.checkedAt).TotalDays } catch { }
+                $knownMaxAge = if ([string]$known.status -eq 'ambiguous') { 7 } else { 30 }
+                if ($knownAge -le $knownMaxAge -and [string]$known.status -eq 'matched' -and
+                    [string]$known.type -eq 'tv' -and [string]$known.id) {
+                    $knownId = [string]$known.id
+                    if (-not $knownMatches.ContainsKey($knownId) -or $score -gt $knownMatches[$knownId].Score) {
+                        $knownMatches[$knownId] = [pscustomobject]@{ Entry = $known; Score = $score }
+                    }
+                }
+            }
+            if ($knownMatches.Count -gt 0) {
+                $bestScore = [int](($knownMatches.Values | Measure-Object -Property Score -Maximum).Maximum)
+                foreach ($match in $knownMatches.Values) {
+                    if ($match.Score -eq $bestScore) { $componentMatches += $match.Entry }
+                }
+            }
+        }
         $componentIds = @($componentMatches | ForEach-Object { [string]$_.id } | Sort-Object -Unique)
         if ($componentIds.Count -eq 1) {
             return @($componentMatches | Where-Object { [string]$_.id -eq $componentIds[0] } | Select-Object -First 1)[0]
         }
         if ($componentIds.Count -gt 1) {
-            return [pscustomobject]@{ status='ambiguous'; type=$type; id=''; name=''; year=$planYear; resolverVersion=3 }
+            $displayNames = @{}
+            foreach ($match in $componentMatches) {
+                $name = [string](Get-PartValue -Parts $match -Name 'name')
+                $nameKey = Get-TmdbTitleKey $name
+                if ($nameKey) { $displayNames[$nameKey] = $name }
+            }
+            $displayName = if ($displayNames.Count -eq 1) { [string]@($displayNames.Values)[0] } else { '' }
+            return [pscustomobject]@{
+                status='ambiguous'; type=$type; id=''; name=$displayName; year=$planYear; resolverVersion=3
+            }
         }
         if ($null -ne $Cache -and $Cache.ContainsKey($cacheKey)) {
             $entry = $Cache[$cacheKey]
@@ -3930,8 +4007,11 @@ function Get-TmdbIdentity {
                 return $entry
             }
         }
-        if ($CacheOnly -or [string]::IsNullOrWhiteSpace($BearerToken) -or $MaxLookups -le 0) { return $null }
-        if ($script:tmdbNewLookupCount -ge $MaxLookups -or $script:tmdbRequestCount -ge $MaxRequests) { return $null }
+        # A cache-only caller may still have a hit under a later search plan
+        # (for example, TV's yearless fallback). A miss in this plan must not
+        # prevent checking the remaining cache keys.
+        if ($CacheOnly -or [string]::IsNullOrWhiteSpace($BearerToken) -or $MaxLookups -le 0) { continue }
+        if ($script:tmdbNewLookupCount -ge $MaxLookups -or $script:tmdbRequestCount -ge $MaxRequests) { continue }
         $script:tmdbNewLookupCount++
 
         $planYear = [string]$plan.Year

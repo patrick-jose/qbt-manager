@@ -357,6 +357,10 @@ function Get-Clusters {
             $identity = Get-TmdbIdentity -Parts $parts -Name ([string](Get-Prop $t 'name')) -Cache $script:tmdbCache -CacheOnly
             if ($identity -and $identity.status -eq 'matched') {
                 $parts = Set-TmdbIdentity -Parts $parts -Identity $identity
+            } elseif ($identity -and $identity.status -eq 'ambiguous' -and
+                      $identity.type -eq 'tv' -and $parts.IsSeries -and $identity.name) {
+                Add-Member -InputObject $parts -NotePropertyName TmdbDisplayName `
+                    -NotePropertyValue ([string]$identity.name) -Force
             }
         }
 
@@ -427,6 +431,15 @@ function Get-GroupDisplayLabel {
         return ('{0} ({1})' -f $Bucket.Canonical, [string]@($Bucket.Years.Keys)[0])
     }
     return $Bucket.Canonical
+}
+
+# GROUPS is a display summary, so bucket by the canonical title rather than
+# TMDB's work ID. Keep media types separate, and let an unresolved exact title
+# join a canonical-name bucket without changing identity-based deduplication.
+function Get-GroupKey {
+    param([string]$Canonical, [string]$Fallback, [string]$MediaType)
+    $name = if ($Canonical) { $Canonical } else { $Fallback }
+    return ('{0}:{1}' -f $MediaType.ToLowerInvariant(), $name.Trim().ToLowerInvariant())
 }
 
 # The episode-set key a torrent is judged under, correcting a name that claims a
@@ -1340,14 +1353,17 @@ function Show-Snapshot {
 
             $parts = @($members | ForEach-Object { $_.parts })
             $identity = Get-TmdbGroupIdentity -Parts $parts
-            $canonical = if ($identity) { Get-TmdbGroupName -Parts $parts } else { '' }
+            $canonical = Get-TmdbGroupName -Parts $parts
 
-            # A work is grouped by what TMDB says it is, never by a filename. The
-            # identity is the key, so every episode set of one show lands in one
-            # row; only an unidentified work falls back to the family label.
+            # The display report is grouped by TMDB's canonical name, not IDs:
+            # distinct records with the same title belong under one heading.
+            # IDs remain authoritative everywhere that can affect deduplication.
             $label = Get-FamilyLabel -Members $members
             if (-not $label) { $label = '(unnamed)' }
-            $groupKey = if ($identity) { 'tmdb:' + $identity } else { 'label:' + $label.ToLowerInvariant() }
+            $mediaType = if ($identity) { [string]$identity.Split(':')[0] }
+                         elseif ($parts[0].IsSeries) { 'tv' }
+                         else { 'movie' }
+            $groupKey = Get-GroupKey -Canonical $canonical -Fallback $label -MediaType $mediaType
 
             # One cluster is exactly one episode set, so this key is exact - it is
             # the set the whole cluster was weighed under.
@@ -1373,6 +1389,7 @@ function Show-Snapshot {
                 }
             }
             $show = $byShow[$groupKey]
+            if (-not $show.Canonical -and $canonical) { $show.Canonical = $canonical }
             $bucket = $show[$kind]
             if ($null -eq $bucket) { continue }
 
