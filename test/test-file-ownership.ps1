@@ -4,11 +4,21 @@ $source = [IO.File]::ReadAllText((Join-Path $root 'qbt-manager.ps1'))
 $start = $source.IndexOf('function Test-Claimed {')
 $end = $source.IndexOf('function Get-PhantomVerdicts {', $start)
 if ($start -lt 0 -or $end -le $start) { throw 'could not locate torrent path ownership helpers' }
-Invoke-Expression $source.Substring($start, $end - $start)
 $resolveStart = $source.IndexOf('function Resolve-TorrentFilePath {')
 $resolveEnd = $source.IndexOf('function Test-SettleMedia {', $resolveStart)
 if ($resolveStart -lt 0 -or $resolveEnd -le $resolveStart) { throw 'could not locate torrent file path resolver' }
-Invoke-Expression $source.Substring($resolveStart, $resolveEnd - $resolveStart)
+$priorityStart = $source.IndexOf('function Set-TorrentFilePriorityVerified {')
+$priorityEnd = $source.IndexOf('# Has this torrent''s data actually arrived', $priorityStart)
+if ($priorityStart -lt 0 -or $priorityEnd -le $priorityStart) { throw 'could not locate verified file-priority helper' }
+$resolverSource = $source.Substring($resolveStart, $resolveEnd - $resolveStart)
+$prioritySource = $source.Substring($priorityStart, $priorityEnd - $priorityStart)
+Invoke-Expression ($resolverSource + [Environment]::NewLine + $prioritySource)
+Invoke-Expression $source.Substring($start, $end - $start)
+$stopStart = $source.IndexOf('function Stop-TorrentAndConfirm {')
+$stopEnd = $source.IndexOf('function Remove-Torrent {', $stopStart)
+if ($stopStart -lt 0 -or $stopEnd -le $stopStart) { throw 'could not locate torrent-stop and file-removal helpers' }
+Invoke-Expression $source.Substring($stopStart, $stopEnd - $stopStart)
+function Test-PendingSettlePath { param([string]$Path) return $false }
 
 $script:fails = 0
 function Check {
@@ -58,13 +68,84 @@ $script:fileListing = @([pscustomobject]@{ index = 3; name = 'pack/episode.mkv';
 Check 'ambiguous file mappings are never submitted for skipping' `
     (-not (Set-TorrentFilePriorityVerified -Torrent $pack -Path $episodePath))
 
+Write-Host ''
+Write-Host '== shared exact file owners =='
+$script:mockTorrentList = @(
+    [pscustomobject]@{ hash = 'owner-a'; name = 'pack A'; content_path = 'C:\downloads\pack'; save_path = 'C:\downloads'; state = 'downloading'; progress = 1 },
+    [pscustomobject]@{ hash = 'owner-b'; name = 'pack B'; content_path = 'C:\downloads\pack'; save_path = 'C:\downloads'; state = 'downloading'; progress = 1 }
+)
+$script:mockFileListings = @{
+    'owner-a' = @([pscustomobject]@{ index = 1; name = 'pack/episode.mkv'; priority = 1; size = 25 })
+    'owner-b' = @([pscustomobject]@{ index = 4; name = 'pack/episode.mkv'; priority = 1; size = 25 })
+}
+$script:applyFilePriorityByHash = @{ 'owner-a' = $true; 'owner-b' = $true }
+$script:failFileReadHash = ''
+$script:mockPosts = @()
+function Invoke-ApiGet {
+    param([string]$Endpoint)
+    if ($Endpoint -eq 'torrents/info') { return @($script:mockTorrentList) }
+    if ($Endpoint -match '^torrents/files\?hash=(?<hash>[^&]+)$') {
+        $hash = $Matches.hash
+        if ($script:failFileReadHash -eq $hash) { throw "mock file-list failure for $hash" }
+        return @($script:mockFileListings[$hash])
+    }
+    throw "unexpected mock API GET: $Endpoint"
+}
+function Invoke-ApiPost {
+    param([string]$Endpoint, [hashtable]$Fields)
+    $script:mockPosts += ,([pscustomobject]@{ Endpoint = $Endpoint; Fields = $Fields.Clone() })
+    if ($Endpoint -eq 'torrents/stop') {
+        foreach ($torrent in $script:mockTorrentList) {
+            if ([string]$torrent.hash -eq [string]$Fields.hashes) { $torrent.state = 'stoppedUP' }
+        }
+    }
+    if ($Endpoint -eq 'torrents/filePrio' -and $script:applyFilePriorityByHash[[string]$Fields.hash]) {
+        foreach ($file in @($script:mockFileListings[[string]$Fields.hash])) {
+            if ([int]$file.index -eq [int]$Fields.id) { $file.priority = [int]$Fields.priority }
+        }
+    }
+}
+function Start-Sleep { param([int]$Milliseconds) }
+
+$sharedPath = 'C:\downloads\pack\episode.mkv'
+$sharedOwners = Prepare-ExactTorrentFileForRemoval -Path $sharedPath `
+    -Torrents $script:mockTorrentList -RequiredHashes @('owner-a') -Gone @{}
+Check 'all exact owners are stopped and verified to skip the shared file' `
+    ($sharedOwners.Verified -and $sharedOwners.Owners.Count -eq 2 -and
+     @($script:mockPosts | Where-Object { $_.Endpoint -eq 'torrents/stop' }).Count -eq 2 -and
+     @($script:mockPosts | Where-Object { $_.Endpoint -eq 'torrents/filePrio' }).Count -eq 2 -and
+     $script:mockFileListings['owner-a'][0].priority -eq 0 -and
+     $script:mockFileListings['owner-b'][0].priority -eq 0)
+
+foreach ($torrent in $script:mockTorrentList) { $torrent.state = 'downloading' }
+foreach ($hash in @('owner-a', 'owner-b')) { $script:mockFileListings[$hash][0].priority = 1 }
+$script:applyFilePriorityByHash = @{ 'owner-a' = $true; 'owner-b' = $false }
+$script:mockPosts = @()
+$unverifiedSharedOwners = Prepare-ExactTorrentFileForRemoval -Path $sharedPath `
+    -Torrents $script:mockTorrentList -RequiredHashes @('owner-a') -Gone @{}
+Check 'one owner failing priority verification refuses shared-file removal' `
+    (-not $unverifiedSharedOwners.Verified -and $script:mockFileListings['owner-b'][0].priority -eq 1)
+
+$script:failFileReadHash = 'owner-b'
+$script:mockPosts = @()
+$unreadableSharedOwners = Prepare-ExactTorrentFileForRemoval -Path $sharedPath `
+    -Torrents $script:mockTorrentList -RequiredHashes @('owner-a') -Gone @{}
+Check 'an unreadable exact-owner file list refuses before stopping or unlinking' `
+    (-not $unreadableSharedOwners.Verified -and
+     @($script:mockPosts | Where-Object { $_.Endpoint -eq 'torrents/stop' }).Count -eq 0)
+$script:failFileReadHash = ''
+
 $removeStart = $source.IndexOf('function Remove-Torrent {')
 $removeEnd = $source.IndexOf('# Polls qBittorrent until the move', $removeStart)
 $removeBody = $source.Substring($removeStart, $removeEnd - $removeStart)
 Check 'torrent-wide data deletion is guarded centrally' `
     ($removeBody -match 'if \(\$wantFiles\)' -and $removeBody -match 'Test-OtherTorrentClaimsPath' -and $removeBody -match '\$wantFiles = \$false')
 Check 'retained-torrent file-only deletion verifies skipped priority before Remove-Item' `
-    ($source -match '(?s)if \(\$d\.Action -eq ''delete-file-only''\).*?Set-TorrentFilePriorityVerified.*?Remove-Item -LiteralPath \$d\.File')
+    ($source -match '(?s)if \(\$d\.Action -eq ''delete-file-only''\).*?Prepare-ExactTorrentFileForRemoval.*?Remove-Item -LiteralPath \$d\.File')
+Check 'pack-versus-single cleanup prepares every exact owner before unlinking' `
+    ($source -match '(?s)Prepare-ExactTorrentFileForRemoval -Path \$packFilePath.*?-RequiredHashes @\(\[string\]\$pack\.hash\).*?Remove-Item -LiteralPath \$packFilePath')
+Check 'file-only dry runs exit before changing torrent state' `
+    ($source -match '(?s)if \(\$DryRun -and \$d\.Action -eq ''delete-file-only''\).*?continue\s*\}\s*if \(\$DryRun -and -not \$d\.Owner\)')
 Check 'unowned-file deletion rechecks ownership immediately before Remove-Item' `
     ($source -match '(?s)No torrent claims it.*?Test-OtherTorrentClaimsPath.*?Remove-Item -LiteralPath \$d\.File')
 

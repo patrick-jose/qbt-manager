@@ -3067,7 +3067,7 @@ function Set-TorrentFilePriorityVerified {
             if ($resolved.Equals($WantedPath, [StringComparison]::OrdinalIgnoreCase)) { $matches += $file }
         }
         return $matches
-    }.GetNewClosure()
+    }
 
     $files = @(Invoke-ApiGet -Endpoint ("torrents/files?hash={0}" -f [string]$Torrent.hash))
     $match = @(& $resolveMatch $files $Path)
@@ -6188,6 +6188,103 @@ function Stop-TorrentAndConfirm {
     return $false
 }
 
+function Prepare-ExactTorrentFileForRemoval {
+    param(
+        [string]$Path,
+        [object[]]$Torrents,
+        [string[]]$RequiredHashes = @(),
+        [hashtable]$Gone = @{}
+    )
+
+    if (Test-PendingSettlePath -Path $Path) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = 'the file is pending settle' }
+    }
+
+    $initial = Get-ExactTorrentFileOwners -Path $Path -Torrents $Torrents -FileCache @{} -Gone $Gone
+    if (-not $initial.Verified) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = $initial.Reason }
+    }
+    if ($initial.Owners.Count -eq 0) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = 'no exact torrent owner was found' }
+    }
+
+    $initialHashes = @($initial.Owners | ForEach-Object { [string]$_.hash } | Sort-Object -Unique)
+    foreach ($requiredHash in @($RequiredHashes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        if ($initialHashes -notcontains [string]$requiredHash) {
+            return [pscustomobject]@{
+                Verified = $false; Owners = @()
+                Reason = "required torrent owner '$requiredHash' is not an exact owner"
+            }
+        }
+    }
+
+    foreach ($owner in $initial.Owners) {
+        $entries = @($Torrents | Where-Object { [string]$_.hash -eq [string]$owner.hash })
+        if ($entries.Count -ne 1) {
+            return [pscustomobject]@{
+                Verified = $false; Owners = @()
+                Reason = "expected one queue entry for exact owner '$($owner.name)', found $($entries.Count)"
+            }
+        }
+        if (-not (Stop-TorrentAndConfirm -T $entries[0])) {
+            return [pscustomobject]@{
+                Verified = $false; Owners = @()
+                Reason = "could not confirm exact owner '$($owner.name)' stopped"
+            }
+        }
+    }
+
+    $afterStop = Get-ExactTorrentFileOwners -Path $Path -Torrents $Torrents -FileCache @{} -Gone $Gone
+    if (-not $afterStop.Verified) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = $afterStop.Reason }
+    }
+    $afterStopHashes = @($afterStop.Owners | ForEach-Object { [string]$_.hash } | Sort-Object -Unique)
+    if (@(Compare-Object -ReferenceObject $initialHashes -DifferenceObject $afterStopHashes).Count -gt 0) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = 'exact owners changed while stopping torrents' }
+    }
+
+    foreach ($owner in $afterStop.Owners) {
+        if (-not (Set-TorrentFilePriorityVerified -Torrent $owner -Path $Path -Priority 0)) {
+            return [pscustomobject]@{
+                Verified = $false; Owners = @()
+                Reason = "qBittorrent did not confirm Do Not Download for '$($owner.name)'"
+            }
+        }
+    }
+
+    $afterPriority = Get-ExactTorrentFileOwners -Path $Path -Torrents $Torrents -FileCache @{} -Gone $Gone
+    if (-not $afterPriority.Verified) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = $afterPriority.Reason }
+    }
+    $afterPriorityHashes = @($afterPriority.Owners | ForEach-Object { [string]$_.hash } | Sort-Object -Unique)
+    if (@(Compare-Object -ReferenceObject $initialHashes -DifferenceObject $afterPriorityHashes).Count -gt 0) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = 'exact owners changed while setting file priorities' }
+    }
+
+    foreach ($owner in $afterPriority.Owners) {
+        if (-not (Set-TorrentFilePriorityVerified -Torrent $owner -Path $Path -Priority 0)) {
+            return [pscustomobject]@{
+                Verified = $false; Owners = @()
+                Reason = "Do Not Download could not be re-verified for '$($owner.name)'"
+            }
+        }
+    }
+
+    $final = Get-ExactTorrentFileOwners -Path $Path -Torrents $Torrents -FileCache @{} -Gone $Gone
+    if (-not $final.Verified) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = $final.Reason }
+    }
+    $finalHashes = @($final.Owners | ForEach-Object { [string]$_.hash } | Sort-Object -Unique)
+    if (@(Compare-Object -ReferenceObject $initialHashes -DifferenceObject $finalHashes).Count -gt 0) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = 'exact owners changed before file removal' }
+    }
+    if (Test-PendingSettlePath -Path $Path) {
+        return [pscustomobject]@{ Verified = $false; Owners = @(); Reason = 'the file became pending settle' }
+    }
+
+    return [pscustomobject]@{ Verified = $true; Owners = @($final.Owners); Reason = '' }
+}
+
 function Remove-Torrent {
     param(
         [object]$T,
@@ -7872,8 +7969,10 @@ foreach ($c in $setGroups) {
 
                 $owners = Get-ExactTorrentFileOwners -Path $packFilePath -Torrents $all `
                     -FileCache $fileSizeCache -Gone $script:gone
-                if (-not $owners.Verified -or $owners.Owners.Count -ne 1 -or
-                    [string]$owners.Owners[0].hash -ne [string]$pack.hash) {
+                $packIsExactOwner = @($owners.Owners | Where-Object {
+                    [string]$_.hash -eq [string]$pack.hash
+                }).Count -eq 1
+                if (-not $owners.Verified -or -not $packIsExactOwner) {
                     $ownershipDetail = [string]$owners.Reason
                     if ($owners.Verified) {
                         $ownerNames = @($owners.Owners | ForEach-Object { [string]$_.name })
@@ -7891,24 +7990,10 @@ foreach ($c in $setGroups) {
                     Write-Log 'DELETE' "[DRY-RUN] $packFilePath - $reason"
                     continue
                 }
-                if (-not (Stop-TorrentAndConfirm -T $pack)) { continue }
-
-                $owners = Get-ExactTorrentFileOwners -Path $packFilePath -Torrents $all `
-                    -FileCache $fileSizeCache -Gone $script:gone
-                if (-not $owners.Verified -or $owners.Owners.Count -ne 1 -or
-                    [string]$owners.Owners[0].hash -ne [string]$pack.hash -or
-                    (Test-PendingSettlePath -Path $packFilePath)) {
-                    $ownershipDetail = [string]$owners.Reason
-                    if ($owners.Verified) {
-                        $ownerNames = @($owners.Owners | ForEach-Object { [string]$_.name })
-                        $ownershipDetail = ("found {0} exact owner(s): {1}" -f $owners.Owners.Count, (@($ownerNames) -join ', '))
-                    }
-                    if (Test-PendingSettlePath -Path $packFilePath) { $ownershipDetail = 'the file is pending settle' }
-                    Write-Log 'WARN' "preserving smaller pack episode '$packFilePath': $ownershipDetail"
-                    continue
-                }
-                if (-not (Set-TorrentFilePriorityVerified -Torrent $pack -Path $packFilePath -Priority 0)) {
-                    Write-Log 'WARN' "preserving smaller pack episode '$packFilePath': qBittorrent did not confirm Do Not Download"
+                $prepared = Prepare-ExactTorrentFileForRemoval -Path $packFilePath -Torrents $all `
+                    -RequiredHashes @([string]$pack.hash) -Gone $script:gone
+                if (-not $prepared.Verified) {
+                    Write-Log 'WARN' "preserving smaller pack episode '$packFilePath': $($prepared.Reason)"
                     continue
                 }
 
@@ -8090,6 +8175,11 @@ else {
             }
             if (-not $stopped) { continue }
         }
+        if ($DryRun -and $d.Action -eq 'delete-file-only') {
+            [void]$script:actions.Add("WOULD DELETE FILE  $($d.File) - $($d.Reason)")
+            Write-Log 'DELETE' "[DRY-RUN] $($d.File) - $($d.Reason)"
+            continue
+        }
         if ($DryRun -and -not $d.Owner) {
             [void]$script:actions.Add("WOULD DELETE FILE  $($d.File) - $($d.Reason)")
             Write-Log 'DELETE' "[DRY-RUN] $($d.File) - $($d.Reason)"
@@ -8101,19 +8191,26 @@ else {
         # the pack's other - usually wanted, sometimes unique - episodes with it.
         # So only the file goes, by path, and the entry is left stopped as it was.
         if ($d.Action -eq 'delete-file-only') {
-            $fileOwners = @($all | Where-Object { Test-Claimed -Path $d.File -Torrents @($_) })
-            if ($fileOwners.Count -ne 1) {
-                Write-Log 'WARN' ("preserving duplicate file {0}: expected one owning torrent, found {1}" -f $d.File, $fileOwners.Count)
-                continue
-            }
-            if (-not (Set-TorrentFilePriorityVerified -Torrent $fileOwners[0] -Path $d.File -Priority 0)) {
-                Write-Log 'WARN' ("preserving duplicate file {0}: qBittorrent did not confirm that the owning torrent skips it" -f $d.File)
+            $requiredHashes = @()
+            if ($d.Owner) { $requiredHashes = @([string]$d.Owner.hash) }
+            $prepared = Prepare-ExactTorrentFileForRemoval -Path $d.File -Torrents $all `
+                -RequiredHashes $requiredHashes -Gone $script:gone
+            if (-not $prepared.Verified) {
+                Write-Log 'WARN' "preserving duplicate file $($d.File): $($prepared.Reason)"
                 continue
             }
             try {
+                $duplicateOnDisk = Get-Item -LiteralPath $d.File -Force -ErrorAction Stop
+                if ($duplicateOnDisk.PSIsContainer -or
+                    ($duplicateOnDisk.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                    [int64]$duplicateOnDisk.Length -ne [int64]$d.Bytes -or
+                    (Test-PendingSettlePath -Path $d.File)) {
+                    Write-Log 'WARN' "preserving duplicate file $($d.File): file changed or became pending settle before removal"
+                    continue
+                }
                 Remove-Item -LiteralPath $d.File -Force -ErrorAction Stop
                 [void]$script:actions.Add("DELETED FILE  $($d.File) - $($d.Reason)")
-                Write-Log 'DELETE' "$($d.File) - $($d.Reason) (file priority set to Do Not Download; pack entry kept)"
+                Write-Log 'DELETE' "$($d.File) - $($d.Reason) (Do Not Download verified for all $($prepared.Owners.Count) exact owners; pack entries kept stopped)"
             }
             catch {
                 Write-Log 'WARN' "could not delete duplicate file $($d.File): $($_.Exception.Message)"

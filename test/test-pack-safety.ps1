@@ -419,10 +419,10 @@ Check 'cleanup no longer requires exact parsed title equality' `
     ($packSingleBlock -notmatch '\$single\.parts\.Title\s+-ne\s+\$pack\.parts\.Title')
 Check 'a smaller pack episode requires a finished single keeper' `
     ($packSingleBlock -match 'single\.progress -lt 1' -and $packSingleBlock -match 'singleEpisodeBytes -le \$epFileBytes')
-Check 'pack-file deletion verifies unique ownership, stops the pack, and sets Do Not Download' `
+Check 'pack-file deletion prepares every exact owner and requires the pack owner' `
     ($packSingleBlock -match 'Get-ExactTorrentFileOwners' -and
-     $packSingleBlock -match 'Stop-TorrentAndConfirm -T \$pack' -and
-     $packSingleBlock -match 'Set-TorrentFilePriorityVerified -Torrent \$pack -Path \$packFilePath -Priority 0')
+     $packSingleBlock -match 'Prepare-ExactTorrentFileForRemoval -Path \$packFilePath' -and
+     $packSingleBlock -match 'RequiredHashes @\(\[string\]\$pack\.hash\)')
 Check 'pack-file deletion removes only the measured episode file' `
     ($packSingleBlock -match 'Remove-Item -LiteralPath \$packFilePath')
 $containedPackBlock = Get-Slice $src 'function Get-ContainedPackDuplicateVerdict' 'function Get-LibraryDuplicateVerdicts'

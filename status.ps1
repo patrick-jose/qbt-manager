@@ -1618,13 +1618,19 @@ function Show-Snapshot {
     try {
         $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
         $info = $task | Get-ScheduledTaskInfo
-        $taskColor = if ($task.State -eq 'Ready') { 'DarkGray' } else { 'Yellow' }
-        $res = $info.LastTaskResult
-        $resColor = if ($res -eq 0) { 'DarkGray' } else { 'Red' }
-        Write-Host ("  task {0} [{1}]  last {2} (exit {3})  next {4}" -f `
-            $taskName, $task.State, $info.LastRunTime, $res, $info.NextRunTime) -ForegroundColor $taskColor
-        if ($res -ne 0) {
-            Write-Host ("  the last run exited {0} - see the log below" -f $res) -ForegroundColor $resColor
+        if ($task.State -eq 'Running') {
+            Write-Host ("  task {0} [Running]  watchdog active since {1}" -f `
+                $taskName, $info.LastRunTime) -ForegroundColor Green
+        }
+        else {
+            $taskColor = if ($task.State -eq 'Ready') { 'DarkGray' } else { 'Yellow' }
+            $res = $info.LastTaskResult
+            $resColor = if ($res -eq 0) { 'DarkGray' } else { 'Red' }
+            Write-Host ("  task {0} [{1}]  last {2} (exit {3})  next {4}" -f `
+                $taskName, $task.State, $info.LastRunTime, $res, $info.NextRunTime) -ForegroundColor $taskColor
+            if ($res -ne 0) {
+                Write-Host ("  the last run exited {0} - see the log below" -f $res) -ForegroundColor $resColor
+            }
         }
     }
     catch {

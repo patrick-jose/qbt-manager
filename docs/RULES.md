@@ -774,6 +774,11 @@ behind is merely untidy.
 A pack must be **stopped** before deletion and is never restarted â€” same
 discipline as every other deletion here, and it matters most for a pack, because a
 running pack re-fetches the file just deleted and the duplicate returns next run.
+If multiple torrents claim the exact same file path, every exact owner is stopped
+and verified to skip that file (`Do Not Download`) before the file is unlinked.
+The owner list and file priorities are rechecked; any missing, changed, or
+unverifiable owner means the file is preserved for a later pass. A dry run never
+changes torrent state or priorities.
 
 ### Retention
 
