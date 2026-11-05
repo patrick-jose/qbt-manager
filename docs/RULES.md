@@ -158,6 +158,9 @@ the smaller single goes with its torrent; when the pack file is smaller, the pac
 is stopped, that one file is set to Do Not Download and removed, and the pack
 entry and its other episodes remain. Exact file ownership, the on-disk sizes and
 the larger finished keeper are verified before unlinking the pack file.
+`status.ps1` reports that file-only action only while both episode files still
+exist at their listed sizes; a stale finished-torrent record is not proof of a
+larger on-disk keeper.
 
 The pack is never removed merely because one episode is duplicated. That is the
 comparison that once deleted a 12,54 GB `E01-E08` pack over a 46 MB difference in

@@ -319,12 +319,46 @@ Check 'and each of its episodes measures differently' `
 # smaller pack FILE goes; the pack entry and its other episodes remain.
 $v = Verdicts @($pack10, $e1big)
 $details = Details @($pack10, $e1big)
-Check 'a smaller pack episode is reported as a file-only removal' `
-    ((@($v).Count -eq 1) -and (@($v) -contains 'pack10') -and $details['pack10'].Verdict -eq 'FILE ONLY')
+Check 'status does not promise a pack-file removal without verified on-disk paths' (@($v).Count -eq 0)
 Check 'the larger single is kept as the episode keeper' (-not ($details.ContainsKey('e1big')))
-Check 'the file-only reason preserves the rest of the pack' ($details['pack10'].Reason -match 'keep its other episodes')
 Check 'status labels retained-pack cleanup as FILE ONLY, not a torrent deletion' `
     ($src -match 'Verdict = \(Get-Prop \$kv\.Value ''Verdict'' ''DELETE''\)')
+
+$diskRoot = Join-Path ([IO.Path]::GetTempPath()) ('qbt-dedup-' + [guid]::NewGuid().ToString('N'))
+try {
+    $diskPack = P 'diskPack' 'Widows.Bay.S01E01-E02.1080p.WEB-DL-GRP [ext.to]' 1.0 1.0
+    $diskSingle = P 'diskSingle' 'Widows.Bay.S01E01.2160p.WEB-DL-GRP [ext.to]' 2.0 1.0
+    $diskPackDir = Join-Path $diskRoot 'pack'
+    $diskSingleDir = Join-Path $diskRoot 'single'
+    [void](New-Item -ItemType Directory -Path $diskPackDir -Force)
+    [void](New-Item -ItemType Directory -Path $diskSingleDir -Force)
+    $diskPack | Add-Member -NotePropertyName save_path -NotePropertyValue $diskPackDir -Force
+    $diskSingle | Add-Member -NotePropertyName save_path -NotePropertyValue $diskSingleDir -Force
+
+    $packEpisode = [pscustomobject]@{ name = 'Widows Bay S01E01.mkv'; size = [int64]5 }
+    $secondPackEpisode = [pscustomobject]@{ name = 'Widows Bay S01E02.mkv'; size = [int64]9 }
+    $singleEpisode = [pscustomobject]@{ name = 'Widows Bay S01E01 single.mkv'; size = [int64]8 }
+    Set-PackFiles -Hash 'diskPack' -Entries @($packEpisode, $secondPackEpisode)
+    Set-PackFiles -Hash 'diskSingle' -Entries @($singleEpisode)
+    [IO.File]::WriteAllBytes((Join-Path $diskPackDir $packEpisode.name), [byte[]](1..5))
+    [IO.File]::WriteAllBytes((Join-Path $diskPackDir $secondPackEpisode.name), [byte[]](1..9))
+    [IO.File]::WriteAllBytes((Join-Path $diskSingleDir $singleEpisode.name), [byte[]](1..8))
+
+    $details = Details @($diskPack, $diskSingle)
+    Check 'a smaller pack episode is reported as FILE ONLY when both on-disk files verify' `
+        ($details.ContainsKey('diskPack') -and $details['diskPack'].Verdict -eq 'FILE ONLY')
+    Check 'a verified FILE ONLY reason preserves the rest of the pack' `
+        ($details['diskPack'].Reason -match 'keep its other episodes')
+
+    Remove-Item -LiteralPath (Join-Path $diskSingleDir $singleEpisode.name) -Force
+    Check 'status withdraws the FILE ONLY action when its larger keeper is missing' `
+        (-not (Details @($diskPack, $diskSingle)).ContainsKey('diskPack'))
+}
+finally {
+    if (Test-Path -LiteralPath $diskRoot) {
+        Remove-Item -LiteralPath $diskRoot -Recurse -Force
+    }
+}
 
 $e1unfinished = P 'e1unfinished' 'Widows.Bay.S01E01.2160p.ATVP.WEB-DL.DDP5.1.Atmos.H.265-NTb [ext.to]' 8.0 0.50
 $v = Verdicts @($pack10, $e1unfinished)

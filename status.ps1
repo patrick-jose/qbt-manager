@@ -319,6 +319,52 @@ function Get-PackEpisodeFile {
     return $best
 }
 
+function Get-TorrentFileDiskState {
+    param($Torrent, $File)
+
+    $savePath = [string](Get-Prop $Torrent 'save_path' '')
+    $name = [string](Get-Prop $File 'name' '')
+    $size = [int64](Get-Prop $File 'size' 0)
+    if ([string]::IsNullOrWhiteSpace($savePath) -or [string]::IsNullOrWhiteSpace($name) -or $size -le 0) {
+        return [pscustomobject]@{ Verified = $false; Path = ''; Reason = 'torrent path, file name, or file size is unavailable' }
+    }
+
+    $relative = $name.Replace('/', '\')
+    if ([IO.Path]::IsPathRooted($relative)) {
+        return [pscustomobject]@{ Verified = $false; Path = ''; Reason = 'torrent file name is absolute' }
+    }
+    try {
+        $root = [IO.Path]::GetFullPath($savePath).TrimEnd('\', '/')
+        $path = [IO.Path]::GetFullPath((Join-Path $root $relative))
+    }
+    catch [ArgumentException] {
+        return [pscustomobject]@{ Verified = $false; Path = ''; Reason = 'torrent file path is invalid' }
+    }
+    catch [NotSupportedException] {
+        return [pscustomobject]@{ Verified = $false; Path = ''; Reason = 'torrent file path is unsupported' }
+    }
+    catch [IO.PathTooLongException] {
+        return [pscustomobject]@{ Verified = $false; Path = ''; Reason = 'torrent file path is too long' }
+    }
+
+    $prefix = $root + [IO.Path]::DirectorySeparatorChar
+    if (-not $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ Verified = $false; Path = $path; Reason = 'torrent file path escapes its save path' }
+    }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [pscustomobject]@{ Verified = $false; Path = $path; Reason = 'torrent file is missing or inaccessible on disk' }
+    }
+
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        return [pscustomobject]@{ Verified = $false; Path = $path; Reason = 'torrent path is not a regular media file' }
+    }
+    if ([int64]$item.Length -ne $size) {
+        return [pscustomobject]@{ Verified = $false; Path = $path; Reason = 'on-disk size differs from qBittorrent file size' }
+    }
+    return [pscustomobject]@{ Verified = $true; Path = $path; Reason = '' }
+}
+
 function Get-PackEpisodeBytes {
     param(
         [string]$Hash,
@@ -674,6 +720,10 @@ function Get-DedupVerdicts {
                 if (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes $epFileBytes `
                         -SingleEpisodeBytes $singleEpisodeBytes)) {
                     if ((Get-Prop $single 'progress') -lt 1 -or $verdicts.ContainsKey($pack.hash)) { continue }
+                    $packDisk = Get-TorrentFileDiskState -Torrent $pack -File $packEpisodeFile
+                    $singleDisk = Get-TorrentFileDiskState -Torrent $single -File $singleEpisodeFile
+                    if (-not $packDisk.Verified -or -not $singleDisk.Verified -or
+                        $packDisk.Path.Equals($singleDisk.Path, [StringComparison]::OrdinalIgnoreCase)) { continue }
                     $verdicts[$pack.hash] = [pscustomobject]@{
                         Verdict = 'FILE ONLY'; Rule = 'dedup-pack-single-file'
                         Reason  = ("smaller S{0}E{1} file inside finished pack '{2}' ({3:N2} GB) than finished single '{4}' ({5:N2} GB); remove only the pack episode file and keep its other episodes" -f `

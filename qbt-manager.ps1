@@ -7959,13 +7959,27 @@ foreach ($c in $setGroups) {
                     $packOnDisk = Get-Item -LiteralPath $packFilePath -Force -ErrorAction Stop
                     $singleOnDisk = Get-Item -LiteralPath $singleFilePath -Force -ErrorAction Stop
                 }
-                catch { continue }
+                catch {
+                    $detail = "could not verify both episode files on disk; no files were removed"
+                    [void]$script:notes.Add(("preserved S{0}E{1} copies from '{2}' and '{3}': {4}" -f `
+                        $single.parts.Season, $single.parts.Episode, $pack.name, $single.name, $detail))
+                    Write-Log 'WARN' ("preserving S{0}E{1} copies from '{2}' and '{3}': {4} ({5})" -f `
+                        $single.parts.Season, $single.parts.Episode, $pack.name, $single.name, $detail, $_.Exception.Message)
+                    continue
+                }
                 if ($packOnDisk.PSIsContainer -or $singleOnDisk.PSIsContainer -or
                     ($packOnDisk.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
                     ($singleOnDisk.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
                     [int64]$packOnDisk.Length -ne [int64]$packEpisodeFile.size -or
                     [int64]$singleOnDisk.Length -ne $singleEpisodeBytes -or
-                    $singleEpisodeBytes -le $epFileBytes) { continue }
+                    $singleEpisodeBytes -le $epFileBytes) {
+                    $detail = 'the file type or on-disk size no longer verifies the qBittorrent listing; no files were removed'
+                    [void]$script:notes.Add(("preserved S{0}E{1} copies from '{2}' and '{3}': {4}" -f `
+                        $single.parts.Season, $single.parts.Episode, $pack.name, $single.name, $detail))
+                    Write-Log 'WARN' ("preserving S{0}E{1} copies from '{2}' and '{3}': {4}" -f `
+                        $single.parts.Season, $single.parts.Episode, $pack.name, $single.name, $detail)
+                    continue
+                }
 
                 $owners = Get-ExactTorrentFileOwners -Path $packFilePath -Torrents $all `
                     -FileCache $fileSizeCache -Gone $script:gone
