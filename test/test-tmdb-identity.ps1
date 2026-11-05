@@ -197,6 +197,14 @@ Check 'same-name TV shows with different IDs remain ambiguous across release yea
     ($sameNameTvIdentity.status -eq 'ambiguous' -and -not $sameNameTvIdentity.id)
 Check 'ambiguous same-name TMDB records retain their shared display title' `
     ($sameNameTvIdentity.name -eq 'Dark Matter')
+$ambiguousDarkMatter = Set-TmdbAmbiguousIdentity -Parts (Get-TitleParts -Name 'Dark Matter S02E03') `
+    -Identity $sameNameTvIdentity
+$identifiedDarkMatterEpisode = Get-TitleParts -Name 'Dark Matter S02E03'
+$identifiedDarkMatterEpisode | Add-Member TmdbId '196322' -Force
+$identifiedDarkMatterEpisode | Add-Member TmdbType 'tv' -Force
+Check 'ambiguous TV identity is marked so same-title shows cannot be deduplicated' `
+    ($ambiguousDarkMatter.TmdbStatus -eq 'ambiguous' -and $ambiguousDarkMatter.TmdbType -eq 'tv' -and
+     -not (Test-SameTitle -A $ambiguousDarkMatter -B $identifiedDarkMatterEpisode -IgnoreEpisodeCoordinates))
 $displayOnlyParts = Get-TitleParts -Name 'Dark Matter S01E01'
 $displayOnlyParts | Add-Member TmdbDisplayName $sameNameTvIdentity.name -Force
 Check 'a display title does not manufacture an authoritative TMDB identity' `

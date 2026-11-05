@@ -333,6 +333,8 @@ Check 'named for what it is'                            ($ssrc -cmatch 'function
 Check 'which also resolves unknown-coordinate TV series' ($ssrc -cmatch '\$parts\.IsSeries\s+-and\s+\[string\]::IsNullOrWhiteSpace\(\$nameKey\)')
 Check 'preview checks whole-season packs against singles too' `
     ($ssrc -cmatch '\$pack\.parts\.Episode\s+-ne\s+0' -and $ssrc -cmatch 'Test-PackContainsEpisode')
+Check 'preview uses show identity rather than exact release title for pack-vs-single' `
+    ($ssrc -cmatch 'Test-SameTitle -A \$single\.parts -B \$pack\.parts -IgnoreEpisodeCoordinates')
 Check 'preview uses the same episode-size rule as the manager' `
     ($ssrc -cmatch 'Test-PackEpisodeOutweighsSingle' -and $ssrc -cmatch 'Get-PackEpisodeFile')
 Check 'both fold clusters by family'                    (

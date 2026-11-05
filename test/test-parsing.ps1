@@ -86,6 +86,14 @@ Check 'underscore-delimited files still identify the same show episode' `
 $ordinalSeason = Parts 'Dexter Resurrection 1. série (CZ/EN) 1080p'
 Check 'ordinal localized season labels identify the season pack' `
     ($ordinalSeason.IsSeries -and $ordinalSeason.Title -eq 'dexter resurrection' -and $ordinalSeason.Season -eq 1 -and $ordinalSeason.Episode -eq 0)
+$italianSeason = Parts 'Dark Matter 2024 - Stagione 01 (2024 ITA/ENG) [COMPLETA] [Pir8][1080p]'
+Check 'Italian Stagione labels identify a whole-season pack' `
+    ($italianSeason.IsSeries -and $italianSeason.Season -eq 1 -and $italianSeason.Episode -eq 0)
+Check 'an Italian season pack keeps the canonical show title' `
+    ($italianSeason.Title -eq 'dark matter')
+$italianEpisode = Parts 'Dark Matter Stagione 02 E03 1080p WEB-DL'
+Check 'a bare episode marker inherits an earlier Italian season label' `
+    ($italianEpisode.IsSeries -and $italianEpisode.Season -eq 2 -and $italianEpisode.Episode -eq 3)
 
 Write-Host ''
 Write-Host '=== FALSE-POSITIVE GUARDS: these must never match ==='

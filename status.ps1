@@ -290,6 +290,47 @@ function Get-ContentKind {
     return 'file'
 }
 
+function Get-PackEpisodeFile {
+    param(
+        [string]$Hash,
+        [int]$Season,
+        [int]$Episode,
+        [hashtable]$Cache
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Hash)) { return $null }
+    $key = $Hash.ToLowerInvariant()
+    if ($null -eq $Cache) { $Cache = @{} }
+    if (-not $Cache.ContainsKey($key)) {
+        $files = Get-Api -Endpoint "torrents/files?hash=$Hash"
+        $Cache[$key] = if ($null -eq $files) { @() } else { @($files) }
+    }
+
+    $rx = '(?i)(?:S0*' + $Season + '[\s._-]*E0*' + $Episode + '(?!\d)|(?<!\d)' +
+          $Season + 'x0*' + $Episode + '(?!\d))'
+    $best = $null
+    foreach ($file in @($Cache[$key])) {
+        $name = [string](Get-Prop $file 'name' '')
+        $size = [int64](Get-Prop $file 'size' 0)
+        if ($name -notmatch $rx -or $size -le 0) { continue }
+        if ([IO.Path]::GetExtension($name).ToLowerInvariant() -notin @('.mkv', '.mp4', '.m4v', '.mov', '.ts', '.m2ts', '.avi', '.webm', '.mpg', '.mpeg')) { continue }
+        if ($null -eq $best -or $size -gt [int64]$best.size) { $best = $file }
+    }
+    return $best
+}
+
+function Get-PackEpisodeBytes {
+    param(
+        [string]$Hash,
+        [int]$Season,
+        [int]$Episode,
+        [hashtable]$Cache
+    )
+    $file = Get-PackEpisodeFile -Hash $Hash -Season $Season -Episode $Episode -Cache $Cache
+    if ($null -eq $file) { return $null }
+    return [int64]$file.size
+}
+
 # ---- the manager's rule set, re-run read-only ------------------------------
 #
 # Each function below answers one question and returns a verdict per torrent.
@@ -357,10 +398,8 @@ function Get-Clusters {
             $identity = Get-TmdbIdentity -Parts $parts -Name ([string](Get-Prop $t 'name')) -Cache $script:tmdbCache -CacheOnly
             if ($identity -and $identity.status -eq 'matched') {
                 $parts = Set-TmdbIdentity -Parts $parts -Identity $identity
-            } elseif ($identity -and $identity.status -eq 'ambiguous' -and
-                      $identity.type -eq 'tv' -and $parts.IsSeries -and $identity.name) {
-                Add-Member -InputObject $parts -NotePropertyName TmdbDisplayName `
-                    -NotePropertyValue ([string]$identity.name) -Force
+            } elseif ($identity -and $identity.status -eq 'ambiguous') {
+                $parts = Set-TmdbAmbiguousIdentity -Parts $parts -Identity $identity
             }
         }
 
@@ -608,7 +647,7 @@ function Get-DedupVerdicts {
                 if ($single.hash -eq $pack.hash) { continue }
                 if (-not $single.parts) { continue }
                 if ($single.parts.IsMultiEpisode) { continue }
-                if ($single.parts.Title -ne $pack.parts.Title) { continue }
+                if (-not (Test-SameTitle -A $single.parts -B $pack.parts -IgnoreEpisodeCoordinates)) { continue }
                 if ($single.parts.Season -ne $pack.parts.Season) { continue }
                 if ($null -eq $single.parts.Episode) { continue }
                 if (-not (Test-PackContainsEpisode -PackParts $pack.parts -Episode $single.parts.Episode)) { continue }
@@ -629,18 +668,20 @@ function Get-DedupVerdicts {
                 if ($null -eq $singleEpisodeFile -or [int64]$singleEpisodeFile.size -le 0) { continue }
                 $singleEpisodeBytes = [int64]$singleEpisodeFile.size
 
-                # ONLY THE SINGLE IS EVER DELETED HERE, and the manager's copy of
-                # this pass is narrowed the same way. Both used to pick a winner
-                # and delete whichever lost, which deleted a whole PACK over one
-                # episode: on 2026-10-05 a single's copy of S18E01 was 46 MB
-                # bigger than the pack's own S18E01 file, and the scheduled run
-                # removed a 12,54 GB E01-E08 pack whose other seven episodes had
-                # no other copy anywhere. A pack is the only record qBittorrent
-                # has of what it holds, so it is never the thing this pass
-                # removes - only a single is, and only when the pack's own file
-                # for that episode is equal in size or larger.
+                # The smaller episode file loses, never the pack entry. A smaller
+                # single is deleted as a torrent; a smaller pack file is reported
+                # separately so the manager can skip and remove only that file.
                 if (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes $epFileBytes `
-                        -SingleEpisodeBytes $singleEpisodeBytes)) { continue }
+                        -SingleEpisodeBytes $singleEpisodeBytes)) {
+                    if ((Get-Prop $single 'progress') -lt 1 -or $verdicts.ContainsKey($pack.hash)) { continue }
+                    $verdicts[$pack.hash] = [pscustomobject]@{
+                        Verdict = 'FILE ONLY'; Rule = 'dedup-pack-single-file'
+                        Reason  = ("smaller S{0}E{1} file inside finished pack '{2}' ({3:N2} GB) than finished single '{4}' ({5:N2} GB); remove only the pack episode file and keep its other episodes" -f `
+                                   $pack.parts.Season, $single.parts.Episode, $pack.name,
+                                   ($epFileBytes / $GB), $single.name, ($singleEpisodeBytes / $GB))
+                    }
+                    continue
+                }
                 if ($verdicts.ContainsKey($single.hash)) { continue }
 
                 $verdicts[$single.hash] = [pscustomobject]@{
@@ -1051,7 +1092,7 @@ function Show-Snapshot {
             $t = $torrents | Where-Object { $_.hash -eq $kv.Key } | Select-Object -First 1
             if ($null -eq $t) { continue }
             [void]$pending.Add([pscustomobject]@{
-                Verdict = 'DELETE'; Name = (Get-Prop $t 'name')
+                Verdict = (Get-Prop $kv.Value 'Verdict' 'DELETE'); Name = (Get-Prop $t 'name')
                 Rule = $kv.Value.Rule; Reason = $kv.Value.Reason
             })
         }

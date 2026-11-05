@@ -439,6 +439,55 @@ function Judge-With {
 }
 function FileOnly { param($Rows) @(@($Rows) | Where-Object { $_.Action -eq 'delete-file-only' }) }
 
+Write-Host ''
+Write-Host '== season-marked pack files beside Season N are compared to the library =='
+$rootPackRoot = New-Tree -ShowName 'Dark Matter' -Season 2 -Layout @{
+    '|Dark.Matter.S02E01.1080p.WEB-DL.mkv' = 2100
+    '|Dark.Matter.S02E02.1080p.WEB-DL.mkv' = 2200
+}
+$rootShowDir = Join-Path $rootPackRoot 'Dark Matter'
+$rootPackDir = Join-Path $rootShowDir 'Dark.Matter.S02.WEB-DLRip.LF'
+New-Item -ItemType Directory -Path $rootPackDir -Force | Out-Null
+foreach ($episode in 1..3) {
+    $path = Join-Path $rootPackDir ("Dark.Matter.S02E{0:D2}.WEB-DLRip.LF.avi" -f $episode)
+    $stream = [IO.File]::Create($path); $stream.SetLength([int64](700 + $episode) * 1KB); $stream.Close()
+}
+# An explicitly different season must not be joined to the S02 episode 1 file.
+$otherSeason = Join-Path $rootPackDir 'Dark.Matter.S03E01.WEB-DLRip.LF.avi'
+$stream = [IO.File]::Create($otherSeason); $stream.SetLength(750KB); $stream.Close()
+$rootPackTorrent = Fake-Torrent -Hash ('c' * 40) `
+    -Name 'Dark.Matter.S02.COMPLETE.WEB-DLRip.LF' -ContentPath $rootPackDir `
+    -Parts '{"IsMultiEpisode":true,"Episode":1,"EpisodeLast":3,"Season":2,"Title":"dark matter"}'
+$rootPackRows = @(Judge-With $rootPackRoot @($rootPackTorrent))
+Check 'root-level S02 pack files are compared against their Season 2 copies' `
+    (@(FileOnly $rootPackRows | Where-Object { $_.Episode -in @('2-E1','2-E2') }).Count -eq 2)
+Check 'a root-level file marked S03 does not collide with a Season 2 episode' `
+    (@($rootPackRows | Where-Object { $_.File -eq $otherSeason }).Count -eq 0)
+Check 'the pack remains because its S02E03 file has no other copy' `
+    (@(FileOnly $rootPackRows).Count -eq 2 -and @(Deletes $rootPackRows).Count -eq 0)
+
+# A show folder can contain two different series with the same display title.
+# An unyearmarked, TMDB-ambiguous root pack must not be deduplicated against a
+# TMDB-identified 2024 series merely because both files say S02E01.
+$ambiguousRoot = New-Tree -ShowName 'Dark Matter' -Season 2 -Layout @{
+    '|Dark Matter 2024 S02E01 A Quiet Life.mkv' = 4100
+}
+$ambiguousShowDir = Join-Path $ambiguousRoot 'Dark Matter'
+$ambiguousPackDir = Join-Path $ambiguousShowDir 'Dark.Matter.S02.WEB-DLRip.LF'
+New-Item -ItemType Directory -Path $ambiguousPackDir -Force | Out-Null
+$ambiguousRootFile = Join-Path $ambiguousPackDir 'Dark.Matter.S02E01.WEB-DLRip.LF.avi'
+$stream = [IO.File]::Create($ambiguousRootFile); $stream.SetLength(800KB); $stream.Close()
+$ambiguousPackTorrent = Fake-Torrent -Hash ('d' * 40) `
+    -Name 'Dark.Matter.S02E01-E09.WEB-DLRip.LF' -ContentPath $ambiguousPackDir `
+    -Parts '{"IsSeries":true,"Season":2,"Episode":1,"EpisodeLast":9,"IsMultiEpisode":true,"Title":"dark matter","Tokens":["dark","matter"],"Numbers":[],"TmdbType":"tv","TmdbStatus":"ambiguous"}'
+$knownEpisode = Join-Path (Join-Path $ambiguousShowDir 'Season 2') 'Dark Matter 2024 S02E01 A Quiet Life.mkv'
+$knownSeriesTorrent = Fake-Torrent -Hash ('e' * 40) `
+    -Name 'Dark Matter 2024 S02E01 A Quiet Life' -ContentPath $knownEpisode `
+    -Parts '{"IsSeries":true,"Season":2,"Episode":1,"Title":"dark matter","Tokens":["dark","matter"],"Numbers":[],"Year":"2024","TmdbType":"tv","TmdbId":"196322","TmdbName":"Dark Matter"}'
+$ambiguousRows = @(Judge-With $ambiguousRoot @($ambiguousPackTorrent,$knownSeriesTorrent))
+Check 'an ambiguous series pack is not deleted against a different TMDB-identified series' `
+    ($ambiguousRows.Count -eq 0)
+
 # The pack holds S18E01-E05. Its E03 file is in the library and is the SMALLER
 # copy of E03, so it is the duplicate. E01, E02, E04 and E05 are NOT in the
 # library at all - the pack is the only record of them.

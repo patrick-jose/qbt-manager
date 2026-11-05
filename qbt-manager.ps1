@@ -570,7 +570,7 @@ $script:nonLatin = '[\p{IsCJKUnifiedIdeographs}\p{IsCyrillic}\p{IsArabic}\p{IsHe
 
 # noise words that survive the cut and must not influence matching at all
 $script:ignorable = @(
-    'disc','discs','complete','season','series','collection','edition','volume','vol',
+    'disc','discs','complete','season','stagione','series','collection','edition','volume','vol',
     'web','rip','hd','sd','full','hdrip','internal','limited','uncut','remastered',
     'dubbed','subbed','subs','sub','final','version'
 )
@@ -691,9 +691,9 @@ function Get-TitleParts {
     # be a real one, which is what stops a group tag like '-S0NNER' or a
     # trailing 'x264-S0' from being read as season zero.
     if (-not $m.Success) {
-        $m = [regex]::Match($work, '(?i)(?<![\p{L}\p{Nd}])(?:season|sezon|saison|s[eé]rie|series|se)[\s._:-]*(?<s>0*[1-9]\d{0,2})(?![\p{L}\p{Nd}])')
+        $m = [regex]::Match($work, '(?i)(?<![\p{L}\p{Nd}])(?:season|stagione|sezon|saison|s[eé]rie|series|se)[\s._:-]*(?<s>0*[1-9]\d{0,2})(?![\p{L}\p{Nd}])')
         if (-not $m.Success) {
-            $m = [regex]::Match($work, '(?i)(?<![\p{L}\p{Nd}])(?<s>0*[1-9]\d?)(?:\s*\.\s*|\s+(?:st|nd|rd|th)\s+)(?:season|sezon|saison|s[eé]rie|series)(?![\p{L}\p{Nd}])')
+            $m = [regex]::Match($work, '(?i)(?<![\p{L}\p{Nd}])(?<s>0*[1-9]\d?)(?:\s*\.\s*|\s+(?:st|nd|rd|th)\s+)(?:season|stagione|sezon|saison|s[eé]rie|series)(?![\p{L}\p{Nd}])')
         }
         if ($m.Success) { $episode = 0 }
     }
@@ -758,7 +758,7 @@ function Get-TitleParts {
         # $m.Index is still valid here.
         if ($bareEpisode) {
             $front = $work.Substring(0, $m.Index)
-            $sm = [regex]::Match($front, '(?i)(?<![\w])(?:s(?<s>0*[1-9]\d{0,2})|(?:season|se)[\s._-]*(?<s>0*[1-9]\d{0,2}))(?![\w])')
+            $sm = [regex]::Match($front, '(?i)(?<![\w])(?:s(?<s>0*[1-9]\d{0,2})|(?:season|stagione|se)[\s._-]*(?<s>0*[1-9]\d{0,2}))(?![\w])')
             if ($sm.Success) {
                 $season = [int]$sm.Groups['s'].Value
                 $markerIndex = $sm.Index
@@ -898,25 +898,29 @@ function Test-SameTitle {
         Deliberately biased towards false negatives: a missed duplicate is
         harmless, a false match deletes somebody's only copy.
     #>
-    param([object]$A, [object]$B)
+    param([object]$A, [object]$B, [switch]$IgnoreEpisodeCoordinates)
 
     if ($null -eq $A -or $null -eq $B) { return $false }
     if ($A.IsSeries -ne $B.IsSeries) { return $false }
 
-    if ($A.IsSeries) {
+    if ($A.IsSeries -and -not $IgnoreEpisodeCoordinates) {
         if ($A.Season -ne $B.Season) { return $false }
         if ($A.Episode -ne $B.Episode) { return $false }
     }
 
     # A shared, unambiguous TMDB identity is stronger than localized spelling.
-    # If both sides have IDs, a mismatch is definitive; do not fall through to
-    # token similarity and accidentally merge two different works.
+    # A known identity cannot be compared safely with an ambiguous or unidentified
+    # release: a remake with the same title would otherwise fall through to the
+    # token comparison and be treated as the same work.
     $aTmdbId = [string](Get-PartValue -Parts $A -Name 'TmdbId')
     $bTmdbId = [string](Get-PartValue -Parts $B -Name 'TmdbId')
-    if ($aTmdbId -and $bTmdbId) {
+    if ($aTmdbId -or $bTmdbId) {
+        if (-not $aTmdbId -or -not $bTmdbId) { return $false }
         return ([string](Get-PartValue -Parts $A -Name 'TmdbType') -eq [string](Get-PartValue -Parts $B -Name 'TmdbType') -and
                 $aTmdbId -eq $bTmdbId)
     }
+    if ((Get-PartValue -Parts $A -Name 'TmdbStatus') -eq 'ambiguous' -or
+        (Get-PartValue -Parts $B -Name 'TmdbStatus') -eq 'ambiguous') { return $false }
 
     # A year printed on one release and absent from another is not a
     # disagreement about which work this is. 'Its Always Sunny in Philadelphia
@@ -3193,9 +3197,10 @@ function Get-PackEpisodeFile {
     $files = @($Cache[$key])
     if ($files.Count -eq 0) { return $null }
 
-    # $Season and $Episode are [int], so interpolating them cannot inject a
-    # pattern; the only thing that varies is zero padding in the file name.
-    $rx = '(?i)S0*' + $Season + 'E0*' + $Episode + '(?!\d)'
+    # Match the coordinate spellings accepted by Get-TitleParts. In particular,
+    # complete packs commonly name files "2x01", not "S02E01".
+    $rx = '(?i)(?:S0*' + $Season + '[\s._-]*E0*' + $Episode + '(?!\d)|(?<!\d)' +
+          $Season + 'x0*' + $Episode + '(?!\d))'
 
     $best = $null
     foreach ($f in $files) {
@@ -3233,7 +3238,7 @@ function Get-ContainedPackDuplicateVerdict {
 
     if (-not $Candidate -or -not $Keeper -or -not $Candidate.parts -or -not $Keeper.parts) { return $null }
     if (-not $Candidate.parts.IsSeries -or -not $Keeper.parts.IsSeries) { return $null }
-    if (-not (Test-SameMediaIdentity -A $Candidate.parts -B $Keeper.parts)) { return $null }
+    if (-not (Test-SameTitle -A $Candidate.parts -B $Keeper.parts -IgnoreEpisodeCoordinates)) { return $null }
     if ([double]$Keeper.progress -lt 1 -or [double]$Keeper.size -le 0 -or [double]$Candidate.size -le 0) { return $null }
 
     $candidateKey = Resolve-TorrentSetKey -T $Candidate -Cache $SetKeyCache
@@ -4105,6 +4110,23 @@ function Set-TmdbSeriesClassification {
     return [pscustomobject]$out
 }
 
+function Set-TmdbAmbiguousIdentity {
+    param($Parts, $Identity)
+
+    if (-not $Parts -or -not $Identity) { return $Parts }
+    $Parts | Add-Member -NotePropertyName TmdbStatus -NotePropertyValue 'ambiguous' -Force
+    if ([string](Get-PartValue -Parts $Identity -Name 'type') -eq 'tv') {
+        $Parts = Set-TmdbSeriesClassification -Parts $Parts
+        $Parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue 'tv' -Force
+        $Parts | Add-Member -NotePropertyName TmdbStatus -NotePropertyValue 'ambiguous' -Force
+    }
+    $name = [string](Get-PartValue -Parts $Identity -Name 'name')
+    if ($name) {
+        $Parts | Add-Member -NotePropertyName TmdbDisplayName -NotePropertyValue $name -Force
+    }
+    return $Parts
+}
+
 function Read-TmdbCache {
     param([string]$Path)
     $cache = @{}
@@ -4323,12 +4345,30 @@ function Get-MovePlan {
     return [pscustomobject]@{ Action = 'move'; Reason = '' }
 }
 
+# Returns the strongest identity available for a library file: the torrent's
+# parsed metadata first, and the filename only when no torrent claims it.
+function Get-LibraryFileSeriesParts {
+    param(
+        [IO.FileInfo]$File,
+        [object[]]$Torrents
+    )
+
+    $claims = @($Torrents | Where-Object {
+        $_.parts -and $_.parts.IsSeries -and
+        (Test-Claimed -Path $File.FullName -Torrents @($_))
+    })
+    $identified = @($claims | Where-Object { Get-PartValue -Parts $_.parts -Name 'TmdbId' })
+    if ($identified.Count -gt 0) { return $identified[0].parts }
+    if ($claims.Count -gt 0) { return $claims[0].parts }
+    return Get-TitleParts -Name $File.Name
+}
+
 # Read-only. Enumerates one level under each root and reports what could be
 # reaped, plus why each thing that was kept was kept - a reaper that deletes
 # silently is impossible to trust, and impossible to debug after the fact.
 function Get-LibraryDuplicateVerdicts {
     <#
-        Rule 4b: the same episode, twice, inside one show's own season folder.
+        Rule 4b: the same episode twice inside one show's library folder.
 
         Why this exists, from a measured loss. The library layout puts a series at
         seriesDir\<show>\Season N\, and the show name comes from Get-LibraryTargetDir
@@ -4354,6 +4394,11 @@ function Get-LibraryDuplicateVerdicts {
         claiming the same episode are the same episode of the same show by
         construction - which is exactly what the family guard could not establish.
 
+        It scans each Season N folder as before, and also considers explicitly
+        season-tagged single-episode files elsewhere under that same show folder.
+        This catches release-pack folders beside Season N while keeping the
+        established show folder as the identity boundary.
+
         What it will NOT do:
 
         - It only ever looks inside seriesDir. Two different shows never share a
@@ -4366,16 +4411,12 @@ function Get-LibraryDuplicateVerdicts {
           a keeper.
         - A PACK is never deleted as a whole just because one of its files is a
           duplicate. See WHAT HAPPENS TO A PACK below.
-        - The season comes from the FOLDER and the episode from the FILE NAME, and
-          the two are never cross-checked. This is the only way the rule can see
-          the files it exists for: 'e01 - Frank Marries a Corpse.mkv' states no
-          season at all and parses as season 1, so requiring the filename's season
-          to match the folder's would reject every EZTV-style file - precisely the
-          half of the pair that must be recognised. Get-LibraryTargetDir is what
-          filed it under Season 18, so the folder is the better evidence anyway.
-          Verified by building the real folder names in a temp tree: with the
-          cross-check in place the rule found 0 duplicates in 16 files; without
-          it, 7.
+        - Inside Season N, the season comes from the FOLDER and the episode from
+          the FILE NAME, and the two are never cross-checked. This is how the rule
+          sees files such as 'e01 - Frank Marries a Corpse.mkv', which state no
+          season. Elsewhere under the show folder, both season and episode must
+          be explicit in the filename and its season must match the folder being
+          checked.
         - A file holding a RANGE of episodes, or a whole season, is skipped. It is
           not a single episode and has nothing to be a duplicate of - the same
           refusal rule 4 makes when it separates packs from singles.
@@ -4427,8 +4468,38 @@ function Get-LibraryDuplicateVerdicts {
     $ownerSetKeyCache = @{}
 
     foreach ($showDir in @(Get-ChildItem -LiteralPath $SeriesDir -Directory -ErrorAction SilentlyContinue)) {
-        foreach ($seasonDir in @(Get-ChildItem -LiteralPath $showDir.FullName -Directory -ErrorAction SilentlyContinue |
-                                Where-Object { $_.Name -match '^Season\s+(?<n>\d+)$' })) {
+        $seasonDirs = @(Get-ChildItem -LiteralPath $showDir.FullName -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match '^Season\s+\d+$' })
+        $rootEpisodesBySeason = @{}
+        $videoExt = @('.mkv', '.mp4', '.avi', '.m4v', '.ts')
+        foreach ($file in @(Get-ChildItem -LiteralPath $showDir.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                           Where-Object { $videoExt -contains $_.Extension.ToLowerInvariant() -and
+                                          -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })) {
+            $insideSeasonFolder = $false
+            foreach ($seasonRoot in $seasonDirs) {
+                if ($file.FullName.StartsWith($seasonRoot.FullName.TrimEnd('\', '/') + '\',
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    $insideSeasonFolder = $true
+                    break
+                }
+            }
+            if ($insideSeasonFolder) { continue }
+
+            $parts = Get-TitleParts -Name $file.Name
+            if (-not $parts -or -not $parts.IsSeries -or $null -eq $parts.Season -or
+                $null -eq $parts.Episode -or [int]$parts.Episode -le 0 -or $parts.IsMultiEpisode) { continue }
+
+            $rootSeason = [int]$parts.Season
+            $rootEpisode = [int]$parts.Episode
+            if (-not $rootEpisodesBySeason.ContainsKey($rootSeason)) { $rootEpisodesBySeason[$rootSeason] = @{} }
+            if (-not $rootEpisodesBySeason[$rootSeason].ContainsKey($rootEpisode)) {
+                $rootEpisodesBySeason[$rootSeason][$rootEpisode] = New-Object System.Collections.ArrayList
+            }
+            [void]$rootEpisodesBySeason[$rootSeason][$rootEpisode].Add($file)
+        }
+
+        foreach ($seasonDir in $seasonDirs) {
+            if ($seasonDir.Name -notmatch '^Season\s+(?<n>\d+)$') { continue }
             $season = [int]$Matches['n']
 
             # Which episode each file in this season claims, read by the ONE helper
@@ -4444,6 +4515,28 @@ function Get-LibraryDuplicateVerdicts {
             # duplicate pair that has to be recognised. Get-LibraryTargetDir filed
             # it under Season 18, so the folder is the better evidence anyway.
             $fileEpisodes = Get-LibraryEpisodeFiles -SeasonDir $seasonDir.FullName -Season $season
+            if ($rootEpisodesBySeason.ContainsKey($season)) {
+                foreach ($episode in $rootEpisodesBySeason[$season].Keys) {
+                    if (-not $fileEpisodes.ContainsKey($episode)) { continue }
+                    foreach ($file in @($rootEpisodesBySeason[$season][$episode])) {
+                        $rootParts = Get-LibraryFileSeriesParts -File $file -Torrents $Torrents
+                        $sameWork = $false
+                        foreach ($seasonFile in @($fileEpisodes[$episode])) {
+                            $seasonParts = Get-LibraryFileSeriesParts -File $seasonFile -Torrents $Torrents
+                            if (Test-SameTitle -A $rootParts -B $seasonParts -IgnoreEpisodeCoordinates) {
+                                $sameWork = $true
+                                break
+                            }
+                        }
+                        if (-not $sameWork) { continue }
+
+                        $alreadyIncluded = @($fileEpisodes[$episode] | Where-Object {
+                            $_.FullName.Equals($file.FullName, [StringComparison]::OrdinalIgnoreCase)
+                        }).Count -gt 0
+                        if (-not $alreadyIncluded) { [void]$fileEpisodes[$episode].Add($file) }
+                    }
+                }
+            }
 
             # Grouped by episode, so two copies of one episode meet. EVERY copy is
             # carried through: keeping only the largest here would hide the
@@ -5628,6 +5721,65 @@ function Resolve-TorrentFilePath {
     return $path
 }
 
+function Get-ExactTorrentFileOwners {
+    param(
+        [string]$Path,
+        [object[]]$Torrents,
+        [hashtable]$FileCache,
+        [hashtable]$Gone = @{}
+    )
+
+    $owners = New-Object System.Collections.ArrayList
+    foreach ($torrent in @($Torrents)) {
+        if (-not $torrent -or $Gone.ContainsKey([string]$torrent.hash)) { continue }
+        if ([string]::IsNullOrWhiteSpace([string]$torrent.content_path)) { continue }
+        if (-not (Test-Claimed -Path $Path -Torrents @($torrent))) { continue }
+        if ([string]::IsNullOrWhiteSpace([string]$torrent.save_path)) {
+            return [pscustomobject]@{
+                Verified = $false; Owners = @()
+                Reason = "missing path data for '$($torrent.name)'"
+            }
+        }
+
+        $key = ([string]$torrent.hash).ToLowerInvariant()
+        if (-not $FileCache.ContainsKey($key)) {
+            try {
+                $files = Invoke-ApiGet -Endpoint ("torrents/files?hash={0}" -f [string]$torrent.hash)
+                $FileCache[$key] = if ($null -eq $files) { @() } else { @($files) }
+            }
+            catch {
+                return [pscustomobject]@{
+                    Verified = $false; Owners = @()
+                    Reason = "could not read file list for '$($torrent.name)': $($_.Exception.Message)"
+                }
+            }
+        }
+        if (@($FileCache[$key]).Count -eq 0) { continue }
+
+        foreach ($file in @($FileCache[$key])) {
+            if ([string]::IsNullOrWhiteSpace([string]$file.name)) {
+                return [pscustomobject]@{
+                    Verified = $false; Owners = @()
+                    Reason = "file list for '$($torrent.name)' contains an empty path"
+                }
+            }
+            try { $filePath = Resolve-TorrentFilePath -T $torrent -Name ([string]$file.name) }
+            catch {
+                return [pscustomobject]@{
+                    Verified = $false; Owners = @()
+                    Reason = "could not resolve a file listed by '$($torrent.name)': $($_.Exception.Message)"
+                }
+            }
+            if ($filePath.Equals($Path, [StringComparison]::OrdinalIgnoreCase)) {
+                [void]$owners.Add($torrent)
+                break
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Verified = $true; Owners = @($owners); Reason = '' }
+}
+
 function Test-SettleMedia {
     param([string]$Name)
     return ($Name -match '(?i)\.(mkv|mp4|avi|m4v)$' -and
@@ -6745,7 +6897,7 @@ foreach ($t in $all) {
       # Resolve-PartsAlias for the live queue this came from.
       $compositeSeriesRelease = $false
       if ($parts -and [regex]::Matches([string]$t.name, '\s+\+\s+').Count -ge 2 -and
-          [regex]::IsMatch([string]$t.name, '(?i)(?:S\d{1,3}\s*E\d{1,3}|(?:season|sezon|saison|s[eé]rie|series)\s*[:._-]*\d|\d{1,2}\s*\.\s*s[eé]rie)')) {
+          [regex]::IsMatch([string]$t.name, '(?i)(?:S\d{1,3}\s*E\d{1,3}|(?:season|stagione|sezon|saison|s[eé]rie|series)\s*[:._-]*\d|\d{1,2}\s*\.\s*s[eé]rie)')) {
           # A title spelling several works joined by '+' is not one show-season,
           # even if the parser finds a season marker in its last component.
           # Keep the full string for TMDB component search, but don't let one
@@ -6803,12 +6955,7 @@ foreach ($t in $all) {
                       Write-Log 'INFO' ("TMDB identifies '{0}' as a one-season show; filing it as a Season {1} pack" -f $rawParts.Title, $parts.Season)
                   }
               } elseif ($identity -and $identity.status -eq 'ambiguous') {
-                  $parts | Add-Member -NotePropertyName TmdbStatus -NotePropertyValue 'ambiguous' -Force
-                  if ($identity.type -eq 'tv') {
-                      $parts = Set-TmdbSeriesClassification -Parts $parts
-                      $parts | Add-Member -NotePropertyName TmdbType -NotePropertyValue 'tv' -Force
-                      $parts | Add-Member -NotePropertyName TmdbStatus -NotePropertyValue 'ambiguous' -Force
-                  }
+                  $parts = Set-TmdbAmbiguousIdentity -Parts $parts -Identity $identity
                   Write-Log 'WARN' ("TMDB result ambiguous for '{0}' ({1}); no external identity applied" -f $rawParts.Title, $rawParts.Year)
               }
           }
@@ -7322,8 +7469,8 @@ if ($cfg.assignCategories) {
 #
 #   rule 4   - $keeper is the largest FINISHED member of the episode set, and the
 #              loser is strictly smaller than it. The keeper is not a candidate.
-#   rule 4/2 - pack-vs-single: both sides complete, the single is the smaller copy
-#              of the one episode they share.
+#   rule 4/2 - pack-vs-single: the pack is complete, and its measured file for
+#              the shared episode is at least as large as the single's file.
 #   rule 4b  - the file is a duplicate of a LARGER file in the same season folder,
 #              and the largest file in that folder is never the one deleted.
 #
@@ -7594,8 +7741,10 @@ foreach ($c in $setGroups) {
     # sit in different sets because their exact ranges differ, so without this
     # pass they are never weighed against each other and the smaller one stays.
     #
-    # Both must be COMPLETE for the comparison to be honest, and DoVi was
-    # already deleted by rule 1, so Test-AlreadyGone closes that door.
+    # The pack must be COMPLETE. When its episode file is larger, it can replace
+    # an unfinished single. When its file is smaller, only a finished single can
+    # prove that deleting the pack's individual episode file is safe.
+    # DoVi was already deleted by rule 1, so Test-AlreadyGone closes that door.
     #
     # WHAT IS WEIGHED is the ONE episode they share, measured on both sides: the
     # pack's own file for that episode, against the single's own file. The pack's
@@ -7604,7 +7753,9 @@ foreach ($c in $setGroups) {
     # count is worse than using nothing, because it produces a plausible number
     # that matches no real file.
     #
-    # ONLY THE SINGLE IS EVER DELETED, and that is the load-bearing part.
+    # The smaller episode file is removed, whichever side owns it. A losing
+    # single goes with its torrent; a losing pack file is skipped and removed
+    # individually so the pack's other episodes remain tracked.
     #
     # It was otherwise, and it cost real data on this box:
     #
@@ -7643,7 +7794,7 @@ foreach ($c in $setGroups) {
             if ($single.hash -eq $pack.hash) { continue }
             if (-not $single.parts) { continue }
             if ($single.parts.IsMultiEpisode) { continue }
-            if ($single.parts.Title -ne $pack.parts.Title) { continue }
+            if (-not (Test-SameTitle -A $single.parts -B $pack.parts -IgnoreEpisodeCoordinates)) { continue }
             if ($single.parts.Season -ne $pack.parts.Season) { continue }
             if ($null -eq $single.parts.Episode) { continue }
             if (-not (Test-PackContainsEpisode -PackParts $pack.parts -Episode $single.parts.Episode)) { continue }
@@ -7661,9 +7812,9 @@ foreach ($c in $setGroups) {
                     $pack.parts.Season, $single.parts.Episode, $pack.name, $single.name))
                 continue
             }
-            # The PACK IS NEVER THE ONE DELETED. Only the single can be, and only
-            # when the pack's own copy is larger or is an equal-size, same-named
-            # release file.
+            # Compare the two measured episode files. If the single is smaller,
+            # the single torrent goes. If the pack file is smaller, only that
+            # file goes; the pack entry stays stopped and skips that file.
             #
             # It was otherwise, and it cost a 12,54 GB pack of E01-E08 on
             # 2026-10-05: the single's S18E01 was 46 MB bigger than the pack's
@@ -7685,8 +7836,101 @@ foreach ($c in $setGroups) {
             # a few bytes larger than the exact same episode inside the pack.
             $singleEpisodeBytes = [int64]$singleEpisodeFile.size
             if (-not (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes $epFileBytes -SingleEpisodeBytes $singleEpisodeBytes)) {
-                # The finished pack's episode is smaller than the single's media
-                # file, so it is not a sufficient keeper for this comparison.
+                if ([double]$single.progress -lt 1) {
+                    [void]$script:notes.Add(("the larger S{0}E{1} file in '{2}' is not finished, so the smaller pack file in '{3}' is preserved" -f `
+                        $single.parts.Season, $single.parts.Episode, $single.name, $pack.name))
+                    continue
+                }
+
+                $packFilePath = $null
+                $singleFilePath = $null
+                try {
+                    $packFilePath = Resolve-TorrentFilePath -T $pack -Name ([string]$packEpisodeFile.name)
+                    $singleFilePath = Resolve-TorrentFilePath -T $single -Name ([string]$singleEpisodeFile.name)
+                }
+                catch {
+                    [void]$script:notes.Add(("cannot resolve the S{0}E{1} files for '{2}' and '{3}', so neither copy is removed" -f `
+                        $single.parts.Season, $single.parts.Episode, $pack.name, $single.name))
+                    continue
+                }
+
+                if ($packFilePath -ieq $singleFilePath -or
+                    (Test-PendingSettlePath -Path $packFilePath) -or
+                    (Test-PendingSettlePath -Path $singleFilePath)) { continue }
+
+                try {
+                    $packOnDisk = Get-Item -LiteralPath $packFilePath -Force -ErrorAction Stop
+                    $singleOnDisk = Get-Item -LiteralPath $singleFilePath -Force -ErrorAction Stop
+                }
+                catch { continue }
+                if ($packOnDisk.PSIsContainer -or $singleOnDisk.PSIsContainer -or
+                    ($packOnDisk.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                    ($singleOnDisk.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                    [int64]$packOnDisk.Length -ne [int64]$packEpisodeFile.size -or
+                    [int64]$singleOnDisk.Length -ne $singleEpisodeBytes -or
+                    $singleEpisodeBytes -le $epFileBytes) { continue }
+
+                $owners = Get-ExactTorrentFileOwners -Path $packFilePath -Torrents $all `
+                    -FileCache $fileSizeCache -Gone $script:gone
+                if (-not $owners.Verified -or $owners.Owners.Count -ne 1 -or
+                    [string]$owners.Owners[0].hash -ne [string]$pack.hash) {
+                    $ownershipDetail = [string]$owners.Reason
+                    if ($owners.Verified) {
+                        $ownerNames = @($owners.Owners | ForEach-Object { [string]$_.name })
+                        $ownershipDetail = ("found {0} exact owner(s): {1}" -f $owners.Owners.Count, (@($ownerNames) -join ', '))
+                    }
+                    Write-Log 'WARN' "preserving smaller pack episode '$packFilePath': $ownershipDetail"
+                    continue
+                }
+
+                $reason = ("smaller duplicate S{0}E{1} inside finished pack '{2}' ({3:N2} GB) than finished single '{4}' ({5:N2} GB); skipping and removing only the pack episode file" -f `
+                    $pack.parts.Season, $single.parts.Episode, $pack.name, ($epFileBytes / 1GB),
+                    $single.name, ($singleEpisodeBytes / 1GB))
+                if ($DryRun) {
+                    [void]$script:actions.Add("WOULD DELETE PACK FILE  $packFilePath - $reason")
+                    Write-Log 'DELETE' "[DRY-RUN] $packFilePath - $reason"
+                    continue
+                }
+                if (-not (Stop-TorrentAndConfirm -T $pack)) { continue }
+
+                $owners = Get-ExactTorrentFileOwners -Path $packFilePath -Torrents $all `
+                    -FileCache $fileSizeCache -Gone $script:gone
+                if (-not $owners.Verified -or $owners.Owners.Count -ne 1 -or
+                    [string]$owners.Owners[0].hash -ne [string]$pack.hash -or
+                    (Test-PendingSettlePath -Path $packFilePath)) {
+                    $ownershipDetail = [string]$owners.Reason
+                    if ($owners.Verified) {
+                        $ownerNames = @($owners.Owners | ForEach-Object { [string]$_.name })
+                        $ownershipDetail = ("found {0} exact owner(s): {1}" -f $owners.Owners.Count, (@($ownerNames) -join ', '))
+                    }
+                    if (Test-PendingSettlePath -Path $packFilePath) { $ownershipDetail = 'the file is pending settle' }
+                    Write-Log 'WARN' "preserving smaller pack episode '$packFilePath': $ownershipDetail"
+                    continue
+                }
+                if (-not (Set-TorrentFilePriorityVerified -Torrent $pack -Path $packFilePath -Priority 0)) {
+                    Write-Log 'WARN' "preserving smaller pack episode '$packFilePath': qBittorrent did not confirm Do Not Download"
+                    continue
+                }
+
+                try {
+                    $packOnDisk = Get-Item -LiteralPath $packFilePath -Force -ErrorAction Stop
+                    $singleOnDisk = Get-Item -LiteralPath $singleFilePath -Force -ErrorAction Stop
+                    if ($packOnDisk.PSIsContainer -or $singleOnDisk.PSIsContainer -or
+                        ($packOnDisk.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                        ($singleOnDisk.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                        [int64]$packOnDisk.Length -ne [int64]$packEpisodeFile.size -or
+                        [int64]$singleOnDisk.Length -ne $singleEpisodeBytes -or
+                        [int64]$singleOnDisk.Length -le [int64]$packOnDisk.Length) {
+                        Write-Log 'WARN' "preserving smaller pack episode '$packFilePath': on-disk sizes changed before removal"
+                        continue
+                    }
+                    Remove-Item -LiteralPath $packFilePath -Force -ErrorAction Stop
+                    [void]$script:actions.Add("DELETED PACK FILE  $packFilePath - $reason")
+                    Write-Log 'DELETE' "$packFilePath - $reason (priority set to Do Not Download; pack entry kept stopped)"
+                }
+                catch {
+                    Write-Log 'WARN' "could not delete smaller pack episode '$packFilePath': $($_.Exception.Message)"
+                }
                 continue
             }
 
@@ -7769,7 +8013,7 @@ foreach ($c in $setGroups) {
     }
 }
 
-# -- rule 4b: the same episode twice inside one show's own season folder -------
+# -- rule 4b: the same episode twice inside one show's library folder ----------
 #
 # THE RULE lives with Get-LibraryDuplicateVerdicts. The short version: rule 4
 # compares inside a cluster, and a cluster's family is the FIRST WORD of the show
@@ -7789,15 +8033,15 @@ if ($cfg.PSObject.Properties['libraryDedupeEnabled']) { $libraryDupOn = [bool]$c
 if ($SkipLibraryScan -or -not $libraryDupOn) {
     Write-Host ''
     Write-Host 'Library duplicate check' -ForegroundColor DarkGray
-    Write-Host '  libraryDedupeEnabled is false, so a repeated episode inside a season folder is left alone' -ForegroundColor DarkGray
+    Write-Host '  libraryDedupeEnabled is false, so repeated library episodes are left alone' -ForegroundColor DarkGray
 }
 else {
     Write-Host ''
-    Write-Host 'Library duplicate check (same episode twice in one season folder)'
+    Write-Host 'Library duplicate check (same episode twice in one show folder)'
     $libDupes = @(Get-LibraryDuplicateVerdicts -SeriesDir $cfg.seriesDir -Torrents $all -Gone $script:gone)
 
     if ($libDupes.Count -eq 0) {
-        Write-Host '  no episode appears twice in a season folder' -ForegroundColor DarkGray
+        Write-Host '  no episode appears twice in a show folder' -ForegroundColor DarkGray
     }
     foreach ($d in $libDupes) {
         $short = Split-Path -Leaf $d.File

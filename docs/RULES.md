@@ -149,10 +149,20 @@ errored copy of something already held in full is a spare copy that failed.
 those rules judge a torrent on its progress or its availability, which is exactly
 what an error corrupts. The one worth naming is **pack-vs-single**: there the
 comparison is between a pack's own file for *one* episode and a single's file for
-that episode, and the pack's other episodes say nothing about it. That is the
+that episode, and the pack's other episodes say nothing about it. The pack must be
+finished, and a single is removed only when it too is finished. The manager
+compares show identity without requiring the pack's first episode to equal the
+single's episode, then checks that the pack actually contains that episode and
+measures both media files. The smaller file is removed whichever side owns it:
+the smaller single goes with its torrent; when the pack file is smaller, the pack
+is stopped, that one file is set to Do Not Download and removed, and the pack
+entry and its other episodes remain. Exact file ownership, the on-disk sizes and
+the larger finished keeper are verified before unlinking the pack file.
+
+The pack is never removed merely because one episode is duplicated. That is the
 comparison that once deleted a 12,54 GB `E01-E08` pack over a 46 MB difference in
-one episode, stranding seven files that existed nowhere else â€” deleting an errored
-single there could strand a pack the same way.
+one episode, stranding seven files that existed nowhere else â€” deleting an
+errored single there could strand a pack the same way.
 
 A DoVi or disc-rip entry that is errored *is* deleted, which is what "in any
 state" means. `status.ps1` mirrors this exactly: it reports an errored DoVi as
@@ -712,7 +722,7 @@ as their members). A third, subtler one is covered too â€” measuring a suff
 pair rather than against one show name made an ordinary episode title look like a
 repeated suffix, and blocked the very merge it was meant to police.
 
-### The same episode twice in one season folder
+### The same episode twice in one show's library folder
 
 Rule 4 cannot see this, and neither can anything keyed on the show name. A
 measured loss: **7 duplicated episodes, 10,5 GB**, every copy finished, every
@@ -721,11 +731,13 @@ first word of the show name â€” so `its always sunny in philadelphia`,
 `c'Ã¨ sempre il sole a philadelphia` and `www.uindex.org - â€¦` are three groups of
 one show that never meet.
 
-The **library folder** is what makes the comparison possible without a heuristic.
-The manager put those files in that folder itself: `Get-LibraryTargetDir` already
-decided they were one show, so the folder is a grouping already proven, arrived at
-by a different route than the family guard. Two files in the same season folder
-claiming the same episode are the same episode by construction.
+The **library folder** is a useful grouping, but not proof that two same-titled
+series are the same work: distinct TMDB series can share a display name. Files
+inside `Season N` use that folder for their season, so seasonless names still
+work. Explicitly season-marked files in release folders elsewhere under the same
+show folder are compared against that season only when their available series
+identity agrees. A TMDB-identified series is never compared with a different or
+ambiguous identity just because the episode numbers match.
 
 Two files claiming one episode â†’ the **larger is kept**, the smaller deleted. A
 tie is **held**, never broken by a coin toss on someone's media. The season comes
@@ -733,6 +745,10 @@ from the folder and the episode from the filename, never cross-checked â€” 
 Frank Marries a Corpse.mkv` states no season at all and parses as season 1, so
 requiring a match would reject exactly the half of the pair that must be
 recognised.
+
+That folder-derived season applies inside `Season N`. A release folder elsewhere
+under the show folder is compared only when each filename explicitly identifies
+the season, preventing a root-level S03 file from colliding with a Season 2 file.
 
 #### A duplicate inside a pack does not delete the pack
 

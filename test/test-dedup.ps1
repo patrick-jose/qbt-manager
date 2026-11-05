@@ -108,6 +108,10 @@ function File {
 }
 
 Invoke-Expression (Get-Slice -Text $src -From 'function Get-Prop' -To 'function Get-MetadataWatch')
+function Get-Api {
+    param([string]$Endpoint)
+    return Invoke-ApiGet -Endpoint $Endpoint
+}
 
 # If the verdict function did not come along, every check below would pass for
 # the wrong reason - an empty verdict set looks exactly like "nothing deleted".
@@ -159,6 +163,10 @@ function Reason {
     $gone = @{}
     $v = Get-DedupVerdicts -Clusters @(, @($Members)) -Gone $gone
     return $v[$Hash].Reason
+}
+function Details {
+    param([object[]]$Members)
+    return Get-DedupVerdicts -Clusters @(, @($Members)) -Gone @{}
 }
 
 "== the case the rule was rewritten for =="
@@ -307,23 +315,24 @@ Check 'a pack is weighed on the episode it shares, not its average' `
 Check 'and each of its episodes measures differently' `
     ((Get-PackEpisodeBytes -Hash 'pack10' -Season 1 -Episode 2 -Cache @{}) -eq [int64](9.0 * $GB))
 
-# E01's file in the pack is 5.5 GB and e1big is 8 GB of the same episode, so the
-# single is the bigger copy of that one episode. The PACK IS STILL NOT DELETED.
-#
-# This used to assert the opposite, and the opposite was wrong. It cost real data
-# on 2026-10-05: the scheduled run deleted Its.Always.Sunny.in.Philadelphia
-# S18E01-E08 because a single's copy of S18E01 was 46 MB bigger than the pack's own
-# S18E01 file. E02-E08 had no other copy anywhere, and removing the pack's entry
-# left them on disk belonging to no torrent at all. A pack is the only record
-# qBittorrent has of the episodes it holds, so a disagreement about one episode
-# must never remove it.
+# E01's file in the pack is 5.5 GB and e1big is 8 GB of the same episode. The
+# smaller pack FILE goes; the pack entry and its other episodes remain.
 $v = Verdicts @($pack10, $e1big)
-Check 'a pack is NOT deleted by a bigger single of the same episode' (-not (@($v) -contains 'pack10'))
-Check 'and the pass takes no action at all in that direction' (@($v).Count -eq 0)
+$details = Details @($pack10, $e1big)
+Check 'a smaller pack episode is reported as a file-only removal' `
+    ((@($v).Count -eq 1) -and (@($v) -contains 'pack10') -and $details['pack10'].Verdict -eq 'FILE ONLY')
+Check 'the larger single is kept as the episode keeper' (-not ($details.ContainsKey('e1big')))
+Check 'the file-only reason preserves the rest of the pack' ($details['pack10'].Reason -match 'keep its other episodes')
+Check 'status labels retained-pack cleanup as FILE ONLY, not a torrent deletion' `
+    ($src -match 'Verdict = \(Get-Prop \$kv\.Value ''Verdict'' ''DELETE''\)')
+
+$e1unfinished = P 'e1unfinished' 'Widows.Bay.S01E01.2160p.ATVP.WEB-DL.DDP5.1.Atmos.H.265-NTb [ext.to]' 8.0 0.50
+$v = Verdicts @($pack10, $e1unfinished)
+Check 'an unfinished larger single cannot justify deleting the pack episode' (@($v).Count -eq 0)
 
 # E02's file in the pack is 9 GB and e2big is 3 GB of that episode, so the
-# single IS the spare copy and goes - the one case this pass may act on, because
-# a single holds nothing but that episode, which the pack already carries.
+# single IS the spare copy and goes as a torrent, because a single holds nothing
+# but that episode, which the pack already carries.
 $v = Verdicts @($pack10, $e2)
 Check 'a single loses where the pack holds a bigger file for that episode' `
     ((@($v).Count -eq 1) -and (@($v) -contains 'e2big'))

@@ -59,7 +59,7 @@ $src = [System.IO.File]::ReadAllText((Get-ProjectFile 'qbt-manager.ps1'), [Syste
 # slicing them apart leaves the rule itself undefined.
 Invoke-Expression (Get-Slice $src '$script:boundaryPattern' 'function Get-DoviHit')
 Invoke-Expression (Get-Slice $src 'function Test-Claimed' 'function Get-PhantomVerdicts')
-Invoke-Expression (Get-Slice $src 'function Test-PendingSettlePath' 'function Resolve-TorrentFilePath')
+Invoke-Expression (Get-Slice $src 'function Test-PendingSettlePath' 'function Test-SettleMedia')
 foreach ($fn in 'Get-LibraryDuplicateVerdicts', 'Get-LibraryEpisodeFiles', 'Test-Claimed', 'Get-TitleParts') {
     if (-not (Get-Command $fn -ErrorAction SilentlyContinue)) { throw "$fn was not loaded by the slices" }
 }
@@ -74,9 +74,39 @@ function Invoke-ApiGet {
     param([string]$Endpoint)
     if ($Endpoint -notmatch 'torrents/files\?hash=(.+)$') { return @() }
     $h = $Matches[1].ToLowerInvariant()
-    if ($script:fileLists.ContainsKey($h)) { return @($script:fileLists[$h]) }
+    if ($script:fileLists.ContainsKey($h)) {
+        if (@($script:fileLists[$h]).Count -eq 0) { return $null }
+        return @($script:fileLists[$h])
+    }
     return @()
 }
+$packOwner = [pscustomobject]@{
+    hash = 'pack-owner'; save_path = 'C:\downloads'; content_path = 'C:\downloads\Show'
+}
+$otherTorrent = [pscustomobject]@{
+    hash = 'other-torrent'; save_path = 'C:\downloads'; content_path = 'C:\downloads\Show'
+}
+$script:fileLists['pack-owner'] = @([pscustomobject]@{ name = 'Show\episode.mkv'; size = 100 })
+$script:fileLists['other-torrent'] = @([pscustomobject]@{ name = 'Show\other.mkv'; size = 200 })
+$ownership = Get-ExactTorrentFileOwners -Path 'C:\downloads\Show\episode.mkv' `
+    -Torrents @($packOwner, $otherTorrent) -FileCache @{}
+Check 'overlapping folder claims do not count as exact episode-file ownership' `
+    ($ownership.Verified -and $ownership.Owners.Count -eq 1 -and $ownership.Owners[0].hash -eq 'pack-owner')
+$script:fileLists['other-torrent'] = @()
+$ownership = Get-ExactTorrentFileOwners -Path 'C:\downloads\Show\episode.mkv' `
+    -Torrents @($packOwner, $otherTorrent) -FileCache @{}
+Check 'a torrent with no listed payload files does not claim an episode path' `
+    ($ownership.Verified -and $ownership.Owners.Count -eq 1 -and $ownership.Owners[0].hash -eq 'pack-owner')
+$metadataOnly = [pscustomobject]@{ hash = 'metadata-only'; name = 'metadata-only' }
+$ownership = Get-ExactTorrentFileOwners -Path 'C:\downloads\Show\episode.mkv' `
+    -Torrents @($packOwner, $metadataOnly) -FileCache @{}
+Check 'a magnet without a content path cannot claim an existing episode file' `
+    ($ownership.Verified -and $ownership.Owners.Count -eq 1 -and $ownership.Owners[0].hash -eq 'pack-owner')
+$script:fileLists['other-torrent'] = @([pscustomobject]@{ name = 'Show\episode.mkv'; size = 100 })
+$ownership = Get-ExactTorrentFileOwners -Path 'C:\downloads\Show\episode.mkv' `
+    -Torrents @($packOwner, $otherTorrent) -FileCache @{}
+Check 'a second exact file owner prevents unique ownership from being claimed' `
+    ($ownership.Verified -and $ownership.Owners.Count -eq 2)
 
 # An exact episode can be equal in media bytes while the single torrent's total
 # includes tiny NFO/tracker sidecars. Compare the measured media files and require
@@ -94,6 +124,12 @@ Check 'episode file lookup ignores larger sidecars when measuring the single' `
     ($equalPackFile.size -eq 1000 -and $equalSingleFile.size -eq 1000)
 Check 'equal-size media files qualify regardless of release filename' `
     (Test-PackEpisodeOutweighsSingle -PackEpisodeBytes $equalPackFile.size -SingleEpisodeBytes $equalSingleFile.size)
+$script:fileLists['x-style-single'] = @(
+    [pscustomobject]@{ name = 'Dark.Matter.2024.2x01.Una.Vita.Tranquilla.mkv'; size = 2000 }
+)
+$xStyleFile = Get-PackEpisodeFile -Hash 'x-style-single' -Season 2 -Episode 1 -Cache @{}
+Check 'episode file lookup recognizes the 2x01 coordinates used by packs' `
+    ($null -ne $xStyleFile -and $xStyleFile.size -eq 2000)
 
 # A TMDB-classified TV release can have unknown season coordinates in its title
 # while its files prove that it is a complete, contiguous season pack. It must
@@ -357,6 +393,41 @@ Check 'it is not deleted whole'            (@(Deletes $unkRows).Count -eq 0)
 Check 'it is file-only'                    (@(FileOnly $unkRows).Count -eq 1)
 Check 'and the reason admits the guess'    ([string]$unkRows[0].Reason -match 'could not be established')
 Check 'no hash is carried'                 ([string]$unkRows[0].OwnerHash -eq '')
+
+Write-Host ''
+Write-Host '== pack-vs-single uses TMDB identity rather than release-title equality =='
+$localizedPackParts = Get-TitleParts -Name 'Widows Bay S01E01-E08 WEB-DL'
+$localizedSingleParts = Get-TitleParts -Name 'O Segredo de Widows Bay S01E04 1080p'
+foreach ($parts in @($localizedPackParts, $localizedSingleParts)) {
+    $parts | Add-Member TmdbId '77' -Force
+    $parts | Add-Member TmdbType 'tv' -Force
+}
+Check 'localized pack and single titles share their TMDB identity' `
+    (Test-SameTitle -A $localizedPackParts -B $localizedSingleParts -IgnoreEpisodeCoordinates)
+Check 'pack and contained single may have different episode coordinates' `
+    ($localizedPackParts.Episode -ne $localizedSingleParts.Episode -and
+     (Test-SameTitle -A $localizedPackParts -B $localizedSingleParts -IgnoreEpisodeCoordinates))
+$differentShowParts = Get-TitleParts -Name 'Widows Bay S01E04 1080p'
+$differentShowParts | Add-Member TmdbId '999' -Force
+$differentShowParts | Add-Member TmdbType 'tv' -Force
+Check 'different TMDB shows never match even when episode coordinates are ignored' `
+    (-not (Test-SameTitle -A $localizedPackParts -B $differentShowParts -IgnoreEpisodeCoordinates))
+$packSingleBlock = Get-Slice $src 'foreach ($pack in $members)' '# A smaller multi-episode pack'
+Check 'cleanup compares pack and single with the identity-aware matcher' `
+    ($packSingleBlock -match 'Test-SameTitle -A \$single\.parts -B \$pack\.parts -IgnoreEpisodeCoordinates')
+Check 'cleanup no longer requires exact parsed title equality' `
+    ($packSingleBlock -notmatch '\$single\.parts\.Title\s+-ne\s+\$pack\.parts\.Title')
+Check 'a smaller pack episode requires a finished single keeper' `
+    ($packSingleBlock -match 'single\.progress -lt 1' -and $packSingleBlock -match 'singleEpisodeBytes -le \$epFileBytes')
+Check 'pack-file deletion verifies unique ownership, stops the pack, and sets Do Not Download' `
+    ($packSingleBlock -match 'Get-ExactTorrentFileOwners' -and
+     $packSingleBlock -match 'Stop-TorrentAndConfirm -T \$pack' -and
+     $packSingleBlock -match 'Set-TorrentFilePriorityVerified -Torrent \$pack -Path \$packFilePath -Priority 0')
+Check 'pack-file deletion removes only the measured episode file' `
+    ($packSingleBlock -match 'Remove-Item -LiteralPath \$packFilePath')
+$containedPackBlock = Get-Slice $src 'function Get-ContainedPackDuplicateVerdict' 'function Get-LibraryDuplicateVerdicts'
+Check 'contained packs compare show identity without requiring matching first episode' `
+    ($containedPackBlock -match 'Test-SameTitle -A \$Candidate\.parts -B \$Keeper\.parts -IgnoreEpisodeCoordinates')
 
 Write-Host ''
 Write-Host '== the caller must actually remove the file =='
